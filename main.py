@@ -15,6 +15,7 @@ CONFIG_FILE = os.path.expanduser('~/.knock_sync_gui_config.json')
 PLIST_PATH = os.path.expanduser('~/Library/LaunchAgents/com.user.knock.sync.plist')
 PLIST_LABEL = "com.user.knock.sync"
 WIN_TASK_NAME = "KnockSyncBackupDaemon"
+WIN_STARTUP_CMD_NAME = "KnockSyncBackup-daemon.cmd"
 
 _IS_WIN = sys.platform == "win32"
 _IS_MAC = sys.platform == "darwin"
@@ -61,35 +62,103 @@ def _windows_task_command_line():
     return f'"{py}" "{script}" --daemon'
 
 
+def _win_startup_cmd_path():
+    """当前用户「启动」文件夹中的本程序启动脚本路径。"""
+    appdata = os.environ.get("APPDATA")
+    if not appdata:
+        return None
+    return os.path.join(
+        appdata,
+        "Microsoft",
+        "Windows",
+        "Start Menu",
+        "Programs",
+        "Startup",
+        WIN_STARTUP_CMD_NAME,
+    )
+
+
+def _remove_windows_startup_cmd():
+    p = _win_startup_cmd_path()
+    if p and os.path.isfile(p):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
+def _write_windows_startup_cmd():
+    """
+    在「启动」文件夹写入 .cmd，登录后自动运行 --daemon（无需计划任务权限）。
+    使用 UTF-8 BOM，避免中文路径乱码。
+    """
+    path = _win_startup_cmd_path()
+    if not path:
+        raise RuntimeError("无法获取 %APPDATA%，无法写入启动文件夹。")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+
+    if getattr(sys, "frozen", False):
+        exe = os.path.normpath(os.path.realpath(sys.executable))
+        line = f'start "" /min "{exe}" --daemon'
+    else:
+        py = os.path.normpath(sys.executable)
+        script = os.path.normpath(os.path.abspath(sys.argv[0]))
+        line = f'start "" /min "{py}" "{script}" --daemon'
+
+    content = (
+        "@echo off\r\n"
+        "chcp 65001 >nul\r\n"
+        f"{line}\r\n"
+    )
+    with open(path, "w", encoding="utf-8-sig", newline="") as f:
+        f.write(content)
+    return path
+
+
 def _install_windows_startup_task():
+    """
+    优先创建计划任务（登录时运行）；若遇「拒绝访问」等权限问题，
+    则回退到当前用户的「启动」文件夹中的 .cmd（效果同为登录后自启）。
+    返回 ("schtasks", None) 或 ("startup_cmd", 脚本路径)。
+    """
     sub_kw = {}
     if _IS_WIN and hasattr(subprocess, "CREATE_NO_WINDOW"):
         sub_kw["creationflags"] = subprocess.CREATE_NO_WINDOW
+
     subprocess.run(
         ["schtasks", "/delete", "/tn", WIN_TASK_NAME, "/f"],
         capture_output=True,
         **sub_kw,
     )
+
     tr = _windows_task_command_line()
-    r = subprocess.run(
-        [
-            "schtasks",
-            "/create",
-            "/tn",
-            WIN_TASK_NAME,
-            "/tr",
-            tr,
-            "/sc",
-            "onlogon",
-            "/f",
-        ],
-        capture_output=True,
-        text=True,
-        **sub_kw,
-    )
-    if r.returncode != 0:
-        err = (r.stderr or "") + (r.stdout or "")
-        raise RuntimeError(err.strip() or f"schtasks 退出码 {r.returncode}")
+    # 多种参数组合，提高在家庭版/企业策略下的成功率
+    attempts = [
+        ["schtasks", "/create", "/tn", WIN_TASK_NAME, "/tr", tr, "/sc", "onlogon", "/f"],
+        ["schtasks", "/create", "/tn", WIN_TASK_NAME, "/tr", tr, "/sc", "onlogon", "/rl", "LIMITED", "/f"],
+    ]
+    last_err = ""
+    for args in attempts:
+        r = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            **sub_kw,
+        )
+        if r.returncode == 0:
+            _remove_windows_startup_cmd()
+            return "schtasks", None
+        last_err = ((r.stderr or "") + (r.stdout or "")).strip() or f"退出码 {r.returncode}"
+
+    try:
+        cmd_path = _write_windows_startup_cmd()
+        return "startup_cmd", cmd_path
+    except Exception as e:
+        raise RuntimeError(
+            "计划任务创建失败（可能被组策略限制或需管理员权限）：\n"
+            f"{last_err}\n\n"
+            f"启动文件夹回退也失败：{e}"
+        ) from e
 
 
 def _plist_xml_string(s):
@@ -131,10 +200,129 @@ def load_config():
     return {}
 
 
-def copy_without_overwrite(src_dir, tgt_dir, log_prefix=""):
+def _count_files_under(root: Path):
+    """递归统计目录下文件总数（用于诊断）；失败时返回 None。"""
+    try:
+        n = 0
+        for child in root.rglob("*"):
+            if child.is_file():
+                n += 1
+                if n > 200000:
+                    return n
+        return n
+    except (PermissionError, OSError):
+        return None
+
+
+def _mtime_ns(path: Path) -> int:
+    """文件修改时间（纳秒），便于跨平台比较。"""
+    st = path.stat()
+    ns = getattr(st, "st_mtime_ns", None)
+    if ns is not None:
+        return ns
+    return int(st.st_mtime * 1_000_000_000)
+
+
+def _merge_config_patch(patch: dict):
+    cfg = load_config()
+    cfg.update(patch)
+    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
+        json.dump(cfg, f, indent=4, ensure_ascii=False)
+
+
+def _ask_overwrite_newer_dialog(master, sample_rel: str):
+    """源较新需覆盖时弹窗。返回 (是否覆盖本次全部较新项, 是否记住长期策略)。"""
+    result = {'ok': False, 'remember': False}
+    win = tk.Toplevel(master)
+    win.title("确认覆盖较新的源文件")
+    win.transient(master)
+    win.grab_set()
+    msg = (
+        "检测到源文件修改时间较新，将覆盖目标中的同名文件。\n\n"
+        f"示例：{sample_rel}\n\n"
+        "• 确定：本次同步中，所有「源较新」的情况均覆盖目标。\n"
+        "• 取消：本次同步中，均不覆盖（仅复制新增文件）。\n"
+    )
+    tk.Label(win, text=msg, justify="left", wraplength=460).pack(padx=12, pady=10)
+    remember_var = tk.BooleanVar(value=False)
+    tk.Checkbutton(
+        win,
+        text="记住本次选择（确定=以后始终覆盖较新；取消=以后始终跳过较新、仅新增）",
+        variable=remember_var,
+    ).pack(anchor="w", padx=12)
+
+    bf = tk.Frame(win)
+    bf.pack(pady=10)
+
+    def on_ok():
+        result['ok'] = True
+        result['remember'] = remember_var.get()
+        win.destroy()
+
+    def on_cancel():
+        result['ok'] = False
+        result['remember'] = remember_var.get()
+        win.destroy()
+
+    tk.Button(bf, text="确定", command=on_ok, width=10).pack(side="left", padx=5)
+    tk.Button(bf, text="取消", command=on_cancel, width=10).pack(side="left", padx=5)
+    win.wait_window()
+    return result['ok'], result['remember']
+
+
+def _resolve_overwrite_newer(
+    gui_master,
+    gui_interactive,
+    overwrite_session,
+    on_policy_saved,
+    sample_relative,
+):
+    """
+    返回 True：执行覆盖；False：跳过本次覆盖。
+    overwrite_session 为可变 dict，键 'decision'：None | True | False，供同一轮多次 copy 共用。
+    """
+    cfg = load_config()
+    mode = cfg.get('newer_overwrite_mode', 'ask')
+    if mode == 'always':
+        return True
+    if mode == 'skip_newer':
+        return False
+    # mode == ask
+    if not gui_interactive:
+        return True
+    if gui_master is None:
+        return True
+    if overwrite_session is None:
+        overwrite_session = {}
+    if overwrite_session.get('decision') is not None:
+        return overwrite_session['decision']
+
+    ok, remember = _ask_overwrite_newer_dialog(gui_master, str(sample_relative))
+    if remember:
+        if ok:
+            _merge_config_patch({'newer_overwrite_mode': 'always'})
+            if on_policy_saved:
+                on_policy_saved('always')
+        else:
+            _merge_config_patch({'newer_overwrite_mode': 'skip_newer'})
+            if on_policy_saved:
+                on_policy_saved('skip_newer')
+    overwrite_session['decision'] = bool(ok)
+    return ok
+
+
+def copy_without_overwrite(
+    src_dir, tgt_dir, log_prefix="",
+    *,
+    gui_master=None,
+    gui_interactive=False,
+    overwrite_session=None,
+    on_policy_saved=None,
+):
     """
     用 pathlib.rglob 深度遍历（与你旧脚本一致的方式）
     + iCloud 占位符自动检测下载
+    + 目标已存在同名文件时：仅当源文件修改时间更新才覆盖（以较新者为准）
     """
     if not src_dir or not tgt_dir:
         print(f"[{datetime.now()}] {log_prefix} ❌ 路径未设置 (src={src_dir}, tgt={tgt_dir})")
@@ -152,6 +340,9 @@ def copy_without_overwrite(src_dir, tgt_dir, log_prefix=""):
     tgt.mkdir(parents=True, exist_ok=True)
     print(f"[{datetime.now()}] {log_prefix} 🚀 开始扫描: {src}")
 
+    if overwrite_session is None:
+        overwrite_session = {'decision': None}
+
     # ===== 诊断输出：看看 Python 到底看到了什么 =====
     try:
         raw_items = sorted(src.iterdir(), key=lambda p: p.name)
@@ -168,6 +359,12 @@ def copy_without_overwrite(src_dir, tgt_dir, log_prefix=""):
             print(f"   (诊断)   {tag}  {item.name}")
     except Exception as e:
         print(f"   (诊断) ⛔ 无法读取目录: {e}")
+
+    total_under = _count_files_under(src)
+    if total_under is not None:
+        print(f"   (诊断) 📊 递归统计：整棵目录下共 {total_under} 个文件（含子文件夹内）")
+    else:
+        print(f"   (诊断) 📊 递归统计：无法遍历子目录（权限或路径限制）")
 
     count = 0
     skipped = 0
@@ -243,17 +440,39 @@ def copy_without_overwrite(src_dir, tgt_dir, log_prefix=""):
             relative = src_file.relative_to(src)
             dst_file = tgt / relative
 
-            # 增量逻辑：目标已有则跳过
+            # 同名：目标已存在且修改时间不早于源 → 跳过；否则覆盖（双向备份以较新的一侧为准）
+            replacing = False
             if dst_file.exists():
-                skipped += 1
-                continue
+                try:
+                    if _mtime_ns(src_file) <= _mtime_ns(dst_file):
+                        skipped += 1
+                        continue
+                    replacing = True
+                except OSError:
+                    print(f"  ! 无法比较修改时间，跳过: {relative}")
+                    skipped += 1
+                    continue
+
+            if replacing:
+                if not _resolve_overwrite_newer(
+                    gui_master,
+                    gui_interactive,
+                    overwrite_session,
+                    on_policy_saved,
+                    relative,
+                ):
+                    skipped += 1
+                    continue
 
             # 创建目标子目录 & 拷贝
             dst_file.parent.mkdir(parents=True, exist_ok=True)
             try:
                 shutil.copy2(str(src_file), str(dst_file))
                 count += 1
-                print(f"  + 搬运成功: {relative}")
+                if replacing:
+                    print(f"  ↑ 覆盖(源较新): {relative}")
+                else:
+                    print(f"  + 新增: {relative}")
             except Exception as e:
                 print(f"  ! 搬运失败: {relative} → {e}")
 
@@ -268,28 +487,66 @@ def copy_without_overwrite(src_dir, tgt_dir, log_prefix=""):
         import traceback
         traceback.print_exc()
 
-    summary = (f"新增 {count}, 跳过 {skipped}"
+    summary = (f"新增/覆盖 {count}, 跳过 {skipped}"
                + (f", 云端下载 {cloud_downloaded}" if cloud_downloaded else "")
                + (f", 云端超时 {cloud_failed}" if cloud_failed else ""))
     print(f"[{datetime.now()}] {log_prefix} ✅ 完成: {summary}\n")
 
 
-def run_morning_task():
+def run_morning_task(
+    gui_master=None,
+    gui_interactive=False,
+    on_policy_saved=None,
+    overwrite_session=None,
+):
     cfg = load_config()
+    if overwrite_session is None:
+        overwrite_session = {'decision': None}
     print("\n" + "=" * 60)
     print("=== 执行早晨同步规则 (抽出保存) ===")
     print("=" * 60)
-    copy_without_overwrite(cfg.get('files_src'), cfg.get('files_tgt'), "[文档]")
-    copy_without_overwrite(cfg.get('images_src'), cfg.get('images_tgt'), "[图片]")
+    copy_without_overwrite(
+        cfg.get('files_src'), cfg.get('files_tgt'), "[文档]",
+        gui_master=gui_master,
+        gui_interactive=gui_interactive,
+        overwrite_session=overwrite_session,
+        on_policy_saved=on_policy_saved,
+    )
+    copy_without_overwrite(
+        cfg.get('images_src'), cfg.get('images_tgt'), "[图片]",
+        gui_master=gui_master,
+        gui_interactive=gui_interactive,
+        overwrite_session=overwrite_session,
+        on_policy_saved=on_policy_saved,
+    )
 
 
-def run_evening_task():
+def run_evening_task(
+    gui_master=None,
+    gui_interactive=False,
+    on_policy_saved=None,
+    overwrite_session=None,
+):
     cfg = load_config()
+    if overwrite_session is None:
+        overwrite_session = {'decision': None}
     print("\n" + "=" * 60)
     print("=== 执行晚间同步规则 (灌回防删) ===")
     print("=" * 60)
-    copy_without_overwrite(cfg.get('files_tgt'), cfg.get('files_src'), "[文档]")
-    copy_without_overwrite(cfg.get('images_tgt'), cfg.get('images_src'), "[图片]")
+    copy_without_overwrite(
+        cfg.get('files_tgt'), cfg.get('files_src'), "[文档]",
+        gui_master=gui_master,
+        gui_interactive=gui_interactive,
+        overwrite_session=overwrite_session,
+        on_policy_saved=on_policy_saved,
+    )
+    copy_without_overwrite(
+        cfg.get('images_tgt'), cfg.get('images_src'), "[图片]",
+        gui_master=gui_master,
+        gui_interactive=gui_interactive,
+        overwrite_session=overwrite_session,
+        on_policy_saved=on_policy_saved,
+    )
 
 
 def start_daemon_loop():
@@ -337,13 +594,14 @@ class AppGUI:
         elif _IS_WIN:
             title = "Windows " + title
         self.root.title(title)
-        self.root.geometry("620x580")
+        self.root.geometry("620x680")
 
         self.vars = {
             'files_src': tk.StringVar(), 'files_tgt': tk.StringVar(),
             'images_src': tk.StringVar(), 'images_tgt': tk.StringVar(),
             'morning_time': tk.StringVar(value="10:10"),
             'evening_time': tk.StringVar(value="19:00"),
+            'newer_overwrite_mode': tk.StringVar(value="ask"),
         }
 
         self.load_history()
@@ -366,6 +624,32 @@ class AppGUI:
         tk.Entry(lf3, textvariable=self.vars['morning_time'], width=10).grid(row=0, column=1, padx=5)
         tk.Label(lf3, text="🌙 晚间 (灌回防删):").grid(row=1, column=0, sticky="e", pady=5)
         tk.Entry(lf3, textvariable=self.vars['evening_time'], width=10).grid(row=1, column=1, padx=5)
+
+        lf4 = tk.LabelFrame(self.root, text=" 📌 同名文件源较新时（覆盖目标） ", padx=10, pady=10)
+        lf4.pack(fill="x", padx=15, pady=5)
+        fr_mode = tk.Frame(lf4)
+        fr_mode.pack(anchor="w")
+        tk.Radiobutton(
+            fr_mode,
+            text="每次询问（弹窗内可记住：覆盖较新 / 跳过较新）",
+            variable=self.vars['newer_overwrite_mode'],
+            value="ask",
+            command=self.save_current_config,
+        ).pack(anchor="w")
+        tk.Radiobutton(
+            fr_mode,
+            text="始终按较新的覆盖（不再弹窗）",
+            variable=self.vars['newer_overwrite_mode'],
+            value="always",
+            command=self.save_current_config,
+        ).pack(anchor="w")
+        tk.Radiobutton(
+            fr_mode,
+            text="始终跳过较新（仅复制新增，不再弹窗）",
+            variable=self.vars['newer_overwrite_mode'],
+            value="skip_newer",
+            command=self.save_current_config,
+        ).pack(anchor="w")
 
         btn_frame = tk.Frame(self.root)
         btn_frame.pack(fill="x", padx=15, pady=10)
@@ -396,6 +680,12 @@ class AppGUI:
     def load_history(self):
         cfg = load_config()
         for k, v in self.vars.items():
+            if k == 'newer_overwrite_mode':
+                m = cfg.get(k) or 'ask'
+                if m not in ('ask', 'always', 'skip_newer'):
+                    m = 'ask'
+                v.set(m)
+                continue
             if k in cfg and cfg[k]:
                 if k.endswith('_src') or k.endswith('_tgt'):
                     v.set(normalize_path_value(cfg[k]))
@@ -405,6 +695,12 @@ class AppGUI:
     def save_current_config(self):
         cfg = {}
         for k, v in self.vars.items():
+            if k == 'newer_overwrite_mode':
+                m = v.get().strip() or 'ask'
+                if m not in ('ask', 'always', 'skip_newer'):
+                    m = 'ask'
+                cfg[k] = m
+                continue
             value = v.get().strip()
             if k.endswith('_src') or k.endswith('_tgt'):
                 value = normalize_path_value(value)
@@ -505,17 +801,35 @@ class AppGUI:
                     else:
                         local_files.append(item.name)
 
-                report_lines.append(f"   📄 本地文件 ({len(local_files)}):")
+                report_lines.append(
+                    "   ℹ️ 说明：「本地文件」仅统计顶层、且名称不以 . 开头的文件；"
+                    "子目录内的文件见下方「递归文件总数」。"
+                )
+                report_lines.append(f"   📄 顶层本地文件 ({len(local_files)}):")
                 for f in local_files:
                     report_lines.append(f"      ✅ {f}")
+
+                report_lines.append(f"   👁️ 顶层隐藏项 ({len(hidden)})（名称以 . 开头，如 .git、.env）:")
+                for f in hidden:
+                    report_lines.append(f"      · {f}")
 
                 report_lines.append(f"   ☁️  iCloud云端 ({len(icloud_files)}):")
                 for f in icloud_files:
                     report_lines.append(f"      ☁️ {f}")
 
-                report_lines.append(f"   📁 子文件夹 ({len(dirs)}):")
+                report_lines.append(f"   📁 顶层子文件夹 ({len(dirs)}):")
                 for d in dirs:
                     report_lines.append(f"      📁 {d}")
+
+                total_under = _count_files_under(p)
+                if total_under is not None:
+                    report_lines.append(f"   📊 递归文件总数（含所有子文件夹）: {total_under}")
+                    if not local_files and total_under > 0:
+                        report_lines.append(
+                            "   💡 顶层没有「非隐藏文件」属正常：文件都在子文件夹里，抽存仍会递归备份。"
+                        )
+                else:
+                    report_lines.append("   📊 递归统计：无法遍历子目录（权限或拒绝访问）。")
 
                 if icloud_files:
                     report_lines.append(f"\n   ⚠️ 有 {len(icloud_files)} 个文件在iCloud云端！")
@@ -542,14 +856,34 @@ class AppGUI:
         if not self.check_source_permissions():
             return
         self.save_current_config()
-        run_morning_task()
+        session = {'decision': None}
+
+        def on_saved(mode):
+            self.vars['newer_overwrite_mode'].set(mode)
+
+        run_morning_task(
+            gui_master=self.root,
+            gui_interactive=True,
+            on_policy_saved=on_saved,
+            overwrite_session=session,
+        )
         messagebox.showinfo("完成", _sync_done_hint(morning=True))
 
     def force_evening(self):
         if not self.check_source_permissions():
             return
         self.save_current_config()
-        run_evening_task()
+        session = {'decision': None}
+
+        def on_saved(mode):
+            self.vars['newer_overwrite_mode'].set(mode)
+
+        run_evening_task(
+            gui_master=self.root,
+            gui_interactive=True,
+            on_policy_saved=on_saved,
+            overwrite_session=session,
+        )
         messagebox.showinfo("完成", _sync_done_hint(morning=False))
 
     def save_and_enable_daemon(self):
@@ -559,15 +893,24 @@ class AppGUI:
 
         try:
             if _IS_WIN:
-                _install_windows_startup_task()
+                method, extra = _install_windows_startup_task()
                 log_dir = os.path.join(
                     os.environ.get("TEMP", os.path.expanduser("~")), "knock_sync_logs"
                 )
-                messagebox.showinfo(
-                    "部署成功！",
-                    f"已创建登录时启动的后台任务（{WIN_TASK_NAME}）。\n"
-                    f"注销并重新登录后生效。\n后台日志目录：{log_dir}",
-                )
+                if method == "schtasks":
+                    msg = (
+                        f"已创建计划任务（{WIN_TASK_NAME}），登录后自动运行后台。\n"
+                        f"请注销并重新登录后生效。\n\n后台日志目录：{log_dir}"
+                    )
+                else:
+                    msg = (
+                        "当前系统不允许创建计划任务（常见于组策略/权限限制），"
+                        "已改为「启动」文件夹方式，效果同为登录后自动运行后台。\n\n"
+                        f"启动脚本：\n{extra}\n\n"
+                        "请注销并重新登录后生效；若不需要可删除上述 .cmd 文件。\n\n"
+                        f"后台日志目录：{log_dir}"
+                    )
+                messagebox.showinfo("部署成功！", msg)
             elif _IS_MAC:
                 current_script = os.path.abspath(sys.argv[0])
                 if getattr(sys, "frozen", False):
