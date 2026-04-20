@@ -1,975 +1,906 @@
-import os
 import sys
-import json
-import time
-import shutil
-import subprocess
-from xml.sax.saxutils import escape as _xml_escape
-from pathlib import Path
-from datetime import datetime
+import numpy as np
 import tkinter as tk
-from tkinter import filedialog, messagebox
+from tkinter import filedialog, messagebox, ttk
+from PIL import Image, ImageDraw, ImageFont, ImageTk, ImageChops, ImageFilter
+import os
+import platform
 
-# --- 全局常量 ---
-CONFIG_FILE = os.path.expanduser('~/.knock_sync_gui_config.json')
-PLIST_PATH = os.path.expanduser('~/Library/LaunchAgents/com.user.knock.sync.plist')
-PLIST_LABEL = "com.user.knock.sync"
-WIN_TASK_NAME = "KnockSyncBackupDaemon"
-WIN_STARTUP_CMD_NAME = "KnockSyncBackup-daemon.cmd"
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+except ImportError:
+    messagebox.showerror("缺少组件", "请在终端执行: pip install tkinterdnd2")
+    exit()
 
-_IS_WIN = sys.platform == "win32"
-_IS_MAC = sys.platform == "darwin"
+TEMPLATE_CONFIGS = {
+    "template_E6.png": {
+        "style": "E6_Classic",
+        "photo": {"size": 405, "x": 92, "y": 122},
+        # 主景横光辉（⑨）与昵称坐标解耦；默认与旧版「昵称默认位置」视觉对齐
+        "glow": {"x": 0, "y": 514},
+        "fields": {
+            "name": {"label": "✎ 玩家名称 (Name):", "size": 28, "x": 0, "y": 502,
+                     "color": "#FAD355", "stroke": "#111111"}
+        }
+    },
+    "template_E7.png": {
+        "style": "E7_Italic",
+        "photo": {"size": 240, "x": 417, "y": 90},
+        "fields": {
+            "name": {"label": "✎ 玩家昵称 (Name):", "size": 26, "x": -6, "y": 311,
+                     "color": "#FFFFFF", "stroke": "#111111"},
+            "city": {"label": "⌂ 玩家城市 (City):", "size": 23, "x": -6, "y": 351,
+                     "color": "#FAD355", "stroke": "#111111"}
+        }
+    }
+}
 
-
-def _daemon_log_paths():
-    """后台任务日志路径（与界面提示一致）。"""
-    if _IS_WIN:
-        base = os.path.join(os.environ.get("TEMP", os.path.expanduser("~")), "knock_sync_logs")
-        os.makedirs(base, exist_ok=True)
-        return (
-            os.path.join(base, "knock_sync_out.log"),
-            os.path.join(base, "knock_sync_err.log"),
-        )
-    return "/tmp/knock_sync_out.log", "/tmp/knock_sync_err.log"
-
-
-def _redirect_daemon_stdio_if_needed():
-    """Windows 下无控制台时，将 print 写入临时目录日志。"""
-    if not _IS_WIN or not getattr(sys, "frozen", False):
-        return
-    try:
-        out_p, err_p = _daemon_log_paths()
-        sys.stdout = open(out_p, "a", encoding="utf-8", buffering=1)
-        sys.stderr = open(err_p, "a", encoding="utf-8", buffering=1)
-    except Exception:
-        pass
-
-
-def _win_daemon_tr_string(exe_path):
-    """供 schtasks /tr 使用的命令行（处理路径中的空格）。"""
-    exe_path = os.path.normpath(exe_path)
-    if " " in exe_path:
-        return f'"{exe_path}" --daemon'
-    return f"{exe_path} --daemon"
+C0 = "#0D0D0D"
+C1 = "#161616"
+C2 = "#222222"
+C3 = "#333333"
+CG = "#D4AF37"
+CT = "#E6C27A"
+CW = "#E0E0E0"
 
 
-def _windows_task_command_line():
-    """当前进程对应的「登录时启动后台」完整命令行。"""
-    if getattr(sys, "frozen", False):
-        return _win_daemon_tr_string(os.path.realpath(sys.executable))
-    py = os.path.normpath(sys.executable)
-    script = os.path.normpath(os.path.abspath(sys.argv[0]))
-    return f'"{py}" "{script}" --daemon'
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("宣传图制作工作台 V2.2")
+        self.root.geometry("1400x850")
+        self.root.configure(bg=C0)
+        self.app_dir = self._ap()
+        self.queue = []
+        self.cur = None
+        self.final = None
+        self.fc = {}
+        self.sfonts = self._sf()
+        self.fld = {}
+        self._rp = None
+        self._ri = None
+        self._tn = None
+        self.ti = None
+        self.pi = None
+        self.sc = 1.0
+        self.vx = self.vy = 0
+        self.dsx = self.dsy = self.dbx = self.dby = 0
+        self.psx = self.psy = self.bvx = self.bvy = 0
+        self.tki = None
+        self.cid = None
+        self._f1 = True
+        self._rj = None
 
+        st = ttk.Style()
+        st.theme_use('clam')
+        st.configure("TCombobox", fieldbackground=C3, background=C2,
+                     foreground=CG, arrowcolor=CG, bordercolor=C2)
+        st.map("TCombobox", fieldbackground=[("readonly", C3)],
+               selectbackground=[("readonly", CG)], selectforeground=[("readonly", "black")],
+               foreground=[("readonly", CG)])
+        for k, v in [('background', C3), ('foreground', CG),
+                     ('selectBackground', CG), ('selectForeground', 'black')]:
+            self.root.option_add(f'*TCombobox*Listbox.{k}', v)
 
-def _win_startup_cmd_path():
-    """当前用户「启动」文件夹中的本程序启动脚本路径。"""
-    appdata = os.environ.get("APPDATA")
-    if not appdata:
-        return None
-    return os.path.join(
-        appdata,
-        "Microsoft",
-        "Windows",
-        "Start Menu",
-        "Programs",
-        "Startup",
-        WIN_STARTUP_CMD_NAME,
-    )
+        self._ui()
+        self._st()
+        self._dnd()
 
+    @staticmethod
+    def _ap():
+        if getattr(sys, 'frozen', False):
+            return os.path.dirname(sys.executable)
+        return os.path.dirname(os.path.abspath(__file__))
 
-def _remove_windows_startup_cmd():
-    p = _win_startup_cmd_path()
-    if p and os.path.isfile(p):
+    def _ui(self):
+        L = tk.Frame(self.root, bg=C1, width=420)
+        L.pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=10)
+        L.pack_propagate(False)
+        tk.Label(L, text="⚜️ 核心工作台", fg=CG, bg=C1,
+                 font=("Microsoft YaHei UI", 18, "bold")).pack(pady=(15, 10))
+
+        b1 = tk.LabelFrame(L, text=" 模板与录入 ", bg=C2, fg=CG,
+                           font=("Microsoft YaHei UI", 11, "bold"), bd=1)
+        b1.pack(fill=tk.X, padx=10, pady=5)
+        self.cmb = ttk.Combobox(b1, state="readonly", font=("Arial", 12, "bold"))
+        self.cmb.pack(fill=tk.X, padx=15, pady=(15, 10))
+        self.cmb.bind("<<ComboboxSelected>>", self._tc)
+        tk.Button(b1, text="[ 点击多选 / 拖入图片 ]\n建立批量排队", command=self._sel,
+                  bg="#2B2B2B", fg=CT, activebackground=CG, activeforeground="black",
+                  font=("Microsoft YaHei UI", 10), height=2, relief="groove"
+                  ).pack(fill=tk.X, padx=15, pady=(5, 10))
+        self.lq = tk.Label(b1, text="[队列空闲]", fg="#888", bg=C2,
+                           font=("Microsoft YaHei UI", 9))
+        self.lq.pack(pady=(0, 10))
+
+        b2 = tk.LabelFrame(L, text=" 空间参数 ", bg=C2, fg=CG,
+                           font=("Microsoft YaHei UI", 10), bd=1)
+        b2.pack(fill=tk.X, padx=10, pady=5)
+        fp = tk.Frame(b2, bg=C2)
+        fp.pack(pady=10)
+
+        def mks(p, t, lo, hi, c):
+            tk.Label(p, text=t, bg=C2, fg=CW,
+                     font=("Microsoft YaHei", 9)).grid(row=0, column=c * 2, padx=(5, 0))
+            s = tk.Spinbox(p, from_=lo, to=hi, width=5, bg=C3, fg=CG,
+                           insertbackground=CG, buttonbackground=C2)
+            s.grid(row=0, column=c * 2 + 1, padx=2)
+            return s
+
+        self.ssz = mks(fp, "宽:", 10, 8000, 0)
+        self.sx = mks(fp, "X:", -4000, 4000, 1)
+        self.sy = mks(fp, "Y:", -4000, 4000, 2)
+        self.ssz.config(command=self._full)
+        self.ssz.bind("<Return>", lambda e: self._full())
+        self.sx.config(command=self._fast)
+        self.sx.bind("<Return>", lambda e: self._fast())
+        self.sy.config(command=self._fast)
+        self.sy.bind("<Return>", lambda e: self._fast())
+
+        b3 = tk.LabelFrame(L, text=" 🌟 光效 ", bg=C2, fg=CG,
+                           font=("Microsoft YaHei UI", 10), bd=1)
+        b3.pack(fill=tk.X, padx=10, pady=5)
+
+        def mksc(par, txt, lo, hi, val):
+            f = tk.Frame(par, bg=C2)
+            f.pack(fill=tk.X, padx=10, pady=4)
+            tk.Label(f, text=txt, bg=C2, fg=CW,
+                     font=("Microsoft YaHei", 9)).pack(side=tk.LEFT)
+            s = tk.Scale(f, from_=lo, to=hi, orient=tk.HORIZONTAL, bg=C2, fg=CG,
+                         bd=0, highlightthickness=0, troughcolor=C3,
+                         activebackground=CG, command=lambda v: self._fast())
+            s.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10)
+            s.set(val)
+            return s
+
+        self.sli = mksc(b3, "光线强度:", 0, 100, 80)
+        self.sfl = mksc(b3, "横光偏移:", -200, 200, 23)
+
+        # E6 专用：主景横光辉位置（与昵称「左右/上下」独立）
+        self.fglow = tk.Frame(b3, bg=C2)
+
+        def mkg(p, t, lo, hi):
+            tk.Label(p, text=t, bg=C2, fg=CW,
+                     font=("Microsoft YaHei", 9)).pack(side=tk.LEFT)
+            s = tk.Spinbox(p, from_=lo, to=hi, width=6, bg=C3, fg=CG,
+                           insertbackground=CG, buttonbackground=C2,
+                           command=self._fast)
+            s.pack(side=tk.LEFT, padx=8)
+            s.bind("<Return>", lambda e: self._fast())
+            return s
+
+        gf = tk.Frame(self.fglow, bg=C2)
+        gf.pack(fill=tk.X, padx=10, pady=4)
+        self.sgx = mkg(gf, "横光左右:", -2000, 2000)
+        self.sgy = mkg(gf, "横光上下:", -500, 2500)
+
+        self.btxt = tk.LabelFrame(L, text=" 文字编辑 ", bg=C2, fg=CG,
+                                  font=("Microsoft YaHei UI", 10), bd=1)
+        self.btxt.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        bf = tk.Frame(L, bg=C1)
+        bf.pack(fill=tk.X, padx=10, pady=15, side=tk.BOTTOM)
+        tk.Button(bf, text="⟳ 刷新", command=self._full, bg="#222", fg=CW,
+                  relief="groove").pack(fill=tk.X, pady=(0, 10))
+        self.bsv = tk.Button(bf, text="✦ 渲染输出 ✦", command=self._save, bg=CG,
+                             fg="black", activebackground="#FFE47A", activeforeground="black",
+                             font=("Microsoft YaHei UI", 13, "bold"), height=2,
+                             state="disabled", cursor="hand2")
+        self.bsv.pack(fill=tk.X)
+
+        R = tk.LabelFrame(self.root,
+                          text=" 🖥️ [滚轮缩放] [Ctrl+滚轮调大小] [左键拖] [右键平移] ",
+                          bg=C0, fg=CG, font=("Microsoft YaHei UI", 11, "bold"), bd=1)
+        R.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(0, 10), pady=10)
+        self.cv = tk.Canvas(R, bg="#080808", highlightthickness=0, cursor="tcross")
+        self.cv.pack(fill=tk.BOTH, expand=True)
+        self.cv.create_text(400, 300, text="等待图像…", fill="#444",
+                            font=("Microsoft YaHei", 16))
+        for ev, fn in [("<MouseWheel>", self._zm), ("<Button-4>", self._zm),
+                       ("<Button-5>", self._zm), ("<Control-MouseWheel>", self._czm),
+                       ("<Control-Button-4>", self._czm), ("<Control-Button-5>", self._czm),
+                       ("<ButtonPress-1>", self._ds), ("<B1-Motion>", self._dm),
+                       ("<ButtonPress-3>", self._ps), ("<B3-Motion>", self._pm),
+                       ("<ButtonPress-2>", self._ps), ("<B2-Motion>", self._pm),
+                       ("<Control-ButtonPress-1>", self._ps), ("<Control-B1-Motion>", self._pm)]:
+            self.cv.bind(ev, fn)
+
+    def _dnd(self):
         try:
-            os.remove(p)
-        except OSError:
+            self.root.drop_target_register(DND_FILES)
+            self.root.dnd_bind('<<Drop>>',
+                               lambda e: self._aq(self.root.tk.splitlist(e.data)))
+        except:
+            pass
+
+    def _sel(self):
+        p = filedialog.askopenfilenames(
+            title="选择照片", filetypes=[("Images", "*.png *.jpg *.jpeg *.webp")])
+        if p:
+            self._aq(p)
+
+    def _aq(self, paths):
+        v = [p for p in paths
+             if str(p).lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))]
+        if not v:
+            return
+        self.queue.extend(v)
+        if not self.cur:
+            self._nx()
+        else:
+            self._uq()
+
+    def _nx(self):
+        if not self.queue:
+            self.cur = None
+            self.lq.config(text="✅ 完成", fg="#2ECC71")
+            self.bsv.config(state="disabled", text="✦ 输出 ✦")
+            return
+        self.cur = self.queue.pop(0)
+        self._uq()
+        self._full()
+
+    def _uq(self):
+        nm = os.path.basename(self.cur)
+        r = len(self.queue)
+        if r > 0:
+            self.lq.config(text=f"▶ {nm} | ⏳{r}张", fg=CT)
+            self.bsv.config(text=f"✦ 保存并下一张({r}) ✦")
+        else:
+            self.lq.config(text=f"▶ {nm} | 🏁最后", fg=CG)
+            self.bsv.config(text="✦ 保存终图 ✦")
+
+    def _save(self):
+        if not self.final or not self.cur:
+            return
+        try:
+            d = os.path.dirname(self.cur)
+            n = os.path.splitext(os.path.basename(self.cur))[0]
+            tpl = self.cmb.get().lower()
+            pfx = "E7出图" if "e7" in tpl else "E6出图"
+            self.final.save(
+                os.path.join(d, f"{pfx}-{n}.png"),
+                format="PNG",
+                optimize=False,
+                compress_level=0
+            )
+            self._nx()
+            if not self.queue and not self.cur:
+                messagebox.showinfo("收工", "🎉 全部完成！")
+        except Exception as e:
+            messagebox.showerror("异常", str(e))
+
+    def _st(self):
+        vl = []
+        try:
+            for f in os.listdir(self.app_dir):
+                lo = f.lower()
+                if "template_e6" in lo and lo.endswith(('.png', '.jpg')):
+                    vl.append(f)
+                    TEMPLATE_CONFIGS[f] = TEMPLATE_CONFIGS["template_E6.png"]
+                elif "template_e7" in lo and lo.endswith(('.png', '.jpg')):
+                    vl.append(f)
+                    TEMPLATE_CONFIGS[f] = TEMPLATE_CONFIGS["template_E7.png"]
+        except:
+            pass
+        if vl:
+            self.cmb['values'] = vl
+            self.cmb.current(0)
+            self._tc()
+        else:
+            messagebox.showwarning("警告", "没找到模板！")
+
+    def _tc(self, ev=None):
+        cfg = TEMPLATE_CONFIGS.get(self.cmb.get())
+        if not cfg:
+            return
+        for s, k in [(self.ssz, "size"), (self.sx, "x"), (self.sy, "y")]:
+            s.delete(0, 'end')
+            s.insert(0, cfg["photo"][k])
+        gv = cfg.get("glow", {"x": 0, "y": 514})
+        self.sgx.delete(0, 'end')
+        self.sgx.insert(0, str(gv.get("x", 0)))
+        self.sgy.delete(0, 'end')
+        self.sgy.insert(0, str(gv.get("y", 514)))
+        if cfg.get("style") == "E6_Classic":
+            self.fglow.pack(fill=tk.X, padx=0, pady=0)
+        else:
+            self.fglow.pack_forget()
+        self.vx = self.vy = 0
+        for w in self.btxt.winfo_children():
+            w.destroy()
+        self.fld.clear()
+        for fk, fv in cfg["fields"].items():
+            g = tk.Frame(self.btxt, bg=C2)
+            g.pack(fill=tk.X, padx=10, pady=(8, 0))
+            tk.Label(g, text=fv["label"], fg=CT, bg=C2,
+                     font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
+            ent = tk.Entry(g, font=("Trebuchet MS", 12), justify="center",
+                           bg=C3, fg=CG, insertbackground=CG, bd=0)
+            ent.pack(fill=tk.X, ipady=4, pady=2)
+            ent.bind("<KeyRelease>", lambda e: self._fast())
+            fc = tk.Frame(g, bg=C2)
+            fc.pack(fill=tk.X, pady=2)
+
+            def mk(p, t, a, b):
+                tk.Label(p, text=t, bg=C2, fg=CW,
+                         font=("Microsoft YaHei", 8)).pack(side=tk.LEFT, padx=(5, 0))
+                s = tk.Spinbox(p, from_=a, to=b, width=4, bg=C3, fg=CG,
+                               buttonbackground=C2, command=self._fast)
+                s.pack(side=tk.LEFT, padx=2)
+                s.bind("<Return>", lambda e: self._fast())
+                return s
+
+            ss = mk(fc, "字号:", 10, 400)
+            ss.delete(0, 'end')
+            ss.insert(0, fv["size"])
+            sxx = mk(fc, "左右:", -1000, 1000)
+            sxx.delete(0, 'end')
+            sxx.insert(0, fv["x"])
+            syy = mk(fc, "上下:", -500, 2000)
+            syy.delete(0, 'end')
+            syy.insert(0, fv["y"])
+            self.fld[fk] = {"e": ent, "ss": ss, "sx": sxx, "sy": syy,
+                            "c": fv["color"], "s": fv["stroke"]}
+        if self.cur:
+            self._full()
+
+            # ═══ 画布交互 ═══
+
+    def _zm(self, e):
+        if not self.final or e.state & 0x0004:
+            return
+        self.sc *= 1.15 if (e.delta > 0 or e.num == 4) else 1 / 1.15
+        self._disp()
+
+    def _czm(self, e):
+        if not self.final:
+            return
+        try:
+            c = int(self.ssz.get())
+            d = getattr(e, 'delta', 0)
+            if e.num == 4 or d > 0:
+                n = int(c * 1.05) + 2
+            elif e.num == 5 or d < 0:
+                n = int(c * 0.95) - 2
+            else:
+                return
+            self.ssz.delete(0, 'end')
+            self.ssz.insert(0, str(max(10, min(n, 8000))))
+            self._full()
+        except:
+            pass
+
+    def _ds(self, e):
+        if not self.final:
+            return
+        self.dsx = e.x
+        self.dsy = e.y
+        try:
+            self.dbx = int(self.sx.get())
+            self.dby = int(self.sy.get())
+        except:
+            pass
+
+    def _dm(self, e):
+        if not self.final:
+            return
+        self.sx.delete(0, 'end')
+        self.sx.insert(0, int(self.dbx + (e.x - self.dsx) / self.sc))
+        self.sy.delete(0, 'end')
+        self.sy.insert(0, int(self.dby + (e.y - self.dsy) / self.sc))
+        self._fast()
+
+    def _ps(self, e):
+        if not self.final:
+            return
+        self.psx = e.x
+        self.psy = e.y
+        self.bvx = self.vx
+        self.bvy = self.vy
+
+    def _pm(self, e):
+        if not self.final or not self.cid:
+            return
+        self.vx = self.bvx + (e.x - self.psx)
+        self.vy = self.bvy + (e.y - self.psy)
+        self.cv.coords(self.cid, self.cv.winfo_width() / 2 + self.vx,
+                       self.cv.winfo_height() / 2 + self.vy)
+
+        # ═══ 字体 ═══
+
+    def _sf(self):
+        sys_name = platform.system().lower()
+        if sys_name == "windows":
+            fd = "C:\\Windows\\Fonts"
+            names = ["seguiemj.ttf", "seguisym.ttf", "impact.ttf", "arialbd.ttf",
+                     "msyhbd.ttc", "tahomabd.ttf", "tahoma.ttf", "arial.ttf",
+                     "msyh.ttc", "simsun.ttc"]
+        elif sys_name == "darwin":
+            fd = "/System/Library/Fonts"
+            names = [
+                "PingFang.ttc", "Helvetica.ttc", "HelveticaNeue.ttc",
+                "Arial.ttf", "Arial Bold.ttf", "Hiragino Sans GB.ttc",
+                "STHeiti Medium.ttc", "Apple Color Emoji.ttc"
+            ]
+        else:
+            fd = "/usr/share/fonts"
+            names = [
+                "NotoSansCJK-Regular.ttc", "NotoSansCJK-Bold.ttc",
+                "DejaVuSans.ttf", "LiberationSans-Regular.ttf"
+            ]
+        pri = []
+        for n in names:
+            full = os.path.join(fd, n)
+            pri.append(full if os.path.exists(full) else n)
+        try:
+            extra_dirs = [fd]
+            if sys_name == "darwin":
+                extra_dirs.extend([
+                    "/Library/Fonts",
+                    os.path.expanduser("~/Library/Fonts")
+                ])
+            elif sys_name == "linux":
+                extra_dirs.extend([
+                    "/usr/local/share/fonts",
+                    os.path.expanduser("~/.fonts")
+                ])
+            ex = set(os.path.basename(p).lower() for p in pri)
+            ext = []
+            for d in extra_dirs:
+                if not os.path.isdir(d):
+                    continue
+                for f in os.listdir(d):
+                    lo = f.lower()
+                    if lo.endswith(('.ttf', '.ttc', '.otf')) and lo not in ex:
+                        ext.append(os.path.join(d, f))
+            return pri + ext
+        except:
+            return pri
+
+    def _gf(self, char, size):
+        ck = f"{char}_{size}"
+        if ck in self.fc:
+            return self.fc[ck]
+        fpk = f"__fp_{ord(char)}"
+        if fpk in self.fc:
+            try:
+                f = ImageFont.truetype(self.fc[fpk], size)
+                self.fc[ck] = (f, char)
+                return f, char
+            except:
+                del self.fc[fpk]
+        for fp in self.sfonts:
+            try:
+                f = ImageFont.truetype(fp, size)
+                if f.getlength(char) <= 0:
+                    continue
+                if not self._fok(fp, char):
+                    continue
+                self.fc[ck] = (f, char)
+                self.fc[fpk] = fp
+                return f, char
+            except:
+                continue
+        return ImageFont.load_default(), char
+
+    def _fok(self, fp, char):
+        k = f"__ok_{fp}_{ord(char)}"
+        if k in self.fc:
+            return self.fc[k]
+        ok = False
+        try:
+            tf = ImageFont.truetype(fp, 20)
+            m1 = tf.getmask(char)
+            m2 = tf.getmask('\ufffe')
+            if m1.size != m2.size:
+                ok = m1.getbbox() is not None
+            else:
+                ok = (m1.tobytes() != m2.tobytes()) and (m1.getbbox() is not None)
+        except:
+            pass
+        self.fc[k] = ok
+        return ok
+
+        # ═══ 文字渲染引擎 ═══
+
+    def _dtxt(self, tgt, text, tw, th, sz, ox, yp, mc, sc_, sty):
+
+        # 极限 5 倍超采样抗锯齿 (SSAA)
+        SSA = 5
+        sz_s = sz * SSA
+
+        cd = []
+        totw_s = 0
+        for ch in text:
+            if ch.isspace():
+                w_s = sz_s * 0.4
+                cd.append((" ", None, w_s))
+                totw_s += w_s
+                continue
+            fn, fc = self._gf(ch, sz_s)
+            try:
+                w_s = fn.getlength(fc)
+            except:
+                w_s = sz_s * 0.8
+            cd.append((fc, fn, w_s))
+            totw_s += w_s
+
+        pad_s = int(sz_s * 2.5)
+        cw_s = int(totw_s + pad_s * 2)
+        cvh_s = int(sz_s * 4.5)
+        tx_s = pad_s
+        ty_s = sz_s
+        bw_s = max(1, int(sz_s * 0.045))
+
+        mt = Image.new("L", (cw_s, cvh_s), 0)
+        dt = ImageDraw.Draw(mt)
+        sw_s = max(2, int(sz_s * 0.07))
+        mo = Image.new("L", (cw_s, cvh_s), 0)
+        do = ImageDraw.Draw(mo)
+        gw_s = max(6, int(sz_s * 0.22))
+        mg = Image.new("L", (cw_s, cvh_s), 0)
+        dg_ = ImageDraw.Draw(mg)
+
+        # 极薄厚底设置 (使用超采样尺度)
+        dep_s = max(1, int(sz_s * 0.025))
+
+        ra = 0
+        for _, fn, _ in cd:
+            if fn:
+                ra = fn.getmetrics()[0]
+                break
+
+        cx_s = tx_s
+        for c, fn, w_s in cd:
+            if fn:
+                dy = ra - fn.getmetrics()[0]
+                dt.text((cx_s, ty_s + dy), c, font=fn, fill=255,
+                        stroke_width=bw_s, stroke_fill=255)
+                do.text((cx_s, ty_s + dy), c, font=fn, fill=255,
+                        stroke_width=sw_s + bw_s, stroke_fill=255)
+                dg_.text((cx_s, ty_s + dy), c, font=fn, fill=255,
+                         stroke_width=gw_s + bw_s, stroke_fill=255)
+            cx_s += w_s
+
+        gold = mc != "#FFFFFF"
+        up = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
+        is7 = sty == "E7_Italic"
+
+        if gold and not is7:
+            gr_s = max(3, int(sz_s * 0.18))
+            gb = mg.filter(ImageFilter.GaussianBlur(radius=gr_s))
+            gt = Image.new("RGBA", (cw_s, cvh_s), (255, 190, 60, 0))
+            ga = np.array(gb, dtype=np.float32) / 255.0
+            yt0 = max(0, ty_s - int(sz_s * 0.3))
+            yb0 = min(cvh_s - 1, ty_s + int(sz_s * 1.6))
+            vt = np.zeros(cvh_s, dtype=np.float32)
+            for y in range(cvh_s):
+                if y <= yt0:
+                    vt[y] = 0.02
+                elif y <= yb0:
+                    vt[y] = 0.02 + 0.98 * ((y - yt0) / max(1, yb0 - yt0))
+                else:
+                    vt[y] = 1.0
+            al = np.clip(ga * vt.reshape(-1, 1) * 0.8 * 255, 0, 255).astype(np.uint8)
+            gt.putalpha(Image.fromarray(al))
+            up.alpha_composite(gt)
+        elif not gold:
+            gr_s = max(3, int(sz_s * 0.18))
+            gb = mg.filter(ImageFilter.GaussianBlur(radius=gr_s))
+            gt = Image.new("RGBA", (cw_s, cvh_s), (180, 200, 255, 0))
+            gt.putalpha(gb.point(lambda p: min(255, int(p * 0.35))))
+            up.alpha_composite(gt)
+
+            # 👇 --- 修改点 7：为 E6 和 E7 重启统一的顶光阴影系统 --- 👇
+        m_full = mt.copy()
+        for i in range(1, dep_s + 1):
+            shifted = Image.new("L", (cw_s, cvh_s), 0)
+            shifted.paste(mt, (0, i))
+            m_full = ImageChops.lighter(m_full, shifted)
+
+        olw_s = max(1, int(sz_s * 0.025))
+        expanded = m_full.filter(ImageFilter.MaxFilter(olw_s * 2 + 1))
+
+        shifted_expanded = Image.new("L", (cw_s, cvh_s), 0)
+        shifted_expanded.paste(expanded, (0, olw_s + 1))
+
+        ring = ImageChops.subtract(shifted_expanded, m_full)
+        ring_soft = ring.filter(ImageFilter.GaussianBlur(2.5))
+
+        # 为金字和白字分别配制最合适的阴影颜色和透明度
+        if gold:
+            ring_soft = ring_soft.point(lambda p: int(p * 0.65))  # 金字用65%透明度
+            shadow_color = (20, 10, 0, 255)  # 暖暗褐色
+        else:
+            ring_soft = ring_soft.point(lambda p: int(p * 0.80))  # 白字需要更高透明度(80%)分离背景
+            shadow_color = (15, 15, 20, 255)  # 冷暗灰偏青色
+
+        ol_layer = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
+        ol_layer.paste(Image.new("RGBA", (cw_s, cvh_s), shadow_color), mask=ring_soft)
+        up.alpha_composite(ol_layer)
+        # 👆 ----------------------------------------------------------- 👆
+
+        # ③ 斜面厚度特效
+        bev_dep_s = max(2, dep_s // 2) if is7 else dep_s
+        for i in range(bev_dep_s, 0, -1):
+            t = i / max(1, bev_dep_s)
+            if gold:
+                r = int(230 * t + 185 * (1 - t))
+                g = int(180 * t + 145 * (1 - t))
+                b = int(45 * t + 15 * (1 - t))
+            else:
+                v = int(90 * t + 55 * (1 - t))
+                r, g, b = v, v, int(v * 1.1)
+            up.paste(Image.new("RGBA", (cw_s, cvh_s), (r, g, b, 255)),
+                     (0, i), mask=mt)
+
+            # ④ 渐变补色
+        if gold:
+            stops = [
+                (0.00, (255, 255, 245)),
+                (0.25, (255, 235, 120)),
+                (0.60, (220, 160, 20)),
+                (1.00, (110, 60, 0)),
+            ]
+        else:
+            stops = [
+                (0.00, (255, 255, 255)), (0.25, (238, 240, 248)),
+                (0.45, (175, 180, 200)), (0.55, (148, 152, 172)),
+                (0.75, (215, 220, 235)), (1.00, (248, 250, 255)),
+            ]
+
+        grd = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
+        gd = ImageDraw.Draw(grd)
+
+        bbox = mt.getbbox()
+        if bbox:
+            yt_s = bbox[1]
+            yb_s = bbox[3]
+        else:
+            yt_s = ty_s - int(sz_s * 0.08)
+            yb_s = ty_s + int(sz_s * 1.08)
+
+        sp_s = max(1, yb_s - yt_s)
+        for y in range(yt_s, yb_s + 1):
+            t = max(0.0, min(1.0, (y - yt_s) / sp_s))
+            lo, hi = stops[0], stops[-1]
+            for j in range(len(stops) - 1):
+                if stops[j][0] <= t <= stops[j + 1][0]:
+                    lo, hi = stops[j], stops[j + 1]
+                    break
+            f = (t - lo[0]) / max(0.0001, hi[0] - lo[0])
+            f = max(0.0, min(1.0, f))
+            f = f * f * (3 - 2 * f)
+            rgb = tuple(int(lo[1][c] + (hi[1][c] - lo[1][c]) * f) for c in range(3))
+            gd.line([(0, y), (cw_s, y)], fill=(*rgb, 255))
+
+        fc2 = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
+        fc2.paste(grd, mask=mt)
+        up.alpha_composite(fc2)
+
+        # ⑤ 高光点缀
+        si = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
+        sd = ImageDraw.Draw(si)
+        if gold:
+            cy2_s = ty_s + int(sz_s * 0.18)
+            cr_s = int(sz_s * 0.22)
+            for y in range(cy2_s - cr_s, cy2_s + cr_s):
+                d = abs(y - cy2_s) / max(1, cr_s)
+                a = int(140 * max(0, 1 - d ** 1.4))
+                if a > 0:
+                    sd.line([(0, y), (cw_s, y)], fill=(255, 255, 240, a))
+        else:
+            cy2_s = ty_s + int(sz_s * 0.2)
+            cr_s = int(sz_s * 0.18)
+            for y in range(cy2_s - cr_s, cy2_s + cr_s):
+                d = abs(y - cy2_s) / max(1, cr_s)
+                a = int(120 * max(0, 1 - d ** 1.5))
+                if a > 0:
+                    sd.line([(0, y), (cw_s, y)], fill=(255, 255, 255, a))
+        sf = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
+        sf.paste(si, mask=mt)
+        up.alpha_composite(sf)
+
+        # ⑥ 顶部微射反光
+        if gold:
+            eh = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
+            ed = ImageDraw.Draw(eh)
+            rim_s = max(2, int(sz_s * 0.1))
+            for y in range(yt_s, yt_s + rim_s):
+                a = int(130 * (1 - (y - yt_s) / max(1, rim_s)))
+                ed.line([(0, y), (cw_s, y)], fill=(255, 255, 248, a))
+            ef = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
+            ef.paste(eh, mask=mt)
+            up.alpha_composite(ef)
+
+            # ⑧ 斜体变形 (完美抗锯齿变形，阴影也会一起自然横斜！)
+        if is7:
+            stamp_s = up.transform((cw_s, cvh_s), Image.AFFINE,
+                                   (1, 0.22, -0.22 * (cvh_s / 2), 0, 1, 0),
+                                   resample=Image.Resampling.BICUBIC)
+        else:
+            stamp_s = up
+
+            # --- 降采样（消除所有锯齿并缩回到目标尺寸） ---
+        target_cw = int(cw_s / SSA)
+        target_cvh = int(cvh_s / SSA)
+        stamp = stamp_s.resize((target_cw, target_cvh), Image.Resampling.LANCZOS)
+
+        # 等比还原物理坐标系统
+        totw = totw_s / SSA
+        tx_ = tx_s / SSA
+        ty_ = ty_s / SSA
+
+        # ⑨ 主景横光辉（仅E6）（保持独立背景层）
+        if gold and not is7:
+            foff = int(self.sfl.get())
+            bwf, bhf = 520, 260
+            xg = np.linspace(-1, 1, bwf)
+            yg = np.linspace(-1, 1, bhf)
+            xx, yy = np.meshgrid(xg, yg)
+            core = np.exp(-(xx ** 2 / 0.01 + yy ** 2 / 0.008))
+            vs = np.maximum(0.0005, 0.014 * (1 - np.abs(xx) ** 1.6 * 0.88))
+            streak = np.exp(-(xx ** 2 / 3.5)) * np.exp(-(yy ** 2 / vs))
+            mid = np.exp(-(xx ** 2 / 0.25 + yy ** 2 / 0.018))
+            amb = np.exp(-(xx ** 2 / 0.08 + yy ** 2 / 0.035))
+            li = np.clip(core + streak * 0.65 + mid * 0.28 + amb * 0.18,
+                         0, 1).astype(np.float32)
+            rgba = np.zeros((bhf, bwf, 4), dtype=np.uint8)
+            rgba[..., 0] = np.minimum(255, 255 * li).astype(np.uint8)
+            rgba[..., 1] = np.minimum(255, 225 * li).astype(np.uint8)
+            rgba[..., 2] = np.minimum(255, 100 * li).astype(np.uint8)
+            rgba[..., 3] = np.minimum(255, 120 * li).astype(np.uint8)
+            fo = Image.fromarray(rgba, "RGBA")
+            ow2 = min(tw, int(totw * 5))
+            oh2 = int(sz * 3)
+            fo = fo.resize((ow2, oh2), Image.Resampling.BICUBIC)
+            try:
+                gx = int(self.sgx.get())
+                gy = int(self.sgy.get())
+            except Exception:
+                gx, gy = 0, 514
+            cxd = int(tw / 2 + gx) - ow2 // 2
+            cyd = gy + foff - oh2 // 2
+            bl = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
+            bl.paste(fo, (cxd, cyd))
+            tgt.alpha_composite(bl)
+
+        tgt.alpha_composite(stamp,
+                            dest=(int((tw - totw) / 2 + ox - tx_), int(yp - ty_)))
+
+        # ═══ 渲染管线 ═══
+
+    def _full(self):
+        if not self.cur:
+            return
+        try:
+            self.root.update_idletasks()
+            tn = self.cmb.get()
+            rw = int(self.ssz.get())
+            if self._tn != tn:
+                self.ti = Image.open(os.path.join(self.app_dir, tn)).convert("RGBA")
+                self._tn = tn
+            if self._rp != self.cur:
+                self._ri = Image.open(self.cur).convert("RGBA")
+                self._rp = self.cur
+            ow, oh = self._ri.size
+            r = rw / float(ow) if ow > 0 else 1
+            self.pi = self._ri.resize((rw, max(1, int(oh * r))),
+                                      Image.Resampling.LANCZOS)
+            if self._f1:
+                self.sc = 0.6 if self.ti.size[0] > 800 else 1.0
+                self._f1 = False
+            self._do_render()
+            self.bsv.config(state="normal")
+        except:
+            pass
+
+    def _fast(self):
+        if self._rj:
+            self.root.after_cancel(self._rj)
+        self._rj = self.root.after(30, self._do_render)
+
+    def _do_render(self):
+        self._rj = None
+        if not self.ti or not self.pi:
+            return
+        try:
+            px = int(self.sx.get())
+            py = int(self.sy.get())
+            tn = self.cmb.get()
+            ts = TEMPLATE_CONFIGS.get(
+                next((k for k in TEMPLATE_CONFIGS if k == tn), None), {}
+            ).get("style", "E6_Classic")
+            tw, th = self.ti.size
+
+            pl = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
+            pl.paste(self.pi, (px, py))
+
+            lv = int(self.sli.get())
+            if lv > 0:
+                ins = lv / 100.0
+                rv, gv, bv, pa = pl.split()
+                rgb = Image.merge("RGB", (rv, gv, bv))
+                gt = Image.new("RGB", (tw, th), (255, 185, 50))
+                cg = Image.blend(rgb, ImageChops.multiply(rgb, gt),
+                                 0.35 * ins).convert("RGBA")
+
+                lw2, lh2 = 160, 160
+                md = (lw2 ** 2 + lh2 ** 2) ** 0.5
+                ms = ((lw2 / 2) ** 2 + lh2 ** 2) ** 0.5
+                yy, xx = np.mgrid[0:lh2, 0:lw2]
+                xx_f = xx.astype(np.float64)
+                yy_f = yy.astype(np.float64)
+
+                dL = np.sqrt(xx_f ** 2 + yy_f ** 2)
+                pL = np.clip(1 - dL / (md * 0.85), 0, 1) ** 1.6
+                dR = np.sqrt((lw2 - xx_f) ** 2 + yy_f ** 2)
+                pR = np.clip(1 - dR / (md * 0.85), 0, 1) ** 1.6
+                tp = np.clip(pL + pR, 0, 1)
+                la = np.zeros((lh2, lw2, 4), dtype=np.uint8)
+                la[..., 0] = 255
+                la[..., 1] = 235
+                la[..., 2] = 150
+                la[..., 3] = np.minimum(255, (190 * tp * ins)).astype(np.uint8)
+                lb = Image.fromarray(la, "RGBA")
+
+                ds = np.sqrt((lw2 / 2 - xx_f) ** 2 + (lh2 - yy_f) ** 2)
+                sr = np.clip(1 - ds / (ms * 0.9), 0, 1)
+                sa = np.zeros((lh2, lw2, 4), dtype=np.uint8)
+                sa[..., 0] = 25
+                sa[..., 1] = 12
+                sa[..., 3] = np.minimum(255, (145 * sr ** 1.2 * ins)).astype(np.uint8)
+                sb = Image.fromarray(sa, "RGBA")
+
+                lm = lb.resize((tw, th), Image.Resampling.BICUBIC)
+                sm = sb.resize((tw, th), Image.Resampling.BICUBIC)
+                lit = Image.alpha_composite(Image.alpha_composite(cg, sm), lm)
+                mem = Image.merge("RGBA", (*lit.split()[:3], pa))
+            else:
+                mem = pl
+
+            mem = Image.alpha_composite(mem, self.ti)
+
+            for _, ct in self.fld.items():
+                tv = ct["e"].get().strip()
+                if not tv:
+                    continue
+                self._dtxt(mem, tv, tw, th, int(ct["ss"].get()),
+                           int(ct["sx"].get()), int(ct["sy"].get()),
+                           ct["c"], ct["s"], ts)
+
+            self.final = mem.copy()
+            self._disp()
+        except:
+            pass
+
+    def _disp(self):
+        if not self.final:
+            return
+        self.cv.delete("all")
+        w, h = self.final.size
+        nw = max(10, int(w * self.sc))
+        nh = max(10, int(h * self.sc))
+        self.tki = ImageTk.PhotoImage(
+            self.final.resize((nw, nh), Image.Resampling.LANCZOS))
+        cx = self.cv.winfo_width() / 2 + self.vx
+        cy = self.cv.winfo_height() / 2 + self.vy
+        self.cid = self.cv.create_image(cx, cy, anchor=tk.CENTER, image=self.tki)
+        try:
+            if self.pi:
+                bx = cx - nw / 2 + int(self.sx.get()) * self.sc
+                by = cy - nh / 2 + int(self.sy.get()) * self.sc
+                self.cv.create_rectangle(
+                    bx, by,
+                    bx + self.pi.size[0] * self.sc,
+                    by + self.pi.size[1] * self.sc,
+                    outline="#00FFCC", width=1, dash=(5, 3))
+        except:
             pass
 
 
-def _write_windows_startup_cmd():
-    """
-    在「启动」文件夹写入 .cmd，登录后自动运行 --daemon（无需计划任务权限）。
-    使用 UTF-8 BOM，避免中文路径乱码。
-    """
-    path = _win_startup_cmd_path()
-    if not path:
-        raise RuntimeError("无法获取 %APPDATA%，无法写入启动文件夹。")
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-
-    if getattr(sys, "frozen", False):
-        exe = os.path.normpath(os.path.realpath(sys.executable))
-        line = f'start "" /min "{exe}" --daemon'
-    else:
-        py = os.path.normpath(sys.executable)
-        script = os.path.normpath(os.path.abspath(sys.argv[0]))
-        line = f'start "" /min "{py}" "{script}" --daemon'
-
-    content = (
-        "@echo off\r\n"
-        "chcp 65001 >nul\r\n"
-        f"{line}\r\n"
-    )
-    with open(path, "w", encoding="utf-8-sig", newline="") as f:
-        f.write(content)
-    return path
-
-
-def _install_windows_startup_task():
-    """
-    优先创建计划任务（登录时运行）；若遇「拒绝访问」等权限问题，
-    则回退到当前用户的「启动」文件夹中的 .cmd（效果同为登录后自启）。
-    返回 ("schtasks", None) 或 ("startup_cmd", 脚本路径)。
-    """
-    sub_kw = {}
-    if _IS_WIN and hasattr(subprocess, "CREATE_NO_WINDOW"):
-        sub_kw["creationflags"] = subprocess.CREATE_NO_WINDOW
-
-    subprocess.run(
-        ["schtasks", "/delete", "/tn", WIN_TASK_NAME, "/f"],
-        capture_output=True,
-        **sub_kw,
-    )
-
-    tr = _windows_task_command_line()
-    # 多种参数组合，提高在家庭版/企业策略下的成功率
-    attempts = [
-        ["schtasks", "/create", "/tn", WIN_TASK_NAME, "/tr", tr, "/sc", "onlogon", "/f"],
-        ["schtasks", "/create", "/tn", WIN_TASK_NAME, "/tr", tr, "/sc", "onlogon", "/rl", "LIMITED", "/f"],
-    ]
-    last_err = ""
-    for args in attempts:
-        r = subprocess.run(
-            args,
-            capture_output=True,
-            text=True,
-            **sub_kw,
-        )
-        if r.returncode == 0:
-            _remove_windows_startup_cmd()
-            return "schtasks", None
-        last_err = ((r.stderr or "") + (r.stdout or "")).strip() or f"退出码 {r.returncode}"
-
-    try:
-        cmd_path = _write_windows_startup_cmd()
-        return "startup_cmd", cmd_path
-    except Exception as e:
-        raise RuntimeError(
-            "计划任务创建失败（可能被组策略限制或需管理员权限）：\n"
-            f"{last_err}\n\n"
-            f"启动文件夹回退也失败：{e}"
-        ) from e
-
-
-def _plist_xml_string(s):
-    """plist 内 <string> 需转义 &、<、>。"""
-    return _xml_escape(str(s), {'"': "&quot;", "'": "&apos;"})
-
-
-def _sync_done_hint(morning=True):
-    if getattr(sys, "frozen", False):
-        out_p, err_p = _daemon_log_paths()
-        return (
-            "同步已完成。打包版无终端窗口，请用「诊断源目录」查看；"
-            f"后台日志：{out_p}、{err_p}"
-        )
-    verb = "抽存" if morning else "灌回"
-    return f"{verb}同步完毕！详情请看终端。"
-
-
-# ==========================================
-# 核心引擎：改用 pathlib.rglob（与旧脚本一致）
-# ==========================================
-
-def normalize_path_value(path_value):
-    """
-    兼容 GUI 输入异常（如多行重复路径），返回可用的单一路径字符串。
-    """
-    if path_value is None:
-        return ""
-    text = str(path_value).replace("\r", "\n").strip()
-    if not text:
-        return ""
-    parts = [line.strip() for line in text.split("\n") if line.strip()]
-    return parts[0] if parts else ""
-
-def load_config():
-    if os.path.exists(CONFIG_FILE):
-        with open(CONFIG_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {}
-
-
-def _count_files_under(root: Path):
-    """递归统计目录下文件总数（用于诊断）；失败时返回 None。"""
-    try:
-        n = 0
-        for child in root.rglob("*"):
-            if child.is_file():
-                n += 1
-                if n > 200000:
-                    return n
-        return n
-    except (PermissionError, OSError):
-        return None
-
-
-def _mtime_ns(path: Path) -> int:
-    """文件修改时间（纳秒），便于跨平台比较。"""
-    st = path.stat()
-    ns = getattr(st, "st_mtime_ns", None)
-    if ns is not None:
-        return ns
-    return int(st.st_mtime * 1_000_000_000)
-
-
-def _merge_config_patch(patch: dict):
-    cfg = load_config()
-    cfg.update(patch)
-    with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-        json.dump(cfg, f, indent=4, ensure_ascii=False)
-
-
-def _ask_overwrite_newer_dialog(master, sample_rel: str):
-    """源较新需覆盖时弹窗。返回 (是否覆盖本次全部较新项, 是否记住长期策略)。"""
-    result = {'ok': False, 'remember': False}
-    win = tk.Toplevel(master)
-    win.title("确认覆盖较新的源文件")
-    win.transient(master)
-    win.grab_set()
-    msg = (
-        "检测到源文件修改时间较新，将覆盖目标中的同名文件。\n\n"
-        f"示例：{sample_rel}\n\n"
-        "• 确定：本次同步中，所有「源较新」的情况均覆盖目标。\n"
-        "• 取消：本次同步中，均不覆盖（仅复制新增文件）。\n"
-    )
-    tk.Label(win, text=msg, justify="left", wraplength=460).pack(padx=12, pady=10)
-    remember_var = tk.BooleanVar(value=False)
-    tk.Checkbutton(
-        win,
-        text="记住本次选择（确定=以后始终覆盖较新；取消=以后始终跳过较新、仅新增）",
-        variable=remember_var,
-    ).pack(anchor="w", padx=12)
-
-    bf = tk.Frame(win)
-    bf.pack(pady=10)
-
-    def on_ok():
-        result['ok'] = True
-        result['remember'] = remember_var.get()
-        win.destroy()
-
-    def on_cancel():
-        result['ok'] = False
-        result['remember'] = remember_var.get()
-        win.destroy()
-
-    tk.Button(bf, text="确定", command=on_ok, width=10).pack(side="left", padx=5)
-    tk.Button(bf, text="取消", command=on_cancel, width=10).pack(side="left", padx=5)
-    win.wait_window()
-    return result['ok'], result['remember']
-
-
-def _resolve_overwrite_newer(
-    gui_master,
-    gui_interactive,
-    overwrite_session,
-    on_policy_saved,
-    sample_relative,
-):
-    """
-    返回 True：执行覆盖；False：跳过本次覆盖。
-    overwrite_session 为可变 dict，键 'decision'：None | True | False，供同一轮多次 copy 共用。
-    """
-    cfg = load_config()
-    mode = cfg.get('newer_overwrite_mode', 'ask')
-    if mode == 'always':
-        return True
-    if mode == 'skip_newer':
-        return False
-    # mode == ask
-    if not gui_interactive:
-        return True
-    if gui_master is None:
-        return True
-    if overwrite_session is None:
-        overwrite_session = {}
-    if overwrite_session.get('decision') is not None:
-        return overwrite_session['decision']
-
-    ok, remember = _ask_overwrite_newer_dialog(gui_master, str(sample_relative))
-    if remember:
-        if ok:
-            _merge_config_patch({'newer_overwrite_mode': 'always'})
-            if on_policy_saved:
-                on_policy_saved('always')
-        else:
-            _merge_config_patch({'newer_overwrite_mode': 'skip_newer'})
-            if on_policy_saved:
-                on_policy_saved('skip_newer')
-    overwrite_session['decision'] = bool(ok)
-    return ok
-
-
-def copy_without_overwrite(
-    src_dir, tgt_dir, log_prefix="",
-    *,
-    gui_master=None,
-    gui_interactive=False,
-    overwrite_session=None,
-    on_policy_saved=None,
-):
-    """
-    用 pathlib.rglob 深度遍历（与你旧脚本一致的方式）
-    + iCloud 占位符自动检测下载
-    + 目标已存在同名文件时：仅当源文件修改时间更新才覆盖（以较新者为准）
-    """
-    if not src_dir or not tgt_dir:
-        print(f"[{datetime.now()}] {log_prefix} ❌ 路径未设置 (src={src_dir}, tgt={tgt_dir})")
-        return
-
-    src_dir = normalize_path_value(src_dir)
-    tgt_dir = normalize_path_value(tgt_dir)
-    src = Path(src_dir).expanduser().resolve()
-    tgt = Path(tgt_dir).expanduser().resolve()
-
-    if not src.exists():
-        print(f"[{datetime.now()}] {log_prefix} ❌ 源文件夹不存在: {src}")
-        return
-
-    tgt.mkdir(parents=True, exist_ok=True)
-    print(f"[{datetime.now()}] {log_prefix} 🚀 开始扫描: {src}")
-
-    if overwrite_session is None:
-        overwrite_session = {'decision': None}
-
-    # ===== 诊断输出：看看 Python 到底看到了什么 =====
-    try:
-        raw_items = sorted(src.iterdir(), key=lambda p: p.name)
-        print(f"   (诊断) 👀 顶层共 {len(raw_items)} 个项目:")
-        for item in raw_items:
-            if item.name == '.DS_Store':
-                continue
-            if item.is_dir():
-                tag = "📁 文件夹"
-            elif item.name.startswith('.') and item.name.endswith('.icloud'):
-                tag = "☁️  iCloud云端"
-            else:
-                tag = "📄 本地文件"
-            print(f"   (诊断)   {tag}  {item.name}")
-    except Exception as e:
-        print(f"   (诊断) ⛔ 无法读取目录: {e}")
-
-    total_under = _count_files_under(src)
-    if total_under is not None:
-        print(f"   (诊断) 📊 递归统计：整棵目录下共 {total_under} 个文件（含子文件夹内）")
-    else:
-        print(f"   (诊断) 📊 递归统计：无法遍历子目录（权限或路径限制）")
-
-    count = 0
-    skipped = 0
-    cloud_downloaded = 0
-    cloud_failed = 0
-
-    try:
-        # ===== 核心：用 rglob 递归遍历（和旧脚本完全一致） =====
-        for src_file in src.rglob("*"):
-            if not src_file.is_file():
-                continue
-
-            name = src_file.name
-
-            # 跳过 macOS 系统垃圾
-            if name in ('.DS_Store', '.localized', 'Thumbs.db', 'desktop.ini'):
-                continue
-
-            # ===== iCloud 占位符处理（仅 macOS） =====
-            if _IS_MAC and name.startswith('.') and name.endswith('.icloud'):
-                real_name = name[1:-7]  # .脚本号.docx.icloud → 脚本号.docx
-                real_file = src_file.parent / real_name
-
-                # 如果真实文件已经在本地了，直接用它
-                if real_file.exists() and real_file.is_file():
-                    src_file = real_file
-                    name = real_name
-                else:
-                    # 触发 iCloud 下载
-                    print(f"  ☁️  云端文件: {real_name}，正在触发下载...")
-                    try:
-                        subprocess.run(
-                            ['brctl', 'download', str(src_file)],
-                            capture_output=True, timeout=15
-                        )
-                    except FileNotFoundError:
-                        # brctl 不存在时尝试 open 命令
-                        try:
-                            subprocess.run(
-                                ['open', str(src_file)],
-                                capture_output=True, timeout=15
-                            )
-                        except Exception:
-                            pass
-                    except Exception:
-                        pass
-
-                    # 等待下载完成（最多 120 秒）
-                    downloaded = False
-                    for wait_round in range(24):
-                        if real_file.exists() and real_file.is_file():
-                            downloaded = True
-                            break
-                        time.sleep(5)
-                        if wait_round % 4 == 3:
-                            print(f"      ⏳ 仍在等待下载: {real_name} ({(wait_round+1)*5}秒)")
-
-                    if downloaded:
-                        src_file = real_file
-                        name = real_name
-                        cloud_downloaded += 1
-                        print(f"  ☁️→✅ 下载完成: {real_name}")
-                    else:
-                        cloud_failed += 1
-                        print(f"  ☁️→❌ 下载超时: {real_name}")
-                        continue
-
-            # 跳过其余隐藏文件（.DS_Store 之类的，注意 iCloud 的已在上面处理）
-            if name.startswith('.'):
-                continue
-
-            # ===== 计算目标路径（保持子目录结构） =====
-            relative = src_file.relative_to(src)
-            dst_file = tgt / relative
-
-            # 同名：目标已存在且修改时间不早于源 → 跳过；否则覆盖（双向备份以较新的一侧为准）
-            replacing = False
-            if dst_file.exists():
-                try:
-                    if _mtime_ns(src_file) <= _mtime_ns(dst_file):
-                        skipped += 1
-                        continue
-                    replacing = True
-                except OSError:
-                    print(f"  ! 无法比较修改时间，跳过: {relative}")
-                    skipped += 1
-                    continue
-
-            if replacing:
-                if not _resolve_overwrite_newer(
-                    gui_master,
-                    gui_interactive,
-                    overwrite_session,
-                    on_policy_saved,
-                    relative,
-                ):
-                    skipped += 1
-                    continue
-
-            # 创建目标子目录 & 拷贝
-            dst_file.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                shutil.copy2(str(src_file), str(dst_file))
-                count += 1
-                if replacing:
-                    print(f"  ↑ 覆盖(源较新): {relative}")
-                else:
-                    print(f"  + 新增: {relative}")
-            except Exception as e:
-                print(f"  ! 搬运失败: {relative} → {e}")
-
-    except PermissionError as e:
-        print(f"[{datetime.now()}] {log_prefix} ⛔️ 权限被拦截: {e}")
-        if _IS_MAC:
-            print(f"   请到【系统设置 → 隐私与安全 → 完全磁盘访问权限】中授权！")
-        else:
-            print(f"   请检查该文件夹的 NTFS 权限，或以管理员身份运行后再试。")
-    except Exception as e:
-        print(f"[{datetime.now()}] {log_prefix} ⛔️ 未知错误: {e}")
-        import traceback
-        traceback.print_exc()
-
-    summary = (f"新增/覆盖 {count}, 跳过 {skipped}"
-               + (f", 云端下载 {cloud_downloaded}" if cloud_downloaded else "")
-               + (f", 云端超时 {cloud_failed}" if cloud_failed else ""))
-    print(f"[{datetime.now()}] {log_prefix} ✅ 完成: {summary}\n")
-
-
-def run_morning_task(
-    gui_master=None,
-    gui_interactive=False,
-    on_policy_saved=None,
-    overwrite_session=None,
-):
-    cfg = load_config()
-    if overwrite_session is None:
-        overwrite_session = {'decision': None}
-    print("\n" + "=" * 60)
-    print("=== 执行早晨同步规则 (抽出保存) ===")
-    print("=" * 60)
-    copy_without_overwrite(
-        cfg.get('files_src'), cfg.get('files_tgt'), "[文档]",
-        gui_master=gui_master,
-        gui_interactive=gui_interactive,
-        overwrite_session=overwrite_session,
-        on_policy_saved=on_policy_saved,
-    )
-    copy_without_overwrite(
-        cfg.get('images_src'), cfg.get('images_tgt'), "[图片]",
-        gui_master=gui_master,
-        gui_interactive=gui_interactive,
-        overwrite_session=overwrite_session,
-        on_policy_saved=on_policy_saved,
-    )
-
-
-def run_evening_task(
-    gui_master=None,
-    gui_interactive=False,
-    on_policy_saved=None,
-    overwrite_session=None,
-):
-    cfg = load_config()
-    if overwrite_session is None:
-        overwrite_session = {'decision': None}
-    print("\n" + "=" * 60)
-    print("=== 执行晚间同步规则 (灌回防删) ===")
-    print("=" * 60)
-    copy_without_overwrite(
-        cfg.get('files_tgt'), cfg.get('files_src'), "[文档]",
-        gui_master=gui_master,
-        gui_interactive=gui_interactive,
-        overwrite_session=overwrite_session,
-        on_policy_saved=on_policy_saved,
-    )
-    copy_without_overwrite(
-        cfg.get('images_tgt'), cfg.get('images_src'), "[图片]",
-        gui_master=gui_master,
-        gui_interactive=gui_interactive,
-        overwrite_session=overwrite_session,
-        on_policy_saved=on_policy_saved,
-    )
-
-
-def start_daemon_loop():
-    _redirect_daemon_stdio_if_needed()
-    cfg = load_config()
-    morning = cfg.get('morning_time', "10:10")
-    evening = cfg.get('evening_time', "19:00")
-    print(f"[后台服务] 已启动！早: {morning}  晚: {evening}")
-
-    try:
-        import schedule
-        schedule.every().day.at(morning).do(run_morning_task)
-        schedule.every().day.at(evening).do(run_evening_task)
-        while True:
-            schedule.run_pending()
-            time.sleep(30)
-    except Exception as e:
-        # 兜底：即使没有 schedule 依赖，也能按分钟轮询执行。
-        print(f"[后台服务] schedule 不可用，启用内置调度: {e}")
-        last_morning_date = None
-        last_evening_date = None
-        while True:
-            now = datetime.now()
-            now_hm = now.strftime("%H:%M")
-            today = now.date()
-            if now_hm == morning and last_morning_date != today:
-                run_morning_task()
-                last_morning_date = today
-            if now_hm == evening and last_evening_date != today:
-                run_evening_task()
-                last_evening_date = today
-            time.sleep(20)
-
-
-# ==========================================
-# GUI 面板
-# ==========================================
-
-class AppGUI:
-    def __init__(self, root):
-        self.root = root
-        title = "全自动防丢失备份工厂"
-        if _IS_MAC:
-            title = "Mac " + title
-        elif _IS_WIN:
-            title = "Windows " + title
-        self.root.title(title)
-        self.root.geometry("620x680")
-
-        self.vars = {
-            'files_src': tk.StringVar(), 'files_tgt': tk.StringVar(),
-            'images_src': tk.StringVar(), 'images_tgt': tk.StringVar(),
-            'morning_time': tk.StringVar(value="10:10"),
-            'evening_time': tk.StringVar(value="19:00"),
-            'newer_overwrite_mode': tk.StringVar(value="ask"),
-        }
-
-        self.load_history()
-        self.build_ui()
-
-    def build_ui(self):
-        lf1 = tk.LabelFrame(self.root, text=" 📂 文档备份路径 (Files) ", padx=10, pady=10)
-        lf1.pack(fill="x", padx=15, pady=5)
-        self.create_path_row(lf1, "原始地址 (源):", 'files_src')
-        self.create_path_row(lf1, "目标地址 (备):", 'files_tgt')
-
-        lf2 = tk.LabelFrame(self.root, text=" 🖼️ 图片备份路径 (Images) ", padx=10, pady=10)
-        lf2.pack(fill="x", padx=15, pady=5)
-        self.create_path_row(lf2, "原始地址 (源):", 'images_src')
-        self.create_path_row(lf2, "目标地址 (备):", 'images_tgt')
-
-        lf3 = tk.LabelFrame(self.root, text=" ⏰ 自动化双向规则 ", padx=10, pady=10)
-        lf3.pack(fill="x", padx=15, pady=5)
-        tk.Label(lf3, text="🌞 早晨 (抽出保存):").grid(row=0, column=0, sticky="e")
-        tk.Entry(lf3, textvariable=self.vars['morning_time'], width=10).grid(row=0, column=1, padx=5)
-        tk.Label(lf3, text="🌙 晚间 (灌回防删):").grid(row=1, column=0, sticky="e", pady=5)
-        tk.Entry(lf3, textvariable=self.vars['evening_time'], width=10).grid(row=1, column=1, padx=5)
-
-        lf4 = tk.LabelFrame(self.root, text=" 📌 同名文件源较新时（覆盖目标） ", padx=10, pady=10)
-        lf4.pack(fill="x", padx=15, pady=5)
-        fr_mode = tk.Frame(lf4)
-        fr_mode.pack(anchor="w")
-        tk.Radiobutton(
-            fr_mode,
-            text="每次询问（弹窗内可记住：覆盖较新 / 跳过较新）",
-            variable=self.vars['newer_overwrite_mode'],
-            value="ask",
-            command=self.save_current_config,
-        ).pack(anchor="w")
-        tk.Radiobutton(
-            fr_mode,
-            text="始终按较新的覆盖（不再弹窗）",
-            variable=self.vars['newer_overwrite_mode'],
-            value="always",
-            command=self.save_current_config,
-        ).pack(anchor="w")
-        tk.Radiobutton(
-            fr_mode,
-            text="始终跳过较新（仅复制新增，不再弹窗）",
-            variable=self.vars['newer_overwrite_mode'],
-            value="skip_newer",
-            command=self.save_current_config,
-        ).pack(anchor="w")
-
-        btn_frame = tk.Frame(self.root)
-        btn_frame.pack(fill="x", padx=15, pady=10)
-        tk.Button(btn_frame, text="▶️ 立刻: 抽存",
-                  command=self.force_morning, bg="lightgreen").pack(side="left", padx=5)
-        tk.Button(btn_frame, text="◀️ 立刻: 灌回",
-                  command=self.force_evening, bg="lightblue").pack(side="left", padx=5)
-        tk.Button(btn_frame, text="🔍 诊断源目录",
-                  command=self.diagnose, bg="lightyellow").pack(side="left", padx=5)
-
-        tk.Button(self.root, text="✅ 保存 & 打入静默后台",
-                  command=self.save_and_enable_daemon,
-                  fg="red", font=("", 13, "bold")).pack(pady=10)
-
-    def create_path_row(self, parent, label_text, var_name):
-        frame = tk.Frame(parent)
-        frame.pack(fill="x", pady=2)
-        tk.Label(frame, text=label_text, width=12, anchor="e").pack(side="left")
-        tk.Entry(frame, textvariable=self.vars[var_name], width=40).pack(side="left", padx=5)
-        tk.Button(frame, text="选择...", command=lambda: self.select_dir(var_name)).pack(side="left")
-
-    def select_dir(self, var_name):
-        path = filedialog.askdirectory()
-        if path:
-            self.vars[var_name].set(path)
-            self.save_current_config()
-
-    def load_history(self):
-        cfg = load_config()
-        for k, v in self.vars.items():
-            if k == 'newer_overwrite_mode':
-                m = cfg.get(k) or 'ask'
-                if m not in ('ask', 'always', 'skip_newer'):
-                    m = 'ask'
-                v.set(m)
-                continue
-            if k in cfg and cfg[k]:
-                if k.endswith('_src') or k.endswith('_tgt'):
-                    v.set(normalize_path_value(cfg[k]))
-                else:
-                    v.set(cfg[k])
-
-    def save_current_config(self):
-        cfg = {}
-        for k, v in self.vars.items():
-            if k == 'newer_overwrite_mode':
-                m = v.get().strip() or 'ask'
-                if m not in ('ask', 'always', 'skip_newer'):
-                    m = 'ask'
-                cfg[k] = m
-                continue
-            value = v.get().strip()
-            if k.endswith('_src') or k.endswith('_tgt'):
-                value = normalize_path_value(value)
-                self.vars[k].set(value)
-            cfg[k] = value
-        with open(CONFIG_FILE, 'w', encoding='utf-8') as f:
-            json.dump(cfg, f, indent=4, ensure_ascii=False)
-        return cfg
-
-    def check_source_permissions(self):
-        """检测源目录是否可读；macOS 下额外处理 Containers 静默拦截。"""
-        paths_to_check = [
-            ('files_src', '文档源'),
-            ('images_src', '图片源'),
-        ]
-        for key, label in paths_to_check:
-            path = normalize_path_value(self.vars[key].get().strip())
-            if not path:
-                continue
-
-            p = Path(path)
-            if not p.exists():
-                continue
-
-            try:
-                items = list(p.iterdir())
-            except PermissionError:
-                items = None  # 明确报错
-
-            # ===== macOS：Containers 目录 + 0 个文件 = 被静默拦截 =====
-            if _IS_MAC and items is not None and len(items) == 0 and '/Containers/' in path:
-                msg = (
-                    f"⚠️ 检测到【{label}】被 macOS 静默拦截！\n\n"
-                    f"路径在应用沙盒容器内：\n{path}\n\n"
-                    f"macOS 不报错但返回空列表（0个文件）。\n\n"
-                    f"解决方法：\n"
-                    f"1. 点击【去设置】打开系统权限页面\n"
-                    f"2. 把 Terminal.app 和 Python 都加入「完全磁盘访问权限」\n"
-                    f"3. 重启终端和本软件"
-                )
-                if messagebox.askokcancel("沙盒权限拦截", msg):
-                    subprocess.run(["open",
-                                    "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"])
-                return False
-
-            if items is None:
-                if _IS_MAC:
-                    msg = ("⚠️ 权限被明确拒绝！\n\n请到系统设置授予「完全磁盘访问权限」。")
-                    if messagebox.askokcancel("权限不足", msg):
-                        subprocess.run(["open",
-                                        "x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles"])
-                else:
-                    msg = (
-                        f"⚠️ 无法读取【{label}】：\n{path}\n\n"
-                        f"请检查该文件夹权限，或以管理员身份运行本程序。"
-                    )
-                    messagebox.showerror("权限不足", msg)
-                return False
-
-        return True
-
-    # ===== 新增：诊断按钮 =====
-    def diagnose(self):
-        """一键诊断：打印 Python 在源目录里到底看到了什么"""
-        self.save_current_config()
-        cfg = load_config()
-
-        report_lines = []
-        for label, key in [("文档源", 'files_src'), ("图片源", 'images_src')]:
-            path = normalize_path_value(cfg.get(key, ''))
-            report_lines.append(f"{'='*50}")
-            report_lines.append(f"🔍 {label}: {path}")
-
-            if not path:
-                report_lines.append("   ❌ 路径为空！请先设置")
-                continue
-
-            p = Path(path)
-            if not p.exists():
-                report_lines.append(f"   ❌ 路径不存在！")
-                continue
-
-            try:
-                items = sorted(p.iterdir(), key=lambda x: x.name)
-                local_files = []
-                icloud_files = []
-                dirs = []
-                hidden = []
-
-                for item in items:
-                    if item.is_dir():
-                        dirs.append(item.name)
-                    elif item.name.startswith('.') and item.name.endswith('.icloud'):
-                        real_name = item.name[1:-7]
-                        icloud_files.append(real_name)
-                    elif item.name.startswith('.'):
-                        hidden.append(item.name)
-                    else:
-                        local_files.append(item.name)
-
-                report_lines.append(
-                    "   ℹ️ 说明：「本地文件」仅统计顶层、且名称不以 . 开头的文件；"
-                    "子目录内的文件见下方「递归文件总数」。"
-                )
-                report_lines.append(f"   📄 顶层本地文件 ({len(local_files)}):")
-                for f in local_files:
-                    report_lines.append(f"      ✅ {f}")
-
-                report_lines.append(f"   👁️ 顶层隐藏项 ({len(hidden)})（名称以 . 开头，如 .git、.env）:")
-                for f in hidden:
-                    report_lines.append(f"      · {f}")
-
-                report_lines.append(f"   ☁️  iCloud云端 ({len(icloud_files)}):")
-                for f in icloud_files:
-                    report_lines.append(f"      ☁️ {f}")
-
-                report_lines.append(f"   📁 顶层子文件夹 ({len(dirs)}):")
-                for d in dirs:
-                    report_lines.append(f"      📁 {d}")
-
-                total_under = _count_files_under(p)
-                if total_under is not None:
-                    report_lines.append(f"   📊 递归文件总数（含所有子文件夹）: {total_under}")
-                    if not local_files and total_under > 0:
-                        report_lines.append(
-                            "   💡 顶层没有「非隐藏文件」属正常：文件都在子文件夹里，抽存仍会递归备份。"
-                        )
-                else:
-                    report_lines.append("   📊 递归统计：无法遍历子目录（权限或拒绝访问）。")
-
-                if icloud_files:
-                    report_lines.append(f"\n   ⚠️ 有 {len(icloud_files)} 个文件在iCloud云端！")
-                    report_lines.append(f"   备份时会自动触发下载，请确保网络畅通。")
-
-            except PermissionError:
-                report_lines.append("   ⛔ 权限被拦截！")
-            except Exception as e:
-                report_lines.append(f"   ⛔ 错误: {e}")
-
-        report = "\n".join(report_lines)
-        print(report)
-
-        # 同时弹窗显示
-        diag_win = tk.Toplevel(self.root)
-        diag_win.title("源目录诊断报告")
-        diag_win.geometry("600x450")
-        text = tk.Text(diag_win, wrap="word", font=("Menlo", 11))
-        text.pack(fill="both", expand=True, padx=10, pady=10)
-        text.insert("1.0", report)
-        text.config(state="disabled")
-
-    def force_morning(self):
-        if not self.check_source_permissions():
-            return
-        self.save_current_config()
-        session = {'decision': None}
-
-        def on_saved(mode):
-            self.vars['newer_overwrite_mode'].set(mode)
-
-        run_morning_task(
-            gui_master=self.root,
-            gui_interactive=True,
-            on_policy_saved=on_saved,
-            overwrite_session=session,
-        )
-        messagebox.showinfo("完成", _sync_done_hint(morning=True))
-
-    def force_evening(self):
-        if not self.check_source_permissions():
-            return
-        self.save_current_config()
-        session = {'decision': None}
-
-        def on_saved(mode):
-            self.vars['newer_overwrite_mode'].set(mode)
-
-        run_evening_task(
-            gui_master=self.root,
-            gui_interactive=True,
-            on_policy_saved=on_saved,
-            overwrite_session=session,
-        )
-        messagebox.showinfo("完成", _sync_done_hint(morning=False))
-
-    def save_and_enable_daemon(self):
-        if not self.check_source_permissions():
-            return
-        self.save_current_config()
-
-        try:
-            if _IS_WIN:
-                method, extra = _install_windows_startup_task()
-                log_dir = os.path.join(
-                    os.environ.get("TEMP", os.path.expanduser("~")), "knock_sync_logs"
-                )
-                if method == "schtasks":
-                    msg = (
-                        f"已创建计划任务（{WIN_TASK_NAME}），登录后自动运行后台。\n"
-                        f"请注销并重新登录后生效。\n\n后台日志目录：{log_dir}"
-                    )
-                else:
-                    msg = (
-                        "当前系统不允许创建计划任务（常见于组策略/权限限制），"
-                        "已改为「启动」文件夹方式，效果同为登录后自动运行后台。\n\n"
-                        f"启动脚本：\n{extra}\n\n"
-                        "请注销并重新登录后生效；若不需要可删除上述 .cmd 文件。\n\n"
-                        f"后台日志目录：{log_dir}"
-                    )
-                messagebox.showinfo("部署成功！", msg)
-            elif _IS_MAC:
-                current_script = os.path.abspath(sys.argv[0])
-                if getattr(sys, "frozen", False):
-                    exe_path = os.path.realpath(sys.executable)
-                    working_dir = os.path.dirname(exe_path) or os.path.expanduser("~")
-                    arg_lines = (
-                        f"        <string>{_plist_xml_string(exe_path)}</string>\n"
-                        f"        <string>--daemon</string>"
-                    )
-                else:
-                    python_exe = sys.executable or "/usr/bin/python3"
-                    working_dir = os.path.dirname(current_script) or os.path.expanduser("~")
-                    arg_lines = (
-                        f"        <string>{_plist_xml_string(python_exe)}</string>\n"
-                        f"        <string>{_plist_xml_string(current_script)}</string>\n"
-                        f"        <string>--daemon</string>"
-                    )
-                plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" \
-"http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{PLIST_LABEL}</string>
-    <key>ProgramArguments</key>
-    <array>
-{arg_lines}
-    </array>
-    <key>WorkingDirectory</key>
-    <string>{_plist_xml_string(working_dir)}</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/knock_sync_out.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/knock_sync_err.log</string>
-</dict>
-</plist>"""
-                subprocess.run(["launchctl", "unload", PLIST_PATH], capture_output=True)
-                with open(PLIST_PATH, 'w', encoding='utf-8') as f:
-                    f.write(plist_content)
-                subprocess.run(["launchctl", "load", PLIST_PATH], capture_output=True)
-                messagebox.showinfo("部署成功！", "开机自启已就绪！可安全关闭此窗口。")
-            else:
-                messagebox.showinfo(
-                    "提示",
-                    "当前系统仅支持在 macOS / Windows 上一键写入自启。\n"
-                    "其他系统请自行用计划任务/cron 运行：python backup.py --daemon",
-                )
-        except Exception as e:
-            messagebox.showerror("错误", f"配置后台失败: {str(e)}")
-
-
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--daemon":
-        start_daemon_loop()
-    else:
-        root = tk.Tk()
-        app = AppGUI(root)
-        root.mainloop()
+    root = TkinterDnD.Tk()
+    App(root)
+    root.mainloop()
