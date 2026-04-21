@@ -1284,12 +1284,14 @@ class PromoAnalyzerApp:
     def load_internal_player_ids(self):
         bp = get_app_path();
         fp = os.path.join(bp, "内玩ID.xlsx")
-        if not os.path.exists(fp): return set()
+        if not os.path.exists(fp):
+            return set(), None
         try:
             df = pd.read_excel(fp) if fp.endswith('.xlsx') else pd.read_excel(fp)
-            return set(str(int(float(x))) if isinstance(x, (int, float)) else str(x).strip() for x in df.iloc[:, 0])
-        except:
-            return set()
+            ids = set(str(int(float(x))) if isinstance(x, (int, float)) else str(x).strip() for x in df.iloc[:, 0])
+            return ids, None
+        except Exception as e:
+            return set(), f"读取内玩ID文件失败: {e}"
 
     def load_file(self):
         fp = filedialog.askopenfilename(filetypes=[("Data", "*.csv *.xlsx")])
@@ -1308,13 +1310,18 @@ class PromoAnalyzerApp:
                     return s
 
                 df['real_id'] = df['real_id'].apply(clean_id_safe)
-            internals = self.load_internal_player_ids()
+            before_cnt = len(df)
+            removed_cnt = 0
+            internals, internal_err = self.load_internal_player_ids()
+            if internal_err:
+                messagebox.showwarning("内玩ID读取失败", internal_err)
             if internals and 'real_id' in df.columns:
                 df = df[~df['real_id'].isin(internals)]
+                removed_cnt = before_cnt - len(df)
             if 'time' in df.columns: df['time'] = pd.to_datetime(df['time'])
             df.sort_values(by=['pid', 'time'], inplace=True)
             self.df_raw = df
-            self.lbl_status.config(text=f"LOADED {len(df)} ROWS")
+            self.lbl_status.config(text=f"LOADED {len(df)} ROWS | 内玩ID剔除 {removed_cnt} 条")
         except Exception as e:
             messagebox.showerror("Error", str(e))
         finally:
