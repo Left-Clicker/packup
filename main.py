@@ -1122,7 +1122,7 @@ class PromoAnalyzerApp:
         self.selected_days = tk.IntVar(value=3)
         self.days_options = [2, 3, 4, 5]
 
-        # [修改点1] 新增：用于全局保存打勾的玩家 PID 的记忆本
+        # 全局保存打勾的玩家唯一键(优先real_id)的记忆本
         self.checked_pids = set()
 
         self._customize_styles()
@@ -1265,21 +1265,36 @@ class PromoAnalyzerApp:
                 vals = list(tree.item(row_id, "values"))
                 new_state = "☑" if vals[0] == "☐" else "☐"
                 vals[0] = new_state
-                pid = vals[1]
+                player_key = vals[2]
 
-                # [修改点2] 新增：把状态记入内存。勾选就加入，取消就移除
+                # 把状态记入内存。勾选就加入，取消就移除
                 if new_state == "☑":
-                    self.checked_pids.add(pid)
+                    self.checked_pids.add(player_key)
                 else:
-                    self.checked_pids.discard(pid)
+                    self.checked_pids.discard(player_key)
 
                 for t in self.tree_views:
                     for child in t.get_children():
-                        if str(t.item(child, 'values')[1]) == pid:
+                        if str(t.item(child, 'values')[2]) == player_key:
                             v = list(t.item(child, 'values'))
                             v[0] = new_state
                             tags = ('processed',) if new_state == "☑" else ()
                             t.item(child, values=v, tags=tags)
+
+    def _normalize_player_id(self, x):
+        s = str(x).strip()
+        if not s or s in ['nan', 'None', 'NaN', 'NAN']:
+            return ""
+        s = s.replace(" ", "").replace("\u3000", "")
+        if s.endswith('.0'):
+            s = s[:-2]
+        # 统一纯数字ID格式，避免 123 / 123.0 / 00123 等格式差异导致过滤失效
+        if re.fullmatch(r"[+-]?\d+(\.0+)?", s):
+            try:
+                s = str(int(float(s)))
+            except:
+                pass
+        return s
 
     def load_internal_player_ids(self):
         bp = get_app_path();
@@ -1288,7 +1303,11 @@ class PromoAnalyzerApp:
             return set(), None
         try:
             df = pd.read_excel(fp) if fp.endswith('.xlsx') else pd.read_excel(fp)
-            ids = set(str(int(float(x))) if isinstance(x, (int, float)) else str(x).strip() for x in df.iloc[:, 0])
+            ids = set()
+            for x in df.iloc[:, 0]:
+                nid = self._normalize_player_id(x)
+                if nid:
+                    ids.add(nid)
             return ids, None
         except Exception as e:
             return set(), f"读取内玩ID文件失败: {e}"
@@ -1304,12 +1323,7 @@ class PromoAnalyzerApp:
             rev_map = {v: k for k, v in COLUMN_MAPPING_CONFIG.items()}
             df.rename(columns=rev_map, inplace=True)
             if 'real_id' in df.columns:
-                def clean_id_safe(x):
-                    s = str(x).strip()
-                    if s.endswith('.0'): return s[:-2]
-                    return s
-
-                df['real_id'] = df['real_id'].apply(clean_id_safe)
+                df['real_id'] = df['real_id'].apply(self._normalize_player_id)
             before_cnt = len(df)
             removed_cnt = 0
             internals, internal_err = self.load_internal_player_ids()
@@ -1319,7 +1333,10 @@ class PromoAnalyzerApp:
                 df = df[~df['real_id'].isin(internals)]
                 removed_cnt = before_cnt - len(df)
             if 'time' in df.columns: df['time'] = pd.to_datetime(df['time'])
-            df.sort_values(by=['pid', 'time'], inplace=True)
+            if 'real_id' in df.columns:
+                df.sort_values(by=['real_id', 'time'], inplace=True)
+            else:
+                df.sort_values(by=['pid', 'time'], inplace=True)
             self.df_raw = df
             self.lbl_status.config(text=f"LOADED {len(df)} ROWS | 内玩ID剔除 {removed_cnt} 条")
         except Exception as e:
@@ -1351,7 +1368,18 @@ class PromoAnalyzerApp:
 
         df = self.df_raw.to_dict('records')
         for r in df: r['time_obj'] = r['time']; r['time_str'] = str(r['time'])
-        grouped_raw = {k: list(v) for k, v in groupby(df, key=lambda x: x.get('pid'))}
+        def build_player_key(row):
+            rid = str(row.get('real_id', '')).strip()
+            if rid and rid not in ['nan', 'None', '']:
+                return rid
+            return f"PID::{str(row.get('pid', '')).strip()}"
+
+        grouped_raw = {}
+        for row in df:
+            k = build_player_key(row)
+            if k not in grouped_raw:
+                grouped_raw[k] = []
+            grouped_raw[k].append(row)
 
         self.results_cache = {2: [], 3: [], 4: [], 5: []}
         total_steps = len(grouped_raw) * len(self.days_options)
@@ -1362,7 +1390,7 @@ class PromoAnalyzerApp:
             cutoff_time = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
 
             day_results = []
-            for pid, all_orders in grouped_raw.items():
+            for player_key, all_orders in grouped_raw.items():
                 filtered_orders = [o for o in all_orders if o['time_obj'] >= cutoff_time]
 
                 if not filtered_orders:
@@ -1395,8 +1423,23 @@ class PromoAnalyzerApp:
                     for e in active_contacts:
                         if e['data']['deadline'] < min_ddl: min_ddl = e['data']['deadline']
 
+                # 昵称展示：按时间顺序汇总，显示“当前昵称 + 曾用昵称”
+                nick_history = []
+                for o in all_orders:
+                    n = str(o.get('pid', '')).strip()
+                    if n and n not in nick_history:
+                        nick_history.append(n)
+                current_nick = nick_history[-1] if nick_history else str(filtered_orders[-1].get('pid', ''))
+                old_nicks = [n for n in nick_history if n != current_nick]
+                if old_nicks:
+                    pid_display = f"{current_nick} (曾用: {', '.join(old_nicks)})"
+                else:
+                    pid_display = current_nick
+
                 res_obj = {
-                    'pid': pid, 'real_id': filtered_orders[0].get('real_id'),
+                    'player_key': player_key,
+                    'pid': pid_display,
+                    'real_id': filtered_orders[0].get('real_id'),
                     'server': filtered_orders[0].get('server'),
                     'total_amt': total_amt,
                     'orders_list': filtered_orders, 'events': evts, 'summary': summary,
@@ -1426,20 +1469,20 @@ class PromoAnalyzerApp:
         count_shown = 0
         for r in data_source:
             if filter_ids:
-                rid = str(r['real_id'])
+                rid = str(r.get('real_id', ''))
                 if rid not in filter_ids:
                     continue
 
             pid = r['pid']
+            player_key = str(r.get('player_key', r.get('real_id', '')))
             amt_str = f"{r['total_amt']:.2f}"
 
-            # [修改点3] 核心：每次查一下“记忆本”，如果在里面就判定为打过勾，并打上对应Tag
-            is_checked = pid in self.checked_pids
+            # 勾选记忆使用唯一键，避免昵称变更后状态丢失
+            is_checked = player_key in self.checked_pids
             check_state = "☑" if is_checked else "☐"
             tags = ('processed',) if is_checked else ()
 
-            # 第一个值变成动态分配的 check_state
-            vals = (check_state, pid, r['real_id'], r['server'], amt_str, r['summary'])
+            vals = (check_state, pid, player_key, r['server'], amt_str, r['summary'])
 
             self.tree_all.insert("", "end", values=vals, tags=tags)
             if r['has_achieved']: self.tree_achieved.insert("", "end", values=vals, tags=tags)
@@ -1452,12 +1495,12 @@ class PromoAnalyzerApp:
         sel = event.widget.selection()
         if not sel: return
         try:
-            pid = str(event.widget.item(sel[0], 'values')[1])
+            player_key = str(event.widget.item(sel[0], 'values')[2])
         except:
             return
 
         current_data = self.results_cache.get(self.selected_days.get(), [])
-        data = next((item for item in current_data if str(item['pid']) == pid), None)
+        data = next((item for item in current_data if str(item.get('player_key')) == player_key), None)
         if not data: return
 
         self.f_ach_cards.clear();
@@ -1511,9 +1554,9 @@ class PromoAnalyzerApp:
                 messagebox.showinfo("Hint", "Select a player first")
                 return
 
-            pid = str(widget.item(sel[0], 'values')[1])
+            player_key = str(widget.item(sel[0], 'values')[2])
             current_data = self.results_cache.get(self.selected_days.get(), [])
-            player_data = next((item for item in current_data if str(item['pid']) == pid), None)
+            player_data = next((item for item in current_data if str(item.get('player_key')) == player_key), None)
 
             if player_data:
                 SinglePlayerCheck(self.root, player_data, self.time_ext_val, self.limit_config_map,
