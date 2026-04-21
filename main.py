@@ -18,6 +18,7 @@ from itertools import groupby
 from operator import itemgetter
 
 os.environ['TK_SILENCE_DEPRECATION'] = '1'
+IS_MACOS = sys.platform == "darwin"
 
 
 # ================= 0. 模板管理器 =================
@@ -306,7 +307,10 @@ def calculate_achievements_normal(orders, all_rules, time_ext, limit_configs={},
 
 
 # Kernel logic with Pure Surplus Check (Safest Mode)
-def calculate_achievements_complex(orders, all_rules, time_ext, limit_configs, ref_time):
+def calculate_achievements_complex(orders, all_rules, time_ext, limit_configs, ref_time, debug_trace=None):
+    if debug_trace is None:
+        debug_trace = []
+
     sum_rules = [r for r in all_rules if r['type'] == 'sum']
     normal_events, _ = calculate_achievements_normal(orders, sum_rules, time_ext, limit_configs, ref_time)
     achieved_sum_events = [e for e in normal_events if e['type'] == 'achieved']
@@ -314,6 +318,9 @@ def calculate_achievements_complex(orders, all_rules, time_ext, limit_configs, r
     for idx, evt in enumerate(achieved_sum_events):
         for o in evt['data']['orders']: order_to_sum_event_idx[str(o['oid'])] = idx
 
+    # 特殊模式口径：
+    # 1) 已达成累充中的订单属于“已使用”，借给10+1时必须保证原达成仍成立；
+    # 2) 未达成(仅contact)链路中的订单不锁定，可直接用于低档(10+1)达成。
     orders_99 = [o for o in orders if abs(o['amt'] - 99.99) < 0.05]
     n99 = len(orders_99)
     count_rule = next((r for r in all_rules if r['type'] == 'count'), None)
@@ -362,7 +369,9 @@ def calculate_achievements_complex(orders, all_rules, time_ext, limit_configs, r
                 oid = str(o['oid'])
                 if o['time_obj'] < est or o['time_obj'] > eed: continue
                 # 特殊模式补单去重：同一轮中已分配给其它事件的订单不可重复使用
-                if oid not in order_to_sum_event_idx and oid not in c_ids and oid not in reserved_refill_oids:
+                # 同时排除已被10+1消耗的订单，避免“一单两用”导致结果虚增
+                if (oid not in order_to_sum_event_idx and oid not in c_ids
+                        and oid not in reserved_refill_oids and oid not in ids_consumed_by_count):
                     pot.append(o)
             refill = [];
             r_tot = 0.0
@@ -375,6 +384,7 @@ def calculate_achievements_complex(orders, all_rules, time_ext, limit_configs, r
             reserved_refill_oids.update(str(x['oid']) for x in refill)
 
         if possible:
+            impact_parts = []
             for e_idx, stolen in bounds.items():
                 evt = achieved_sum_events[e_idx];
                 sps = plans[e_idx]
@@ -388,6 +398,14 @@ def calculate_achievements_complex(orders, all_rules, time_ext, limit_configs, r
                 evt['data']['total'] = sum(o['amt'] for o in new_list)
                 evt['data']['count'] = len(new_list)
                 for o in sps: order_to_sum_event_idx[str(o['oid'])] = e_idx
+                impact_parts.append(
+                    f"{evt['rule']['name']} 借{len(stolen)}单({', '.join(s_ids)}) "
+                    f"回填{len(sps)}单({', '.join(str(o['oid']) for o in sps) if sps else '无需回填'})"
+                )
+            debug_trace.append(
+                f"10+1 达成 | 起点OID={grp[0]['oid']} | 借走10单: {', '.join(str(o['oid']) for o in grp)} | "
+                f"影响: {' ; '.join(impact_parts) if impact_parts else '无'}"
+            )
             achieved_count_events.append({'type': 'achieved', 'rule': count_rule, 'sets': 1,
                                           'data': {'orders': grp, 'total': sum(o['amt'] for o in grp), 'count': 10,
                                                    'start_t': grp[0]['time_obj'], 'deadline': ddl}
@@ -400,6 +418,7 @@ def calculate_achievements_complex(orders, all_rules, time_ext, limit_configs, r
 
     def is_borrowable_safely(oid):
         if oid in ids_consumed_by_count: return False
+        # 不在已达成累充中的99.99，视为未锁定，可直接用于10+1
         if oid not in order_to_sum_event_idx: return True
         e_idx = order_to_sum_event_idx[oid]
         evt = achieved_sum_events[e_idx]
@@ -588,6 +607,7 @@ class SinglePlayerCheck(ttk.Toplevel):
 
         self.precalc_data = {'normal': [], 'special': []}
         self.cache_view = {}
+        self.cache_special_log = {}
         self.iid_to_oid = {}
         self.oid_to_iid = {}
 
@@ -648,6 +668,8 @@ class SinglePlayerCheck(ttk.Toplevel):
         self.btn_mode = ttk.Button(rt_frame, text="计算中...", bootstyle="secondary", state=tk.DISABLED,
                                    command=self.toggle_mode)
         self.btn_mode.pack(side=tk.LEFT, padx=5)
+        ttk.Button(rt_frame, text="📜 特殊借单日志", bootstyle="info-outline", command=self.show_special_log).pack(
+            side=tk.LEFT, padx=5)
 
         ttk.Label(frame_controls, text="Shift+Click选范围 -> 右键手动标记", font=("Helvetica", 9),
                   bootstyle="secondary").pack(side=tk.LEFT)
@@ -700,7 +722,12 @@ class SinglePlayerCheck(ttk.Toplevel):
 
     def _setup_tags(self):
         for name, color in RULE_COLORS.items():
-            if name != "DEFAULT": self.tree.tag_configure(name, background=color, foreground="white")
+            if name != "DEFAULT":
+                if IS_MACOS:
+                    # macOS 下 Treeview 行背景色可能不生效，改用文字着色高亮，避免影响 Windows 现有效果
+                    self.tree.tag_configure(name, foreground=color, background=RULE_COLORS["DEFAULT"])
+                else:
+                    self.tree.tag_configure(name, background=color, foreground="white")
         self.tree.tag_configure('separator', background='#444444', foreground='#dddddd')
         self.tree.tag_configure('normal_row', background=RULE_COLORS["DEFAULT"], foreground="#cccccc")
 
@@ -763,9 +790,12 @@ class SinglePlayerCheck(ttk.Toplevel):
                 if mode == "normal":
                     evts, _ = calculate_achievements_normal(sub, ALL_RULES, self.time_ext, self.limit_configs,
                                                             self.ref_time)
+                    special_log_text = ""
                 else:
+                    debug_lines = []
                     evts, _ = calculate_achievements_complex(sub, ALL_RULES, self.time_ext, self.limit_configs,
-                                                             self.ref_time)
+                                                             self.ref_time, debug_trace=debug_lines)
+                    special_log_text = "\n".join(debug_lines)
 
                 oid_disp = f"{row['oid']} | {row['amt']}"
                 is_marked = str(row.get('is_marked', '否')).strip()
@@ -787,7 +817,8 @@ class SinglePlayerCheck(ttk.Toplevel):
                     'sep': False,
                     'val': (row['time_str'], oid_disp, row_sum, str(sc) if sc else ""),
                     'evt': evts,
-                    'oid': str(row.get('oid', f"idx_{i}"))
+                    'oid': str(row.get('oid', f"idx_{i}")),
+                    'special_log': special_log_text
                 })
 
                 if mode == 'special' and not has_10:
@@ -875,6 +906,7 @@ class SinglePlayerCheck(ttk.Toplevel):
     def _refresh_view(self):
         self.tree.delete(*self.tree.get_children())
         self.cache_view = {}
+        self.cache_special_log = {}
         self.iid_to_oid = {};
         self.oid_to_iid = {}
 
@@ -885,8 +917,27 @@ class SinglePlayerCheck(ttk.Toplevel):
             else:
                 iid = self.tree.insert("", tk.END, values=item['val'], tags=('normal_row',))
                 self.cache_view[iid] = item['evt']
+                self.cache_special_log[iid] = item.get('special_log', "")
                 self.iid_to_oid[iid] = item['oid']
                 self.oid_to_iid[item['oid']] = iid
+
+    def show_special_log(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Hint", "请先选中一行再查看日志")
+            return
+        iid = sel[0]
+        if self.calc_mode != "special":
+            messagebox.showinfo("Hint", "请先切换到“特殊计算”模式后再查看")
+            return
+
+        text = self.cache_special_log.get(iid, "").strip()
+        if not text:
+            text = "当前行没有最终生效的借单结果。"
+
+        self.txt.delete("1.0", tk.END)
+        self.txt.insert("1.0", text)
+        self.nb_cards.select(2)
 
     def toggle_mode(self):
         self.calc_mode = "special" if self.calc_mode == "normal" else "normal"
@@ -959,7 +1010,11 @@ class SinglePlayerCheck(ttk.Toplevel):
         color = colorchooser.askcolor(parent=self)[1]
         if not color: return
         tag = f"manual_mark_{color}_{datetime.now().timestamp()}"
-        self.tree.tag_configure(tag, background=color, foreground="white")
+        if IS_MACOS:
+            # macOS 手动标记同样用文字色，保持可见性
+            self.tree.tag_configure(tag, foreground=color, background=RULE_COLORS["DEFAULT"])
+        else:
+            self.tree.tag_configure(tag, background=color, foreground="white")
         indices = [self.tree.index(i) for i in sel]
         for i in range(min(indices), max(indices) + 1):
             iid = self.tree.get_children()[i]
@@ -979,8 +1034,15 @@ class SinglePlayerCheck(ttk.Toplevel):
         if not sel: return
         iid = sel[0]
         if iid not in self.cache_view: return
-        events = sorted(self.cache_view[iid],
-                        key=lambda x: (0 if x['type'] == 'achieved' else 1, x['rule']['priority']))
+        self.txt.delete("1.0", tk.END)
+        if self.calc_mode == "special":
+            log_text = self.cache_special_log.get(iid, "").strip()
+            if log_text:
+                self.txt.insert("1.0", log_text)
+            else:
+                self.txt.insert("1.0", "当前行没有最终生效的借单结果。")
+        else:
+            self.txt.insert("1.0", "当前是普通计算模式，切到“特殊计算”后可查看借单日志。")
 
         for child in self.tree.get_children():
             tags = list(self.tree.item(child, "tags"))
@@ -989,58 +1051,63 @@ class SinglePlayerCheck(ttk.Toplevel):
 
         self.f_ach_cards.clear();
         self.f_con_cards.clear();
-        b_cons = {};
-        has_contact = False;
-        txt_log = ""
 
-        for e in events:
-            if e['type'] == 'achieved':
-                txt = format_event_text_full(e)
-                oids = [str(o['oid']) for o in e['data']['orders']]
-                self.f_ach_cards.add_card(e['rule']['name'], txt, "success", oids)
-                txt_log += txt + "\n"
+        try:
+            raw_events = self.cache_view.get(iid, [])
+            events = [e for e in raw_events if isinstance(e, dict) and 'type' in e and 'rule' in e and 'data' in e]
+            events = sorted(events, key=lambda x: (0 if x.get('type') == 'achieved' else 1, x.get('rule', {}).get('priority', 999)))
 
-                for o in e['data']['orders']:
-                    tgt = self.oid_to_iid.get(str(o.get('oid', '')))
-                    if tgt:
-                        ct = list(self.tree.item(tgt, "tags"))
-                        if any(t.startswith('manual_mark') for t in ct): continue
-                        if 'normal_row' in ct: ct.remove('normal_row')
-                        if e['rule']['name'] not in ct: ct.append(e['rule']['name'])
-                        self.tree.item(tgt, tags=tuple(ct))
+            b_cons = {}
+            has_contact = False
 
-            elif e['type'] == 'contact':
-                # 修复: 使用 self.ref_time 而不是 self.current_ref_time
-                if e['data']['deadline'] <= self.ref_time: continue
-                rn = e['rule']['name']
-                if rn not in b_cons or e['miss'] < b_cons[rn]['miss']:
-                    b_cons[rn] = e
-                has_contact = True
+            for e in events:
+                if e.get('type') == 'achieved':
+                    txt = format_event_text_full(e)
+                    oids = [str(o.get('oid', '')) for o in e.get('data', {}).get('orders', [])]
+                    self.f_ach_cards.add_card(e.get('rule', {}).get('name', 'ACH'), txt, "success", oids)
 
-        for r_name, e in b_cons.items():
-            t_key = "contact_count" if e['rule']['type'] == 'count' else "contact_sum"
+                    for o in e.get('data', {}).get('orders', []):
+                        tgt = self.oid_to_iid.get(str(o.get('oid', '')))
+                        if tgt:
+                            ct = list(self.tree.item(tgt, "tags"))
+                            if any(t.startswith('manual_mark') for t in ct): continue
+                            if 'normal_row' in ct: ct.remove('normal_row')
+                            rn = e.get('rule', {}).get('name')
+                            if rn and rn not in ct: ct.append(rn)
+                            self.tree.item(tgt, tags=tuple(ct))
 
-            # --- 核心修改开始 ---
-            # 重新计算严格截止时间：起始时间 + 规则原生小时数 (不加 time_ext)
-            strict_deadline = e['data']['start_t'] + timedelta(hours=e['rule']['hours'])
+                elif e.get('type') == 'contact':
+                    deadline = e.get('data', {}).get('deadline')
+                    if not deadline or deadline <= self.ref_time:
+                        continue
+                    rn = e.get('rule', {}).get('name')
+                    if rn and (rn not in b_cons or e.get('miss', 9999) < b_cons[rn].get('miss', 9999)):
+                        b_cons[rn] = e
+                    has_contact = True
 
-            msg = tmpl_mgr.render(t_key, bonus_name=r_name, reward=e['rule'].get('reward'), miss=e['miss'],
-                                  deadline=str(strict_deadline).split('.')[0])
-            # --- 核心修改结束 ---
+            for r_name, e in b_cons.items():
+                t_key = "contact_count" if e.get('rule', {}).get('type') == 'count' else "contact_sum"
+                strict_deadline = e['data']['start_t'] + timedelta(hours=e['rule']['hours'])
+                msg = tmpl_mgr.render(t_key, bonus_name=r_name, reward=e['rule'].get('reward'), miss=e.get('miss', 0),
+                                      deadline=str(strict_deadline).split('.')[0])
+                oids = [str(o.get('oid', '')) for o in e.get('data', {}).get('orders', [])]
+                self.f_con_cards.add_card(r_name, msg, "warning", oids, template_text=msg)
 
-            oids = [str(o['oid']) for o in e['data']['orders']]
-            self.f_con_cards.add_card(r_name, msg, "warning", oids, template_text=msg)
-        if has_contact:
-            self.nb_cards.select(1)
-        else:
-            self.nb_cards.select(0)
+            if has_contact:
+                self.nb_cards.select(1)
+            else:
+                self.nb_cards.select(0)
+        except Exception as ex:
+            self.txt.delete("1.0", tk.END)
+            self.txt.insert("1.0", f"渲染异常: {ex}")
+            self.nb_cards.select(2)
 
             # ================= 6. 主程序 (修改版) =================
 
 
 class PromoAnalyzerApp:
     def __init__(self):
-        self.root = ttk.Window(title="黑道英文业绩计算器V7.6", themename="darkly")
+        self.root = ttk.Window(title="黑道英文业绩计算器V7.9", themename="darkly")
         self.root.geometry("1450x980")
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
 
