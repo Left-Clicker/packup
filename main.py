@@ -1,910 +1,1665 @@
-import sys
-import numpy as np
+import ttkbootstrap as ttk
+from ttkbootstrap.constants import *
+from ttkbootstrap.toast import ToastNotification
+from ttkbootstrap.scrolled import ScrolledText
+from tkinter import filedialog, messagebox, colorchooser
 import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-from PIL import Image, ImageDraw, ImageFont, ImageTk, ImageChops, ImageFilter
+import pandas as pd
+import math
+import re
+import json
 import os
-import platform
+import sys
+import copy
+import time
+import threading
+from datetime import datetime, timedelta
+from itertools import groupby
+from operator import itemgetter
 
-try:
-    from tkinterdnd2 import TkinterDnD, DND_FILES
-except ImportError:
-    messagebox.showerror("缺少组件", "请在终端执行: pip install tkinterdnd2")
-    exit()
+os.environ['TK_SILENCE_DEPRECATION'] = '1'
+IS_MACOS = sys.platform == "darwin"
 
-TEMPLATE_CONFIGS = {
-    "template_E6.png": {
-        "style": "E6_Classic",
-        "photo": {"size": 405, "x": 92, "y": 122},
-        # 主景横光辉（⑨）与昵称坐标解耦；默认与旧版「昵称默认位置」视觉对齐
-        "glow": {"x": 0, "y": 514},
-        "fields": {
-            "name": {"label": "✎ 玩家名称 (Name):", "size": 28, "x": 0, "y": 502,
-                     "color": "#FAD355", "stroke": "#111111"}
-        }
-    },
-    "template_E7.png": {
-        "style": "E7_Italic",
-        "photo": {"size": 240, "x": 417, "y": 90},
-        "fields": {
-            "name": {"label": "✎ 玩家昵称 (Name):", "size": 26, "x": -6, "y": 311,
-                     "color": "#FFFFFF", "stroke": "#111111"},
-            "city": {"label": "⌂ 玩家城市 (City):", "size": 23, "x": -6, "y": 351,
-                     "color": "#FAD355", "stroke": "#111111"}
-        }
+
+# ================= 0. 模板管理器 =================
+
+class TemplateManager:
+    FILE_NAME = "templates.json"
+
+    DEFAULT_TEMPLATES = {
+        "contact_sum": (
+            "Hi dear, your account will reach {bonus_name} bonus and get free {reward}*$99.99 packs, "
+            "if you purchase {miss} more $99.99 packs before {deadline} City Time."
+        ),
+        "contact_count": (
+            "Hi dear, your account will reach {bonus_name} bonus and get free {reward}*$99.99 packs, "
+            "if you purchase {miss} more $99.99 non-Diamonds packs before {deadline} City Time."
+        )
     }
-}
 
-C0 = "#0D0D0D"
-C1 = "#161616"
-C2 = "#222222"
-C3 = "#333333"
-CG = "#D4AF37"
-CT = "#E6C27A"
-CW = "#E0E0E0"
+    def __init__(self):
+        self.templates = self.load_templates()
+
+    def load_templates(self):
+        base_path = get_app_path()
+        full_path = os.path.join(base_path, self.FILE_NAME)
+        if not os.path.exists(full_path): return self.DEFAULT_TEMPLATES.copy()
+        try:
+            with open(full_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for k, v in self.DEFAULT_TEMPLATES.items():
+                    if k not in data: data[k] = v
+                return data
+        except:
+            return self.DEFAULT_TEMPLATES.copy()
+
+    def save_templates(self, new_data):
+        self.templates = new_data
+        base_path = get_app_path()
+        full_path = os.path.join(base_path, self.FILE_NAME)
+        try:
+            with open(full_path, "w", encoding="utf-8") as f:
+                json.dump(new_data, f, ensure_ascii=False, indent=4)
+            return True
+        except Exception as e:
+            return False
+
+    def get(self, key):
+        return self.templates.get(key, self.DEFAULT_TEMPLATES[key])
+
+    def render(self, key, **kwargs):
+        tmpl = self.get(key)
+        try:
+            return tmpl.format(**kwargs)
+        except KeyError as e:
+            return f"Error: Template missing variable {{{e.args[0]}}}. Raw: {tmpl}"
 
 
-class App:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("宣传图制作工作台 V2.2")
-        self.root.geometry("1400x850")
-        self.root.configure(bg=C0)
-        self.app_dir = self._ap()
-        self.queue = []
-        self.cur = None
-        self.final = None
-        self.fc = {}
-        self.sfonts = self._sf()
-        self.fld = {}
-        self._rp = None
-        self._ri = None
-        self._tn = None
-        self.ti = None
-        self.pi = None
-        self.sc = 1.0
-        self.vx = self.vy = 0
-        self.dsx = self.dsy = self.dbx = self.dby = 0
-        self.psx = self.psy = self.bvx = self.bvy = 0
-        self.tki = None
-        self.cid = None
-        self._f1 = True
-        self._rj = None
-
-        st = ttk.Style()
-        st.theme_use('clam')
-        st.configure("TCombobox", fieldbackground=C3, background=C2,
-                     foreground=CG, arrowcolor=CG, bordercolor=C2)
-        st.map("TCombobox", fieldbackground=[("readonly", C3)],
-               selectbackground=[("readonly", CG)], selectforeground=[("readonly", "black")],
-               foreground=[("readonly", CG)])
-        for k, v in [('background', C3), ('foreground', CG),
-                     ('selectBackground', CG), ('selectForeground', 'black')]:
-            self.root.option_add(f'*TCombobox*Listbox.{k}', v)
-
-        self._ui()
-        self._st()
-        self._dnd()
-
-    @staticmethod
-    def _ap():
-        if getattr(sys, 'frozen', False):
-            exe_dir = os.path.dirname(sys.executable)
-            internal_dir = os.path.join(exe_dir, "_internal")
-            if os.path.isdir(internal_dir):
-                return internal_dir
-            return exe_dir
+def get_app_path():
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(sys.executable)
+    else:
         return os.path.dirname(os.path.abspath(__file__))
 
-    def _ui(self):
-        L = tk.Frame(self.root, bg=C1, width=420)
-        L.pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=10)
-        L.pack_propagate(False)
-        tk.Label(L, text="⚜️ 核心工作台", fg=CG, bg=C1,
-                 font=("Microsoft YaHei UI", 18, "bold")).pack(pady=(15, 10))
 
-        b1 = tk.LabelFrame(L, text=" 模板与录入 ", bg=C2, fg=CG,
-                           font=("Microsoft YaHei UI", 11, "bold"), bd=1)
-        b1.pack(fill=tk.X, padx=10, pady=5)
-        self.cmb = ttk.Combobox(b1, state="readonly", font=("Arial", 12, "bold"))
-        self.cmb.pack(fill=tk.X, padx=15, pady=(15, 10))
-        self.cmb.bind("<<ComboboxSelected>>", self._tc)
-        tk.Button(b1, text="[ 点击多选 / 拖入图片 ]\n建立批量排队", command=self._sel,
-                  bg="#2B2B2B", fg=CT, activebackground=CG, activeforeground="black",
-                  font=("Microsoft YaHei UI", 10), height=2, relief="groove"
-                  ).pack(fill=tk.X, padx=15, pady=(5, 10))
-        self.lq = tk.Label(b1, text="[队列空闲]", fg="#888", bg=C2,
-                           font=("Microsoft YaHei UI", 9))
-        self.lq.pack(pady=(0, 10))
+tmpl_mgr = TemplateManager()
 
-        b2 = tk.LabelFrame(L, text=" 空间参数 ", bg=C2, fg=CG,
-                           font=("Microsoft YaHei UI", 10), bd=1)
-        b2.pack(fill=tk.X, padx=10, pady=5)
-        fp = tk.Frame(b2, bg=C2)
-        fp.pack(pady=10)
+# ================= 1. 配置区域 =================
 
-        def mks(p, t, lo, hi, c):
-            tk.Label(p, text=t, bg=C2, fg=CW,
-                     font=("Microsoft YaHei", 9)).grid(row=0, column=c * 2, padx=(5, 0))
-            s = tk.Spinbox(p, from_=lo, to=hi, width=5, bg=C3, fg=CG,
-                           insertbackground=CG, buttonbackground=C2)
-            s.grid(row=0, column=c * 2 + 1, padx=2)
-            return s
+RULE_COLORS = {
+    "1000+180": "#FF6B6B",
+    "500+85": "#FF9F43",
+    "168+25": "#Feca57",
+    "68+8": "#2ECC71",
+    "34+4": "#54A0FF",
+    "10+1": "#D980FA",
+    "DEFAULT": "#333333"
+}
 
-        self.ssz = mks(fp, "宽:", 10, 8000, 0)
-        self.sx = mks(fp, "X:", -4000, 4000, 1)
-        self.sy = mks(fp, "Y:", -4000, 4000, 2)
-        self.ssz.config(command=self._full)
-        self.ssz.bind("<Return>", lambda e: self._full())
-        self.sx.config(command=self._fast)
-        self.sx.bind("<Return>", lambda e: self._fast())
-        self.sy.config(command=self._fast)
-        self.sy.bind("<Return>", lambda e: self._fast())
+COLUMN_MAPPING_CONFIG = {
+    'oid': '订单号', 'pid': '玩家昵称', 'real_id': '玩家Player_id', 'amt': '礼包价格',
+    'time': '订单发放日期', 'server': '服务器昵称', 'status': '是否发放元宝',
+    'is_marked': '是否已标记绩效', 'perf_owner': '业绩归属人', 'free_event': '是否计入免费包活动'
+}
 
-        b3 = tk.LabelFrame(L, text=" 🌟 光效 ", bg=C2, fg=CG,
-                           font=("Microsoft YaHei UI", 10), bd=1)
-        b3.pack(fill=tk.X, padx=10, pady=5)
+SUM_RULES = [
+    {"name": "1000+180", "hours": 72, "type": "sum", "target": 99990.00, "priority": 10, "default_min_reached": 700,
+     "reward": 180},
+    {"name": "500+85", "hours": 48, "type": "sum", "target": 49995.00, "priority": 20, "default_min_reached": 300,
+     "reward": 85},
+    {"name": "168+25", "hours": 48, "type": "sum", "target": 16798.32, "priority": 30, "default_min_reached": 100,
+     "reward": 25},
+    {"name": "68+8", "hours": 48, "type": "sum", "target": 6799.32, "priority": 40, "default_min_reached": 54,
+     "reward": 8},
+    {"name": "34+4", "hours": 24, "type": "sum", "target": 3399.66, "priority": 50, "default_min_reached": 20,
+     "reward": 4},
+]
 
-        def mksc(par, txt, lo, hi, val):
-            f = tk.Frame(par, bg=C2)
-            f.pack(fill=tk.X, padx=10, pady=4)
-            tk.Label(f, text=txt, bg=C2, fg=CW,
-                     font=("Microsoft YaHei", 9)).pack(side=tk.LEFT)
-            s = tk.Scale(f, from_=lo, to=hi, orient=tk.HORIZONTAL, bg=C2, fg=CG,
-                         bd=0, highlightthickness=0, troughcolor=C3,
-                         activebackground=CG, command=lambda v: self._fast())
-            s.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10)
-            s.set(val)
-            return s
+COUNT_RULE = {"name": "10+1", "hours": 24, "type": "count", "target": 10, "unit_price": 99.99, "priority": 60,
+              "default_min_reached": 5, "reward": 1}
 
-        self.sli = mksc(b3, "光线强度:", 0, 100, 80)
-        self.sfl = mksc(b3, "横光偏移:", -200, 200, 23)
+# 必须按优先级排序 (1000 -> 10)
+ALL_RULES = sorted(SUM_RULES + [COUNT_RULE], key=lambda x: x['priority'])
 
-        # E6 专用：主景横光辉位置（与昵称「左右/上下」独立）
-        self.fglow = tk.Frame(b3, bg=C2)
 
-        def mkg(p, t, lo, hi):
-            tk.Label(p, text=t, bg=C2, fg=CW,
-                     font=("Microsoft YaHei", 9)).pack(side=tk.LEFT)
-            s = tk.Spinbox(p, from_=lo, to=hi, width=6, bg=C3, fg=CG,
-                           insertbackground=CG, buttonbackground=C2,
-                           command=self._fast)
-            s.pack(side=tk.LEFT, padx=8)
-            s.bind("<Return>", lambda e: self._fast())
-            return s
+def is_marked_performance(row): return str(row.get('is_marked', '')).strip() == '是'
 
-        gf = tk.Frame(self.fglow, bg=C2)
-        gf.pack(fill=tk.X, padx=10, pady=4)
-        self.sgx = mkg(gf, "横光左右:", -2000, 2000)
-        self.sgy = mkg(gf, "横光上下:", -500, 2500)
 
-        self.btxt = tk.LabelFrame(L, text=" 文字编辑 ", bg=C2, fg=CG,
-                                  font=("Microsoft YaHei UI", 10), bd=1)
-        self.btxt.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+def is_free_event_pack(row): return str(row.get('free_event', '否')).strip() != '否'
 
-        bf = tk.Frame(L, bg=C1)
-        bf.pack(fill=tk.X, padx=10, pady=15, side=tk.BOTTOM)
-        tk.Button(bf, text="⟳ 刷新", command=self._full, bg="#222", fg=CW,
-                  relief="groove").pack(fill=tk.X, pady=(0, 10))
-        self.bsv = tk.Button(bf, text="✦ 渲染输出 ✦", command=self._save, bg=CG,
-                             fg="black", activebackground="#FFE47A", activeforeground="black",
-                             font=("Microsoft YaHei UI", 13, "bold"), height=2,
-                             state="disabled", cursor="hand2")
-        self.bsv.pack(fill=tk.X)
 
-        R = tk.LabelFrame(self.root,
-                          text=" 🖥️ [滚轮缩放] [Ctrl+滚轮调大小] [左键拖] [右键平移] ",
-                          bg=C0, fg=CG, font=("Microsoft YaHei UI", 11, "bold"), bd=1)
-        R.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(0, 10), pady=10)
-        self.cv = tk.Canvas(R, bg="#080808", highlightthickness=0, cursor="tcross")
-        self.cv.pack(fill=tk.BOTH, expand=True)
-        self.cv.create_text(400, 300, text="等待图像…", fill="#444",
-                            font=("Microsoft YaHei", 16))
-        for ev, fn in [("<MouseWheel>", self._zm), ("<Button-4>", self._zm),
-                       ("<Button-5>", self._zm), ("<Control-MouseWheel>", self._czm),
-                       ("<Control-Button-4>", self._czm), ("<Control-Button-5>", self._czm),
-                       ("<ButtonPress-1>", self._ds), ("<B1-Motion>", self._dm),
-                       ("<ButtonPress-3>", self._ps), ("<B3-Motion>", self._pm),
-                       ("<ButtonPress-2>", self._ps), ("<B2-Motion>", self._pm),
-                       ("<Control-ButtonPress-1>", self._ps), ("<Control-B1-Motion>", self._pm)]:
-            self.cv.bind(ev, fn)
+def has_owner_or_perf_mark(row):
+    perf_owner = str(row.get('perf_owner', '')).strip()
+    has_owner = perf_owner and perf_owner not in ['nan', 'None', '']
+    return is_marked_performance(row) or has_owner
 
-    def _dnd(self):
-        try:
-            self.root.drop_target_register(DND_FILES)
-            self.root.dnd_bind('<<Drop>>',
-                               lambda e: self._aq(self.root.tk.splitlist(e.data)))
-        except:
-            pass
 
-    def _sel(self):
-        p = filedialog.askopenfilenames(
-            title="选择照片", filetypes=[("Images", "*.png *.jpg *.jpeg *.webp")])
-        if p:
-            self._aq(p)
+def format_percent(value):
+    if abs(value - round(value)) < 1e-9:
+        return f"{int(round(value))}%"
+    return f"{value:.1f}%"
 
-    def _aq(self, paths):
-        v = [p for p in paths
-             if str(p).lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))]
-        if not v:
-            return
-        self.queue.extend(v)
-        if not self.cur:
-            self._nx()
-        else:
-            self._uq()
 
-    def _nx(self):
-        if not self.queue:
-            self.cur = None
-            self.lq.config(text="✅ 完成", fg="#2ECC71")
-            self.bsv.config(state="disabled", text="✦ 输出 ✦")
-            return
-        self.cur = self.queue.pop(0)
-        self._uq()
-        self._full()
+def build_mark_ratio_text(events):
+    merged_by_rule = {}
+    rule_order = []
 
-    def _uq(self):
-        nm = os.path.basename(self.cur)
-        r = len(self.queue)
-        if r > 0:
-            self.lq.config(text=f"▶ {nm} | ⏳{r}张", fg=CT)
-            self.bsv.config(text=f"✦ 保存并下一张({r}) ✦")
-        else:
-            self.lq.config(text=f"▶ {nm} | 🏁最后", fg=CG)
-            self.bsv.config(text="✦ 保存终图 ✦")
+    for e in events:
+        if e.get('type') != 'achieved':
+            continue
+        rule = e.get('rule', {})
+        rule_name = str(rule.get('name', '')).strip()
+        if not rule_name:
+            continue
+        if rule_name not in merged_by_rule:
+            merged_by_rule[rule_name] = []
+            rule_order.append((rule.get('priority', 999), rule_name))
 
-    def _save(self):
-        if not self.final or not self.cur:
-            return
-        try:
-            d = os.path.dirname(self.cur)
-            n = os.path.splitext(os.path.basename(self.cur))[0]
-            tpl = self.cmb.get().lower()
-            pfx = "E7出图" if "e7" in tpl else "E6出图"
-            self.final.save(
-                os.path.join(d, f"{pfx}-{n}.png"),
-                format="PNG",
-                optimize=False,
-                compress_level=0
-            )
-            self._nx()
-            if not self.queue and not self.cur:
-                messagebox.showinfo("收工", "🎉 全部完成！")
-        except Exception as e:
-            messagebox.showerror("异常", str(e))
+        orders = e.get('data', {}).get('orders', [])
+        total = len(orders)
+        if total <= 0:
+            continue
 
-    def _st(self):
-        vl = []
-        try:
-            for f in os.listdir(self.app_dir):
-                lo = f.lower()
-                if "template_e6" in lo and lo.endswith(('.png', '.jpg')):
-                    vl.append(f)
-                    TEMPLATE_CONFIGS[f] = TEMPLATE_CONFIGS["template_E6.png"]
-                elif "template_e7" in lo and lo.endswith(('.png', '.jpg')):
-                    vl.append(f)
-                    TEMPLATE_CONFIGS[f] = TEMPLATE_CONFIGS["template_E7.png"]
-        except:
-            pass
-        if vl:
-            self.cmb['values'] = vl
-            self.cmb.current(0)
-            self._tc()
-        else:
-            messagebox.showwarning("警告", "没找到模板！")
+        # 归属标记 + 免费包标记合并口径：任一命中即计为“已标记”
+        merged_cnt = sum(1 for o in orders if (has_owner_or_perf_mark(o) or is_free_event_pack(o)))
+        merged_by_rule[rule_name].append(format_percent(merged_cnt * 100.0 / total))
 
-    def _tc(self, ev=None):
-        cfg = TEMPLATE_CONFIGS.get(self.cmb.get())
-        if not cfg:
-            return
-        for s, k in [(self.ssz, "size"), (self.sx, "x"), (self.sy, "y")]:
-            s.delete(0, 'end')
-            s.insert(0, cfg["photo"][k])
-        gv = cfg.get("glow", {"x": 0, "y": 514})
-        self.sgx.delete(0, 'end')
-        self.sgx.insert(0, str(gv.get("x", 0)))
-        self.sgy.delete(0, 'end')
-        self.sgy.insert(0, str(gv.get("y", 514)))
-        if cfg.get("style") == "E6_Classic":
-            self.fglow.pack(fill=tk.X, padx=0, pady=0)
-        else:
-            self.fglow.pack_forget()
-        self.vx = self.vy = 0
-        for w in self.btxt.winfo_children():
-            w.destroy()
-        self.fld.clear()
-        for fk, fv in cfg["fields"].items():
-            g = tk.Frame(self.btxt, bg=C2)
-            g.pack(fill=tk.X, padx=10, pady=(8, 0))
-            tk.Label(g, text=fv["label"], fg=CT, bg=C2,
-                     font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
-            ent = tk.Entry(g, font=("Trebuchet MS", 12), justify="center",
-                           bg=C3, fg=CG, insertbackground=CG, bd=0)
-            ent.pack(fill=tk.X, ipady=4, pady=2)
-            ent.bind("<KeyRelease>", lambda e: self._fast())
-            fc = tk.Frame(g, bg=C2)
-            fc.pack(fill=tk.X, pady=2)
+    if not merged_by_rule:
+        return ""
 
-            def mk(p, t, a, b):
-                tk.Label(p, text=t, bg=C2, fg=CW,
-                         font=("Microsoft YaHei", 8)).pack(side=tk.LEFT, padx=(5, 0))
-                s = tk.Spinbox(p, from_=a, to=b, width=4, bg=C3, fg=CG,
-                               buttonbackground=C2, command=self._fast)
-                s.pack(side=tk.LEFT, padx=2)
-                s.bind("<Return>", lambda e: self._fast())
-                return s
+    merged_parts = []
+    for _, rule_name in sorted(rule_order, key=lambda x: x[0]):
+        vals = merged_by_rule.get(rule_name, [])
+        if vals:
+            merged_parts.append(f"{rule_name}:{'/'.join(vals)}")
+    if not merged_parts:
+        return ""
+    return "标记占比详情 " + " | ".join(merged_parts)
 
-            ss = mk(fc, "字号:", 10, 400)
-            ss.delete(0, 'end')
-            ss.insert(0, fv["size"])
-            sxx = mk(fc, "左右:", -1000, 1000)
-            sxx.delete(0, 'end')
-            sxx.insert(0, fv["x"])
-            syy = mk(fc, "上下:", -500, 2000)
-            syy.delete(0, 'end')
-            syy.insert(0, fv["y"])
-            self.fld[fk] = {"e": ent, "ss": ss, "sx": sxx, "sy": syy,
-                            "c": fv["color"], "s": fv["stroke"]}
-        if self.cur:
-            self._full()
 
-            # ═══ 画布交互 ═══
+def format_event_text_full(e):
+    oids = ", ".join([str(o['oid']) for o in e['data']['orders']])
+    return f"Rule: {e['rule']['name']}\nTotal: ${e['data']['total']:.2f}\nCount: {e['data']['count']}\nOrders: {oids}"
 
-    def _zm(self, e):
-        if not self.final or e.state & 0x0004:
-            return
-        self.sc *= 1.15 if (e.delta > 0 or e.num == 4) else 1 / 1.15
-        self._disp()
 
-    def _czm(self, e):
-        if not self.final:
-            return
-        try:
-            c = int(self.ssz.get())
-            d = getattr(e, 'delta', 0)
-            if e.num == 4 or d > 0:
-                n = int(c * 1.05) + 2
-            elif e.num == 5 or d < 0:
-                n = int(c * 0.95) - 2
-            else:
-                return
-            self.ssz.delete(0, 'end')
-            self.ssz.insert(0, str(max(10, min(n, 8000))))
-            self._full()
-        except:
-            pass
+def show_copy_toast(title, message):
+    try:
+        toast = ToastNotification(
+            title=title,
+            message=message,
+            duration=2000,
+            bootstyle="success",
+            position=(50, 50, 'se')
+        )
+        toast.show_toast()
+    except:
+        pass
 
-    def _ds(self, e):
-        if not self.final:
-            return
-        self.dsx = e.x
-        self.dsy = e.y
-        try:
-            self.dbx = int(self.sx.get())
-            self.dby = int(self.sy.get())
-        except:
-            pass
+        # Display Logic
 
-    def _dm(self, e):
-        if not self.final:
-            return
-        self.sx.delete(0, 'end')
-        self.sx.insert(0, int(self.dbx + (e.x - self.dsx) / self.sc))
-        self.sy.delete(0, 'end')
-        self.sy.insert(0, int(self.dby + (e.y - self.dsy) / self.sc))
-        self._fast()
 
-    def _ps(self, e):
-        if not self.final:
-            return
-        self.psx = e.x
-        self.psy = e.y
-        self.bvx = self.vx
-        self.bvy = self.vy
+def generate_summary_grouped(events, calc_mode="normal", ref_time=None, current_oid=None, suppress_map=None):
+    if not events: return ""
 
-    def _pm(self, e):
-        if not self.final or not self.cid:
-            return
-        self.vx = self.bvx + (e.x - self.psx)
-        self.vy = self.bvy + (e.y - self.psy)
-        self.cv.coords(self.cid, self.cv.winfo_width() / 2 + self.vx,
-                       self.cv.winfo_height() / 2 + self.vy)
+    # 【修复调整】彻底废除了原本用来隐藏 miss<=1 的 cutoff_priority 拦截逻辑
+    # 确保上方的 Treeview 列表与底部卡片读取数据源保持绝对一致，如实显示差1。
 
-        # ═══ 字体 ═══
+    grouped = {}
+    for e in events:
+        r_name = e['rule']['name']
+        r_priority = e['rule']['priority']
 
-    def _sf(self):
-        sys_name = platform.system().lower()
-        if sys_name == "windows":
-            fd = "C:\\Windows\\Fonts"
-            names = ["seguiemj.ttf", "seguisym.ttf", "impact.ttf", "arialbd.ttf",
-                     "msyhbd.ttc", "tahomabd.ttf", "tahoma.ttf", "arial.ttf",
-                     "msyh.ttc", "simsun.ttc"]
-        elif sys_name == "darwin":
-            fd = "/System/Library/Fonts"
-            names = [
-                "PingFang.ttc", "Helvetica.ttc", "HelveticaNeue.ttc",
-                "Arial.ttf", "Arial Bold.ttf", "Hiragino Sans GB.ttc",
-                "STHeiti Medium.ttc", "Apple Color Emoji.ttc"
-            ]
-        else:
-            fd = "/usr/share/fonts"
-            names = [
-                "NotoSansCJK-Regular.ttc", "NotoSansCJK-Bold.ttc",
-                "DejaVuSans.ttf", "LiberationSans-Regular.ttf"
-            ]
-        pri = []
-        for n in names:
-            full = os.path.join(fd, n)
-            pri.append(full if os.path.exists(full) else n)
-        try:
-            extra_dirs = [fd]
-            if sys_name == "darwin":
-                extra_dirs.extend([
-                    "/Library/Fonts",
-                    os.path.expanduser("~/Library/Fonts")
-                ])
-            elif sys_name == "linux":
-                extra_dirs.extend([
-                    "/usr/local/share/fonts",
-                    os.path.expanduser("~/.fonts")
-                ])
-            ex = set(os.path.basename(p).lower() for p in pri)
-            ext = []
-            for d in extra_dirs:
-                if not os.path.isdir(d):
-                    continue
-                for f in os.listdir(d):
-                    lo = f.lower()
-                    if lo.endswith(('.ttf', '.ttc', '.otf')) and lo not in ex:
-                        ext.append(os.path.join(d, f))
-            return pri + ext
-        except:
-            return pri
+        if r_name not in grouped: grouped[r_name] = {'priority': r_priority, 'achieved_sets': 0, 'contacts': set()}
 
-    def _gf(self, char, size):
-        ck = f"{char}_{size}"
-        if ck in self.fc:
-            return self.fc[ck]
-        fpk = f"__fp_{ord(char)}"
-        if fpk in self.fc:
-            try:
-                f = ImageFont.truetype(self.fc[fpk], size)
-                self.fc[ck] = (f, char)
-                return f, char
-            except:
-                del self.fc[fpk]
-        for fp in self.sfonts:
-            try:
-                f = ImageFont.truetype(fp, size)
-                if f.getlength(char) <= 0:
-                    continue
-                if not self._fok(fp, char):
-                    continue
-                self.fc[ck] = (f, char)
-                self.fc[fpk] = fp
-                return f, char
-            except:
-                continue
-        return ImageFont.load_default(), char
+        if e['type'] == 'achieved':
+            grouped[r_name]['achieved_sets'] += e['sets']
+        elif e['type'] == 'contact':
+            # 过滤已超时的催单
+            if ref_time and e['data']['deadline'] <= ref_time: continue
 
-    def _fok(self, fp, char):
-        k = f"__ok_{fp}_{ord(char)}"
-        if k in self.fc:
-            return self.fc[k]
-        ok = False
-        try:
-            tf = ImageFont.truetype(fp, 20)
-            m1 = tf.getmask(char)
-            m2 = tf.getmask('\ufffe')
-            if m1.size != m2.size:
-                ok = m1.getbbox() is not None
-            else:
-                ok = (m1.tobytes() != m2.tobytes()) and (m1.getbbox() is not None)
-        except:
-            pass
-        self.fc[k] = ok
-        return ok
+            # 【被删除的代码】：不再拦截强行剔除 e['miss'] <= 1 的数据
 
-        # ═══ 文字渲染引擎 ═══
+            grouped[r_name]['contacts'].add(e['miss'])
 
-    def _dtxt(self, tgt, text, tw, th, sz, ox, yp, mc, sc_, sty):
+    sorted_groups = sorted(grouped.items(), key=lambda x: x[1]['priority'])
+    parts = []
+    for r_name, data in sorted_groups:
+        sub_parts = []
+        if data['achieved_sets'] > 0: sub_parts.append(f"{r_name}达成x{data['achieved_sets']}")
+        if data['contacts']:
+            min_miss = min(data['contacts'])
+            sub_parts.append(f"{r_name}差{min_miss}")
+        if sub_parts: parts.append(" ".join(sub_parts))
+    return " | ".join(parts)
 
-        # 极限 5 倍超采样抗锯齿 (SSAA)
-        SSA = 5
-        sz_s = sz * SSA
 
-        cd = []
-        totw_s = 0
-        for ch in text:
-            if ch.isspace():
-                w_s = sz_s * 0.4
-                cd.append((" ", None, w_s))
-                totw_s += w_s
-                continue
-            fn, fc = self._gf(ch, sz_s)
-            try:
-                w_s = fn.getlength(fc)
-            except:
-                w_s = sz_s * 0.8
-            cd.append((fc, fn, w_s))
-            totw_s += w_s
+# --- 核心计算引擎 (Standard - Waterfall) ---
+# 逻辑：优先达成大额，达成即消耗并停止检查(Break)；未达成则检查催单，并继续检查低档位(Continue)。
+def calculate_achievements_normal(orders, all_rules, time_ext, limit_configs={}, ref_time=None):
+    if ref_time is None: ref_time = datetime.utcnow()
+    n = len(orders)
+    events = []
+    used_indices = set()
 
-        pad_s = int(sz_s * 2.5)
-        cw_s = int(totw_s + pad_s * 2)
-        cvh_s = int(sz_s * 4.5)
-        tx_s = pad_s
-        ty_s = sz_s
-        bw_s = max(1, int(sz_s * 0.045))
+    i = 0
+    while i < n:
+        if i in used_indices:
+            i += 1
+            continue
 
-        mt = Image.new("L", (cw_s, cvh_s), 0)
-        dt = ImageDraw.Draw(mt)
-        sw_s = max(2, int(sz_s * 0.07))
-        mo = Image.new("L", (cw_s, cvh_s), 0)
-        do = ImageDraw.Draw(mo)
-        gw_s = max(6, int(sz_s * 0.22))
-        mg = Image.new("L", (cw_s, cvh_s), 0)
-        dg_ = ImageDraw.Draw(mg)
+        consumed_in_this_pass = False
 
-        # 极薄厚底设置 (使用超采样尺度)
-        dep_s = max(1, int(sz_s * 0.025))
+        for rule in all_rules:
+            # 1. 确定起点
+            target_price = rule.get('unit_price', 99.99)
+            actual_start_idx = i
 
-        ra = 0
-        for _, fn, _ in cd:
-            if fn:
-                ra = fn.getmetrics()[0]
+            if rule['type'] == 'count':
+                temp_idx = i
+                found_valid_start = False
+                while temp_idx < n:
+                    if temp_idx in used_indices:
+                        temp_idx += 1;
+                        continue
+                    if abs(orders[temp_idx]['amt'] - target_price) < 0.05:
+                        actual_start_idx = temp_idx
+                        found_valid_start = True
+                        break
+                    temp_idx += 1
+                if not found_valid_start: continue
+
+            st = orders[actual_start_idx]['time_obj']
+            t_ext_val = time_ext if rule['type'] == 'sum' else 0
+            window_s = (rule['hours'] + t_ext_val) * 3600
+            deadline = st + timedelta(seconds=window_s)
+
+            scan_indices = []
+            acc_val = 0.0
+            valid_cnt = 0
+
+            for j in range(actual_start_idx, n):
+                if j in used_indices: continue
+                row = orders[j]
+                if row['time_obj'] > deadline: break
+
+                is_valid = False
+                if rule['type'] == 'sum':
+                    acc_val += row['amt'];
+                    is_valid = True
+                elif rule['type'] == 'count':
+                    if abs(row['amt'] - target_price) < 0.05:
+                        valid_cnt += 1;
+                        is_valid = True
+
+                if is_valid: scan_indices.append(j)
+
+                # 2. 判断状态
+            is_achieved = False
+            # 【修复1：防浮点不达成】增加 0.05 的容错，防止本该达成却判定失败
+            if rule['type'] == 'sum' and acc_val >= (rule['target'] - 0.05):
+                is_achieved = True
+            elif rule['type'] == 'count' and valid_cnt >= int(rule['target']):
+                is_achieved = True
+
+            if is_achieved:
+                # === 达成 ===
+                final_orders = []
+                temp_sum = 0.0;
+                temp_cnt = 0
+                for idx in scan_indices:
+                    o = orders[idx]
+                    final_orders.append(o)
+                    used_indices.add(idx)
+                    if rule['type'] == 'sum':
+                        temp_sum += o['amt']
+                        if temp_sum >= (rule['target'] - 0.05): break
+                    elif rule['type'] == 'count':
+                        temp_cnt += 1
+                        if temp_cnt >= int(rule['target']): break
+
+                events.append({
+                    'type': 'achieved', 'rule': rule, 'sets': 1,
+                    'data': {'orders': final_orders, 'total': sum(x['amt'] for x in final_orders),
+                             'count': len(final_orders), 'start_t': final_orders[0]['time_obj'], 'deadline': deadline}
+                })
+                consumed_in_this_pass = True
                 break
 
-        cx_s = tx_s
-        for c, fn, w_s in cd:
-            if fn:
-                dy = ra - fn.getmetrics()[0]
-                dt.text((cx_s, ty_s + dy), c, font=fn, fill=255,
-                        stroke_width=bw_s, stroke_fill=255)
-                do.text((cx_s, ty_s + dy), c, font=fn, fill=255,
-                        stroke_width=sw_s + bw_s, stroke_fill=255)
-                dg_.text((cx_s, ty_s + dy), c, font=fn, fill=255,
-                         stroke_width=gw_s + bw_s, stroke_fill=255)
-            cx_s += w_s
+            else:
+                # === 催单 ===
+                limit = limit_configs.get(rule['name'], 0)
+                if limit > 0:
+                    is_contact = False;
+                    miss = 0
+                    if rule['type'] == 'sum':
+                        if acc_val >= (limit * 99.99 - 0.05):
+                            is_contact = True
+                            # 【修复2：彻底解决连续13和最后多算1包的问题】
+                            # 利用 round 先将结果逼近规范小数位，再 ceil 抹去末尾脏数据进行整数进位
+                            miss = math.ceil(round((rule['target'] - acc_val) / 99.99, 4))
+                    elif rule['type'] == 'count':
+                        if valid_cnt >= limit:
+                            is_contact = True
+                            miss = int(rule['target']) - valid_cnt
 
-        gold = mc != "#FFFFFF"
-        up = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
-        is7 = sty == "E7_Italic"
+                    if is_contact:
+                        events.append({
+                            'type': 'contact', 'rule': rule, 'miss': miss,
+                            'data': {'orders': [orders[k] for k in scan_indices], 'total': acc_val,
+                                     'count': len(scan_indices), 'start_t': st, 'deadline': deadline}
+                        })
 
-        if gold and not is7:
-            gr_s = max(3, int(sz_s * 0.18))
-            gb = mg.filter(ImageFilter.GaussianBlur(radius=gr_s))
-            gt = Image.new("RGBA", (cw_s, cvh_s), (255, 190, 60, 0))
-            ga = np.array(gb, dtype=np.float32) / 255.0
-            yt0 = max(0, ty_s - int(sz_s * 0.3))
-            yb0 = min(cvh_s - 1, ty_s + int(sz_s * 1.6))
-            vt = np.zeros(cvh_s, dtype=np.float32)
-            for y in range(cvh_s):
-                if y <= yt0:
-                    vt[y] = 0.02
-                elif y <= yb0:
-                    vt[y] = 0.02 + 0.98 * ((y - yt0) / max(1, yb0 - yt0))
+        if not consumed_in_this_pass:
+            i += 1
+
+    return events, used_indices
+
+
+# Kernel logic with Pure Surplus Check (Safest Mode)
+def calculate_achievements_complex(orders, all_rules, time_ext, limit_configs, ref_time, debug_trace=None):
+    if debug_trace is None:
+        debug_trace = []
+
+    sum_rules = [r for r in all_rules if r['type'] == 'sum']
+    normal_events, _ = calculate_achievements_normal(orders, sum_rules, time_ext, limit_configs, ref_time)
+    achieved_sum_events = [e for e in normal_events if e['type'] == 'achieved']
+    order_to_sum_event_idx = {}
+    for idx, evt in enumerate(achieved_sum_events):
+        for o in evt['data']['orders']: order_to_sum_event_idx[str(o['oid'])] = idx
+
+    # 特殊模式口径：
+    # 1) 已达成累充中的订单属于“已使用”，借给10+1时必须保证原达成仍成立；
+    # 2) 未达成(仅contact)链路中的订单不锁定，可直接用于低档(10+1)达成。
+    orders_99 = [o for o in orders if abs(o['amt'] - 99.99) < 0.05]
+    n99 = len(orders_99)
+    count_rule = next((r for r in all_rules if r['type'] == 'count'), None)
+    if not count_rule: return normal_events, set()
+
+    achieved_count_events = [];
+    ids_consumed_by_count = set()
+    i = 0
+    while i <= n99 - 10:
+        if str(orders_99[i]['oid']) in ids_consumed_by_count: i += 1; continue
+        st = orders_99[i]['time_obj'];
+        ddl = st + timedelta(hours=24)
+        grp = [];
+        temp_j = i
+        while temp_j < n99:
+            o = orders_99[temp_j]
+            if str(o['oid']) in ids_consumed_by_count: temp_j += 1; continue
+            if o['time_obj'] > ddl: break
+            grp.append(o);
+            if len(grp) == 10: break
+            temp_j += 1
+        if len(grp) < 10: i += 1; continue
+
+        bounds = {}
+        for o in grp:
+            oid = str(o['oid'])
+            if oid in order_to_sum_event_idx:
+                idx = order_to_sum_event_idx[oid]
+                if idx not in bounds: bounds[idx] = []
+                bounds[idx].append(o)
+
+        possible = True;
+        plans = {}
+        reserved_refill_oids = set()
+        for e_idx, stolen in bounds.items():
+            evt = achieved_sum_events[e_idx]
+            cur = evt['data']['total'];
+            tgt = evt['rule']['target']
+            need = tgt - (cur - sum(o['amt'] for o in stolen))
+            if need <= 0.05: plans[e_idx] = []; continue
+            est = evt['data']['start_t'];
+            eed = evt['data']['deadline']
+            pot = []
+            c_ids = {str(o['oid']) for o in grp}
+            for o in orders:
+                oid = str(o['oid'])
+                if o['time_obj'] < est or o['time_obj'] > eed: continue
+                # 特殊模式补单去重：同一轮中已分配给其它事件的订单不可重复使用
+                # 同时排除已被10+1消耗的订单，避免“一单两用”导致结果虚增
+                if (oid not in order_to_sum_event_idx and oid not in c_ids
+                        and oid not in reserved_refill_oids and oid not in ids_consumed_by_count):
+                    pot.append(o)
+            refill = [];
+            r_tot = 0.0
+            for sp in pot:
+                refill.append(sp);
+                r_tot += sp['amt']
+                if r_tot >= need - 0.05: break
+            if r_tot < need - 0.05: possible = False; break
+            plans[e_idx] = refill
+            reserved_refill_oids.update(str(x['oid']) for x in refill)
+
+        if possible:
+            impact_parts = []
+            for e_idx, stolen in bounds.items():
+                evt = achieved_sum_events[e_idx];
+                sps = plans[e_idx]
+                s_ids = [str(o['oid']) for o in stolen]
+                for s_oid in s_ids:
+                    # 被借走的订单不再属于原累充事件，必须清理映射
+                    if order_to_sum_event_idx.get(s_oid) == e_idx:
+                        del order_to_sum_event_idx[s_oid]
+                new_list = [o for o in evt['data']['orders'] if str(o['oid']) not in s_ids] + sps
+                evt['data']['orders'] = new_list
+                evt['data']['total'] = sum(o['amt'] for o in new_list)
+                evt['data']['count'] = len(new_list)
+                for o in sps: order_to_sum_event_idx[str(o['oid'])] = e_idx
+                impact_parts.append(
+                    f"{evt['rule']['name']} 借{len(stolen)}单({', '.join(s_ids)}) "
+                    f"回填{len(sps)}单({', '.join(str(o['oid']) for o in sps) if sps else '无需回填'})"
+                )
+            debug_trace.append(
+                f"10+1 达成 | 起点OID={grp[0]['oid']} | 借走10单: {', '.join(str(o['oid']) for o in grp)} | "
+                f"影响: {' ; '.join(impact_parts) if impact_parts else '无'}"
+            )
+            achieved_count_events.append({'type': 'achieved', 'rule': count_rule, 'sets': 1,
+                                          'data': {'orders': grp, 'total': sum(o['amt'] for o in grp), 'count': 10,
+                                                   'start_t': grp[0]['time_obj'], 'deadline': ddl}
+                                          })
+            for o in grp: ids_consumed_by_count.add(str(o['oid']))
+        i += 1
+
+    final = achieved_sum_events + achieved_count_events
+    min_r = limit_configs.get(count_rule['name'], 0)
+
+    def is_borrowable_safely(oid):
+        if oid in ids_consumed_by_count: return False
+        # 不在已达成累充中的99.99，视为未锁定，可直接用于10+1
+        if oid not in order_to_sum_event_idx: return True
+        e_idx = order_to_sum_event_idx[oid]
+        evt = achieved_sum_events[e_idx]
+        if (evt['data']['total'] - 99.99) >= (evt['rule']['target'] - 0.05):
+            return True
+        return False
+
+    if min_r > 0:
+        i = 0
+        while i < n99:
+            o_start = orders_99[i]
+            oid_start = str(o_start['oid'])
+            if not is_borrowable_safely(oid_start):
+                i += 1;
+                continue
+            st = o_start['time_obj'];
+            ddl = st + timedelta(hours=24)
+            current_chain = [o_start]
+            for j in range(i + 1, n99):
+                o_curr = orders_99[j]
+                if o_curr['time_obj'] > ddl: break
+                oid_curr = str(o_curr['oid'])
+                if is_borrowable_safely(oid_curr):
+                    current_chain.append(o_curr)
+            cnt = len(current_chain)
+            if cnt >= min_r and cnt < 10 and ref_time < ddl:
+                final.append({'type': 'contact', 'rule': count_rule, 'miss': 10 - cnt,
+                              'data': {'orders': current_chain, 'total': sum(o['amt'] for o in current_chain),
+                                       'count': cnt, 'start_t': st, 'deadline': ddl}
+                              })
+            i += 1
+
+    final += [e for e in normal_events if e['type'] == 'contact']
+    return final, set()
+
+
+# 全局辅助函数：寻找最佳起点 (Best Scenario)
+def find_best_scenario(orders, all_rules, time_ext, limit_map, ref_time):
+    if not orders: return []
+    best_score = -1
+    best_events = []
+
+    scan_limit = min(len(orders), 100)
+
+    for i in range(scan_limit):
+        sub_orders = orders[i:]
+        evts, _ = calculate_achievements_normal(sub_orders, all_rules, time_ext, limit_map, ref_time)
+        score = sum(e['rule'].get('reward', 0) * e['sets'] for e in evts if e['type'] == 'achieved')
+
+        if score > best_score:
+            best_score = score
+            best_events = evts
+
+    return best_events
+
+
+# ================= 3. 编辑器 UI =================
+
+class TemplateEditorWindow(ttk.Toplevel):
+    def __init__(self, parent):
+        super().__init__(title="Edit Templates", master=parent)
+        self.geometry("800x600")
+        self.data = tmpl_mgr.load_templates()
+        self.text_widgets = {}
+
+        ttk.Label(self, text="模板编辑器", font=("Helvetica", 14, "bold"), bootstyle="primary").pack(pady=10)
+        container = ttk.Frame(self)
+        container.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+
+        f1 = ttk.Labelframe(container, text="累充规则模板 (Sum Rules)", bootstyle="primary")
+        f1.pack(fill=tk.BOTH, expand=True, pady=5)
+        t1 = ScrolledText(f1, height=5, font=("Consolas", 10))
+        t1.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        t1.insert("1.0", self.data.get("contact_sum", ""))
+        self.text_widgets["contact_sum"] = t1
+
+        f2 = ttk.Labelframe(container, text="计数规则模板 (Count Rules)", bootstyle="success")
+        f2.pack(fill=tk.BOTH, expand=True, pady=5)
+        t2 = ScrolledText(f2, height=5, font=("Consolas", 10))
+        t2.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+        t2.insert("1.0", self.data.get("contact_count", ""))
+        self.text_widgets["contact_count"] = t2
+
+        ttk.Button(self, text="💾 保存并生效", bootstyle="success", command=self.save).pack(pady=10, fill=tk.X, padx=50)
+
+    def save(self):
+        new_data = {}
+        for k, w in self.text_widgets.items(): new_data[k] = w.get("1.0", "end-1c").strip()
+        if tmpl_mgr.save_templates(new_data): self.destroy()
+
+        # ================= 4. UI 组件 (SafeScrollableFrame) =================
+
+
+class SafeScrollableFrame(ttk.Frame):
+    def __init__(self, parent, columns=2, *args, **kwargs):
+        super().__init__(parent, *args, **kwargs)
+        self.columns = columns
+        style = ttk.Style()
+        bg_color = style.lookup("TFrame", "background")
+        self.canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0, bg=bg_color)
+        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.scrollable_frame = ttk.Frame(self.canvas)
+        self.scrollable_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas_window = self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
+        self.canvas.bind('<Configure>', self._configure_window_width)
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.scrollbar.pack(side="right", fill="y")
+        self.bind_all("<MouseWheel>", self._on_mousewheel)
+
+    def _configure_window_width(self, event):
+        self.canvas.itemconfig(self.canvas_window, width=event.width)
+
+    def _on_mousewheel(self, event):
+        try:
+            x, y = self.winfo_pointerxy()
+            widget = self.winfo_containing(x, y)
+            if widget and str(self) in str(widget):
+                self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        except:
+            pass
+
+    def clear(self):
+        for widget in self.scrollable_frame.winfo_children(): widget.destroy()
+
+    def add_card(self, title, content, bootstyle="secondary", oids=None, template_text=None):
+        count = len(self.scrollable_frame.winfo_children())
+        row, col = count // self.columns, count % self.columns
+        card = ttk.Labelframe(self.scrollable_frame, text=f" {title} ", bootstyle=bootstyle)
+        card.grid(row=row, column=col, padx=10, pady=10, sticky="nsew")
+
+        txt = tk.Text(card, height=5, width=40, font=("Consolas", 9), bg="#2b2b2b", fg="#eee", relief="flat",
+                      insertbackground="white")
+        txt.insert("1.0", content)
+        txt.config(state=tk.DISABLED)
+        txt.pack(fill="both", expand=True, padx=5, pady=5)
+
+        def _enter_txt(e):
+            self.unbind_all("<MouseWheel>")
+
+        def _leave_txt(e):
+            self.bind_all("<MouseWheel>", self._on_mousewheel)
+
+        txt.bind("<Enter>", _enter_txt);
+        txt.bind("<Leave>", _leave_txt)
+
+        btn_frame = ttk.Frame(card);
+        btn_frame.pack(fill=tk.X, padx=5, pady=5)
+
+        def copy_str(s, msg):
+            self.winfo_toplevel().clipboard_clear()
+            self.winfo_toplevel().clipboard_append(s)
+            show_copy_toast("COPIED", msg)
+
+        if oids:
+            if isinstance(oids, list):
+                o_str = "\n".join(oids)
+            else:
+                o_str = str(oids)
+            ttk.Button(btn_frame, text="🆔 Copy Orders", bootstyle="info-outline", cursor="hand2",
+                       command=lambda: copy_str(o_str, f"{len(oids)} Orders Copied")).pack(side=tk.LEFT, padx=5,
+                                                                                           fill=tk.X, expand=True)
+        if template_text:
+            ttk.Button(btn_frame, text="📋 Copy Msg", bootstyle="success-outline", cursor="hand2",
+                       command=lambda: copy_str(template_text, "Template Text Copied")).pack(side=tk.LEFT, padx=5,
+                                                                                             fill=tk.X, expand=True)
+        self.scrollable_frame.grid_columnconfigure(col, weight=1)
+
+        # ================= 5. 单玩家检查窗口类 =================
+
+
+class SinglePlayerCheck(ttk.Toplevel):
+    def __init__(self, parent, player_data, time_ext, limit_configs, ref_time):
+        t_str = ref_time.strftime("%Y-%m-%d %H:%M:%S") if ref_time else "Unknown"
+        super().__init__(title=f"单玩家检查 (ID:{player_data.get('real_id', '?')}) @ Ref: {t_str}", master=parent)
+        self.geometry("1550x850")
+        self.p_data = player_data
+        self.time_ext = time_ext
+        self.limit_configs = limit_configs
+        self.ref_time = ref_time
+
+        self.calc_mode = "normal"
+        self.opt_diff_val = 0
+        self.opt_10_info = ""
+        self.frm_manual_stats = None
+
+        self.precalc_data = {'normal': [], 'special': []}
+        self.cache_view = {}
+        self.cache_special_log = {}
+        self.iid_to_oid = {}
+        self.oid_to_iid = {}
+
+        self._init_ui()
+        self._setup_tags()
+        self._precompute_all()
+        self._refresh_view()
+
+    def _init_ui(self):
+        frame_top = ttk.Frame(self);
+        frame_top.pack(side=tk.TOP, fill=tk.X, padx=10, pady=10)
+
+        frame_legend = ttk.LabelFrame(frame_top, text=" Color Legend ")
+        frame_legend.pack(side=tk.TOP, fill=tk.X, pady=(0, 10), ipadx=5, ipady=5)
+        for rule_name, color_hex in RULE_COLORS.items():
+            if rule_name == "DEFAULT": continue
+            canvas = tk.Canvas(frame_legend, width=90, height=26, bg="#444444", highlightthickness=0)
+            canvas.pack(side=tk.LEFT, padx=5, pady=5)
+            canvas.create_text(45, 13, text=rule_name, fill=color_hex, font=("Helvetica", 10, "bold"))
+
+        frame_controls = ttk.Frame(frame_top);
+        frame_controls.pack(side=tk.TOP, fill=tk.X)
+        self.frm_manual_stats = ttk.Frame(frame_controls);
+        self.frm_manual_stats.pack(side=tk.LEFT, padx=(0, 20))
+
+        # ================== 【新增区域：下拉菜单按钮组】 ==================
+        filter_frame = ttk.Frame(frame_controls)
+        filter_frame.pack(side=tk.LEFT, padx=10)
+
+        # 1. 剔除归属人下拉菜单
+        mb_owner = ttk.Menubutton(filter_frame, text="⛔ 剔除归属人订单", bootstyle="warning-outline")
+        mb_owner.pack(side=tk.LEFT, padx=2)
+        menu_owner = tk.Menu(mb_owner, tearoff=0)
+        menu_owner.add_command(label="剔除【所有】归属人/标记订单", command=lambda: self.filter_owner(keep_10_1=False))
+        menu_owner.add_command(label="剔除归属人 (但保留 '24小时内买10送1')",
+                               command=lambda: self.filter_owner(keep_10_1=True))
+        mb_owner['menu'] = menu_owner
+
+        # 2. 剔除免费包下拉菜单
+        mb_free = ttk.Menubutton(filter_frame, text="🆓 剔除免费包订单", bootstyle="warning-outline")
+        mb_free.pack(side=tk.LEFT, padx=2)
+        menu_free = tk.Menu(mb_free, tearoff=0)
+        menu_free.add_command(label="剔除【所有】免费包订单", command=lambda: self.filter_free_event(keep_10_1=False))
+        menu_free.add_command(label="剔除免费包 (但保留 '24小时内买10送1')",
+                              command=lambda: self.filter_free_event(keep_10_1=True))
+        mb_free['menu'] = menu_free
+
+        # 3. 重置按钮 (保持普通按钮)
+        ttk.Button(filter_frame, text="🔄 重置列表", bootstyle="info-outline", command=self.reset_filter).pack(
+            side=tk.LEFT, padx=2)
+        # ==========================================================
+
+        rt_frame = ttk.Frame(frame_controls);
+
+        rt_frame.pack(side=tk.RIGHT)
+        ttk.Button(rt_frame, text="🧹 Clear Marks", bootstyle="danger-outline", command=self.clear_manual_marks).pack(
+            side=tk.LEFT, padx=5)
+        self.btn_mode = ttk.Button(rt_frame, text="计算中...", bootstyle="secondary", state=tk.DISABLED,
+                                   command=self.toggle_mode)
+        self.btn_mode.pack(side=tk.LEFT, padx=5)
+        ttk.Button(rt_frame, text="📜 特殊借单日志", bootstyle="info-outline", command=self.show_special_log).pack(
+            side=tk.LEFT, padx=5)
+
+        ttk.Label(frame_controls, text="Shift+Click选范围 -> 右键手动标记", font=("Helvetica", 9),
+                  bootstyle="secondary").pack(side=tk.LEFT)
+
+        self.paned = ttk.Panedwindow(self, orient=tk.VERTICAL);
+        self.paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        frame_list = ttk.Frame(self.paned);
+        self.paned.add(frame_list, weight=3)
+        cols = ("time", "oid", "result", "score")
+        self.tree = ttk.Treeview(frame_list, columns=cols, show="headings", height=10)
+        self.tree.heading("time", text="Start Time (GMT+0)");
+        self.tree.column("time", width=150)
+        self.tree.heading("oid", text="Order | Price");
+        self.tree.column("oid", width=220)
+        self.tree.heading("result", text="Analysis Result");
+        self.tree.column("result", width=850)
+        self.tree.heading("score", text="Reward");
+        self.tree.column("score", width=80, anchor="center")
+        sb = ttk.Scrollbar(frame_list, command=self.tree.yview);
+        self.tree.configure(yscrollcommand=sb.set)
+        self.tree.pack(side="left", fill="both", expand=True);
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.tree.bind("<<TreeviewSelect>>", self.on_select)
+
+        def _copy_id(e):
+            sel = self.tree.selection()
+            if sel: val = self.tree.item(sel[0], 'values'); self.clipboard_clear(); self.clipboard_append(
+                val[1].split('|')[0].strip())
+            show_copy_toast("COPIED", "Copied")
+
+        self.tree.bind("<Control-c>", _copy_id)
+
+        self.cm = tk.Menu(self.tree, tearoff=0)
+        self.cm.add_command(label="Mark Selection (Mixed)", command=lambda: self.mark_selection_logic("all"))
+        self.cm.add_command(label="Mark Selection (Only 99.99)", command=lambda: self.mark_selection_logic("99"))
+        self.tree.bind("<Button-3>", lambda e: self.cm.post(e.x_root, e.y_root))
+
+        frame_bottom = ttk.Frame(self.paned);
+        self.paned.add(frame_bottom, weight=2)
+        self.nb_cards = ttk.Notebook(frame_bottom, bootstyle="warning");
+        self.nb_cards.pack(fill=tk.BOTH, expand=True)
+        self.f_ach_cards = SafeScrollableFrame(self.nb_cards);
+        self.nb_cards.add(self.f_ach_cards, text=" ACHIEVED ")
+        self.f_con_cards = SafeScrollableFrame(self.nb_cards);
+        self.nb_cards.add(self.f_con_cards, text=" CONTACT ")
+        f_tmpl = ttk.Frame(self.nb_cards);
+        self.nb_cards.add(f_tmpl, text=" LOGS ")
+        self.txt = ScrolledText(f_tmpl, height=8, font=("Consolas", 10), bootstyle="secondary");
+        self.txt.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+    def _setup_tags(self):
+        for name, color in RULE_COLORS.items():
+            if name != "DEFAULT":
+                if IS_MACOS:
+                    # macOS 下 Treeview 行背景色可能不生效，改用文字着色高亮，避免影响 Windows 现有效果
+                    self.tree.tag_configure(name, foreground=color, background=RULE_COLORS["DEFAULT"])
                 else:
-                    vt[y] = 1.0
-            al = np.clip(ga * vt.reshape(-1, 1) * 0.8 * 255, 0, 255).astype(np.uint8)
-            gt.putalpha(Image.fromarray(al))
-            up.alpha_composite(gt)
-        elif not gold:
-            gr_s = max(3, int(sz_s * 0.18))
-            gb = mg.filter(ImageFilter.GaussianBlur(radius=gr_s))
-            gt = Image.new("RGBA", (cw_s, cvh_s), (180, 200, 255, 0))
-            gt.putalpha(gb.point(lambda p: min(255, int(p * 0.35))))
-            up.alpha_composite(gt)
+                    self.tree.tag_configure(name, background=color, foreground="white")
+        self.tree.tag_configure('separator', background='#444444', foreground='#dddddd')
+        self.tree.tag_configure('normal_row', background=RULE_COLORS["DEFAULT"], foreground="#cccccc")
 
-            # 👇 --- 修改点 7：为 E6 和 E7 重启统一的顶光阴影系统 --- 👇
-        m_full = mt.copy()
-        for i in range(1, dep_s + 1):
-            shifted = Image.new("L", (cw_s, cvh_s), 0)
-            shifted.paste(mt, (0, i))
-            m_full = ImageChops.lighter(m_full, shifted)
+        # ================== 【基础抽取改写区域】提取带参数据生成器 ==================
 
-        olw_s = max(1, int(sz_s * 0.025))
-        expanded = m_full.filter(ImageFilter.MaxFilter(olw_s * 2 + 1))
+    def _precompute_data(self, orders):
+        t_strict = self.ref_time - timedelta(hours=24)
+        t_loose = self.ref_time - timedelta(hours=24 + self.time_ext)
 
-        shifted_expanded = Image.new("L", (cw_s, cvh_s), 0)
-        shifted_expanded.paste(expanded, (0, olw_s + 1))
+        def compute_mode(mode):
+            max_score = -1
+            scan_limit = min(len(orders), 100)
 
-        ring = ImageChops.subtract(shifted_expanded, m_full)
-        ring_soft = ring.filter(ImageFilter.GaussianBlur(2.5))
+            best_evts_for_suppress = []
 
-        # 为金字和白字分别配制最合适的阴影颜色和透明度
-        if gold:
-            ring_soft = ring_soft.point(lambda p: int(p * 0.65))  # 金字用65%透明度
-            shadow_color = (20, 10, 0, 255)  # 暖暗褐色
-        else:
-            ring_soft = ring_soft.point(lambda p: int(p * 0.80))  # 白字需要更高透明度(80%)分离背景
-            shadow_color = (15, 15, 20, 255)  # 冷暗灰偏青色
+            for k in range(scan_limit):
+                sub = orders[k:]
+                if mode == "normal":
+                    evts_k, _ = calculate_achievements_normal(sub, ALL_RULES, self.time_ext, self.limit_configs,
+                                                              self.ref_time)
+                else:
+                    evts_k, _ = calculate_achievements_complex(sub, ALL_RULES, self.time_ext, self.limit_configs,
+                                                               self.ref_time)
 
-        ol_layer = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
-        ol_layer.paste(Image.new("RGBA", (cw_s, cvh_s), shadow_color), mask=ring_soft)
-        up.alpha_composite(ol_layer)
-        # 👆 ----------------------------------------------------------- 👆
+                score_k = sum(e['rule'].get('reward', 0) * e['sets'] for e in evts_k if e['type'] == 'achieved')
 
-        # ③ 斜面厚度特效
-        bev_dep_s = max(2, dep_s // 2) if is7 else dep_s
-        for i in range(bev_dep_s, 0, -1):
-            t = i / max(1, bev_dep_s)
-            if gold:
-                r = int(230 * t + 185 * (1 - t))
-                g = int(180 * t + 145 * (1 - t))
-                b = int(45 * t + 15 * (1 - t))
+                if score_k > max_score:
+                    max_score = score_k
+                    best_evts_for_suppress = evts_k
+                elif max_score == -1 and k == 0:
+                    max_score = score_k
+                    best_evts_for_suppress = evts_k
+
+            suppress_map = {}
+            if mode == "normal":
+                for e in best_evts_for_suppress:
+                    if e['type'] == 'achieved':
+                        p = e['rule']['priority']
+                        for o in e['data']['orders']:
+                            oid = str(o['oid'])
+                            if oid not in suppress_map or p < suppress_map[oid]:
+                                suppress_map[oid] = p
+
+            rows = []
+            inserts_s, inserts_l = False, False
+            has_10 = False
+
+            for i, row in enumerate(orders):
+                sep = None
+                if not inserts_l and row['time_obj'] > t_loose:
+                    sep = ("-" * 20, f"--- 24H + {self.time_ext}H Tolerance ---", "-", "")
+                    inserts_l = True
+                if not inserts_s and row['time_obj'] > t_strict:
+                    if sep: rows.append({'sep': True, 'val': sep})
+                    sep = ("-" * 20, "--- 24H Strict Limit (10+1) ---", "-", "")
+                    inserts_s = True
+                if sep: rows.append({'sep': True, 'val': sep})
+
+                sub = orders[i:]
+                if mode == "normal":
+                    evts, _ = calculate_achievements_normal(sub, ALL_RULES, self.time_ext, self.limit_configs,
+                                                            self.ref_time)
+                    special_log_text = ""
+                else:
+                    debug_lines = []
+                    evts, _ = calculate_achievements_complex(sub, ALL_RULES, self.time_ext, self.limit_configs,
+                                                             self.ref_time, debug_trace=debug_lines)
+                    special_log_text = "\n".join(debug_lines)
+
+                oid_disp = f"{row['oid']} | {row['amt']}"
+                is_marked = str(row.get('is_marked', '否')).strip()
+                perf_owner = str(row.get('perf_owner', '')).strip()
+                free_evt = str(row.get('free_event', '否')).strip()
+                extra_tags = []
+                if is_marked not in ['否', 'nan', '', 'None', 'NO']:
+                    if perf_owner and perf_owner not in ['nan', 'None', '']:
+                        extra_tags.append(perf_owner)
+                    else:
+                        extra_tags.append("绩效✔")
+                if free_evt not in ['否', 'nan', '', 'None', 'NO']: extra_tags.append(free_evt)
+                if extra_tags: oid_disp += f" [{'|'.join(extra_tags)}]"
+
+                sc = sum(e['rule'].get('reward', 0) * e['sets'] for e in evts if e['type'] == 'achieved')
+                row_sum = generate_summary_grouped(evts, mode, self.ref_time, str(row.get('oid')), suppress_map)
+
+                rows.append({
+                    'sep': False,
+                    'val': (row['time_str'], oid_disp, row_sum, str(sc) if sc else ""),
+                    'evt': evts,
+                    'oid': str(row.get('oid', f"idx_{i}")),
+                    'special_log': special_log_text
+                })
+
+                if mode == 'special' and not has_10:
+                    if any(e['type'] == 'contact' and e['rule']['name'] == '10+1' for e in evts): has_10 = True
+
+            return rows, max_score, has_10
+
+        n_data, sc_norm, _ = compute_mode("normal")
+        s_data, sc_spec, h10 = compute_mode("special")
+
+        return {'normal': n_data, 'special': s_data}, sc_spec - sc_norm, "10+1 Contact" if h10 else ""
+
+    def _precompute_all(self):
+        # 缓存最原始数据及生成最初底图计算
+        self.original_orders = self.p_data['orders_list']
+        self.default_precalc_data, self.default_opt_diff_val, self.default_opt_10_info = self._precompute_data(
+            self.original_orders)
+
+        self.precalc_data = self.default_precalc_data
+        self.opt_diff_val = self.default_opt_diff_val
+        self.opt_10_info = self.default_opt_10_info
+
+        self.btn_mode.config(state=tk.NORMAL)
+        self._update_button_style()
+
+        # ================== 【新增功能区域】过滤方法 ==================
+
+    def filter_owner(self, keep_10_1=False):
+        filtered_orders = []
+        for row in self.original_orders:
+            perf_owner = str(row.get('perf_owner', '')).strip()
+            has_owner = perf_owner and perf_owner not in ['nan', 'None', '']
+            is_marked = is_marked_performance(row)
+            free_event_val = str(row.get('free_event', '')).strip()
+
+            # 判断是否是需要被剔除的"已标记归属人"的订单
+            if is_marked or has_owner:
+                # 如果开启了"保留10+1"模式，且该订单正好是"24小时内买10送1"，则免于剔除
+                if keep_10_1 and "24小时内买10送1" in free_event_val:
+                    pass  # 放行保留
+                else:
+                    continue  # 正式剔除
+            filtered_orders.append(row)
+        self._apply_new_orders(filtered_orders)
+
+    def filter_free_event(self, keep_10_1=False):
+        filtered_orders = []
+        for row in self.original_orders:
+            is_free = is_free_event_pack(row)
+            free_event_val = str(row.get('free_event', '')).strip()
+
+            # 判断是否是免费包订单
+            if is_free:
+                # 如果开启了"保留10+1"模式，且该订单正好是"24小时内买10送1"，则免于剔除
+                if keep_10_1 and "24小时内买10送1" in free_event_val:
+                    pass  # 放行保留
+                else:
+                    continue  # 正式剔除
+            filtered_orders.append(row)
+        self._apply_new_orders(filtered_orders)
+
+    def reset_filter(self):
+        self.precalc_data = self.default_precalc_data
+        self.opt_diff_val = self.default_opt_diff_val
+        self.opt_10_info = self.default_opt_10_info
+
+        # 刷新视图并清理卡片防残影
+        self._refresh_view()
+        self.f_ach_cards.clear()
+        self.f_con_cards.clear()
+        for w in self.frm_manual_stats.winfo_children(): w.destroy()
+        self._update_button_style()
+
+    def _apply_new_orders(self, modified_orders):
+        # 执行实时过滤计算并更新
+        self.precalc_data, self.opt_diff_val, self.opt_10_info = self._precompute_data(modified_orders)
+        self._refresh_view()
+        self.f_ach_cards.clear()
+        self.f_con_cards.clear()
+        for w in self.frm_manual_stats.winfo_children(): w.destroy()
+        self._update_button_style()
+
+        # ==========================================================
+
+    def _refresh_view(self):
+        self.tree.delete(*self.tree.get_children())
+        self.cache_view = {}
+        self.cache_special_log = {}
+        self.iid_to_oid = {};
+        self.oid_to_iid = {}
+
+        data = self.precalc_data[self.calc_mode]
+        for item in data:
+            if item['sep']:
+                self.tree.insert("", tk.END, values=item['val'], tags=('separator',))
             else:
-                v = int(90 * t + 55 * (1 - t))
-                r, g, b = v, v, int(v * 1.1)
-            up.paste(Image.new("RGBA", (cw_s, cvh_s), (r, g, b, 255)),
-                     (0, i), mask=mt)
+                iid = self.tree.insert("", tk.END, values=item['val'], tags=('normal_row',))
+                self.cache_view[iid] = item['evt']
+                self.cache_special_log[iid] = item.get('special_log', "")
+                self.iid_to_oid[iid] = item['oid']
+                self.oid_to_iid[item['oid']] = iid
 
-            # ④ 渐变补色
-        if gold:
-            stops = [
-                (0.00, (255, 255, 245)),
-                (0.25, (255, 235, 120)),
-                (0.60, (220, 160, 20)),
-                (1.00, (110, 60, 0)),
-            ]
+    def show_special_log(self):
+        sel = self.tree.selection()
+        if not sel:
+            messagebox.showinfo("Hint", "请先选中一行再查看日志")
+            return
+        iid = sel[0]
+        if self.calc_mode != "special":
+            messagebox.showinfo("Hint", "请先切换到“特殊计算”模式后再查看")
+            return
+
+        text = self.cache_special_log.get(iid, "").strip()
+        if not text:
+            text = "当前行没有最终生效的借单结果。"
+
+        self.txt.delete("1.0", tk.END)
+        self.txt.insert("1.0", text)
+        self.nb_cards.select(2)
+
+    def toggle_mode(self):
+        self.calc_mode = "special" if self.calc_mode == "normal" else "normal"
+        self._update_button_style()
+        self._refresh_view()
+
+    def _update_button_style(self):
+        if self.calc_mode == "normal":
+            if self.opt_diff_val > 0:
+                self.btn_mode.configure(text=f"🚀 推荐: 特殊模式 (收益 +{self.opt_diff_val})", bootstyle="success")
+            elif self.opt_10_info:
+                self.btn_mode.configure(text=f"✨ 特殊: {self.opt_10_info} (收益 +{self.opt_diff_val})",
+                                        bootstyle="info")
+            else:
+                self.btn_mode.configure(text="切换: 特殊计算 (优先10+1)", bootstyle="info-outline")
         else:
-            stops = [
-                (0.00, (255, 255, 255)), (0.25, (238, 240, 248)),
-                (0.45, (175, 180, 200)), (0.55, (148, 152, 172)),
-                (0.75, (215, 220, 235)), (1.00, (248, 250, 255)),
-            ]
+            self.btn_mode.configure(text="切换: 普通计算 (Standard)", bootstyle="secondary-outline")
 
-        grd = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
-        gd = ImageDraw.Draw(grd)
+    def _update_stats_display(self, selection_only=False):
+        for w in self.frm_manual_stats.winfo_children(): w.destroy()
 
-        bbox = mt.getbbox()
-        if bbox:
-            yt_s = bbox[1]
-            yb_s = bbox[3]
-        else:
-            yt_s = ty_s - int(sz_s * 0.08)
-            yb_s = ty_s + int(sz_s * 1.08)
-
-        sp_s = max(1, yb_s - yt_s)
-        for y in range(yt_s, yb_s + 1):
-            t = max(0.0, min(1.0, (y - yt_s) / sp_s))
-            lo, hi = stops[0], stops[-1]
-            for j in range(len(stops) - 1):
-                if stops[j][0] <= t <= stops[j + 1][0]:
-                    lo, hi = stops[j], stops[j + 1]
-                    break
-            f = (t - lo[0]) / max(0.0001, hi[0] - lo[0])
-            f = max(0.0, min(1.0, f))
-            f = f * f * (3 - 2 * f)
-            rgb = tuple(int(lo[1][c] + (hi[1][c] - lo[1][c]) * f) for c in range(3))
-            gd.line([(0, y), (cw_s, y)], fill=(*rgb, 255))
-
-        fc2 = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
-        fc2.paste(grd, mask=mt)
-        up.alpha_composite(fc2)
-
-        # ⑤ 高光点缀
-        si = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
-        sd = ImageDraw.Draw(si)
-        if gold:
-            cy2_s = ty_s + int(sz_s * 0.18)
-            cr_s = int(sz_s * 0.22)
-            for y in range(cy2_s - cr_s, cy2_s + cr_s):
-                d = abs(y - cy2_s) / max(1, cr_s)
-                a = int(140 * max(0, 1 - d ** 1.4))
-                if a > 0:
-                    sd.line([(0, y), (cw_s, y)], fill=(255, 255, 240, a))
-        else:
-            cy2_s = ty_s + int(sz_s * 0.2)
-            cr_s = int(sz_s * 0.18)
-            for y in range(cy2_s - cr_s, cy2_s + cr_s):
-                d = abs(y - cy2_s) / max(1, cr_s)
-                a = int(120 * max(0, 1 - d ** 1.5))
-                if a > 0:
-                    sd.line([(0, y), (cw_s, y)], fill=(255, 255, 255, a))
-        sf = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
-        sf.paste(si, mask=mt)
-        up.alpha_composite(sf)
-
-        # ⑥ 顶部微射反光
-        if gold:
-            eh = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
-            ed = ImageDraw.Draw(eh)
-            rim_s = max(2, int(sz_s * 0.1))
-            for y in range(yt_s, yt_s + rim_s):
-                a = int(130 * (1 - (y - yt_s) / max(1, rim_s)))
-                ed.line([(0, y), (cw_s, y)], fill=(255, 255, 248, a))
-            ef = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
-            ef.paste(eh, mask=mt)
-            up.alpha_composite(ef)
-
-            # ⑧ 斜体变形 (完美抗锯齿变形，阴影也会一起自然横斜！)
-        if is7:
-            stamp_s = up.transform((cw_s, cvh_s), Image.AFFINE,
-                                   (1, 0.22, -0.22 * (cvh_s / 2), 0, 1, 0),
-                                   resample=Image.Resampling.BICUBIC)
-        else:
-            stamp_s = up
-
-            # --- 降采样（消除所有锯齿并缩回到目标尺寸） ---
-        target_cw = int(cw_s / SSA)
-        target_cvh = int(cvh_s / SSA)
-        stamp = stamp_s.resize((target_cw, target_cvh), Image.Resampling.LANCZOS)
-
-        # 等比还原物理坐标系统
-        totw = totw_s / SSA
-        tx_ = tx_s / SSA
-        ty_ = ty_s / SSA
-
-        # ⑨ 主景横光辉（仅E6）（保持独立背景层）
-        if gold and not is7:
-            foff = int(self.sfl.get())
-            bwf, bhf = 520, 260
-            xg = np.linspace(-1, 1, bwf)
-            yg = np.linspace(-1, 1, bhf)
-            xx, yy = np.meshgrid(xg, yg)
-            core = np.exp(-(xx ** 2 / 0.01 + yy ** 2 / 0.008))
-            vs = np.maximum(0.0005, 0.014 * (1 - np.abs(xx) ** 1.6 * 0.88))
-            streak = np.exp(-(xx ** 2 / 3.5)) * np.exp(-(yy ** 2 / vs))
-            mid = np.exp(-(xx ** 2 / 0.25 + yy ** 2 / 0.018))
-            amb = np.exp(-(xx ** 2 / 0.08 + yy ** 2 / 0.035))
-            li = np.clip(core + streak * 0.65 + mid * 0.28 + amb * 0.18,
-                         0, 1).astype(np.float32)
-            rgba = np.zeros((bhf, bwf, 4), dtype=np.uint8)
-            rgba[..., 0] = np.minimum(255, 255 * li).astype(np.uint8)
-            rgba[..., 1] = np.minimum(255, 225 * li).astype(np.uint8)
-            rgba[..., 2] = np.minimum(255, 100 * li).astype(np.uint8)
-            rgba[..., 3] = np.minimum(255, 120 * li).astype(np.uint8)
-            fo = Image.fromarray(rgba, "RGBA")
-            ow2 = min(tw, int(totw * 5))
-            oh2 = int(sz * 3)
-            fo = fo.resize((ow2, oh2), Image.Resampling.BICUBIC)
+        def extract_price(val_str):
             try:
-                gx = int(self.sgx.get())
-                gy = int(self.sgy.get())
-            except Exception:
-                gx, gy = 0, 514
-            cxd = int(tw / 2 + gx) - ow2 // 2
-            cyd = gy + foff - oh2 // 2
-            bl = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
-            bl.paste(fo, (cxd, cyd))
-            tgt.alpha_composite(bl)
+                price_part = val_str.split('|')[1]
+                return float(re.search(r"(\d+\.?\d*)", price_part).group(1))
+            except:
+                return 0.0
 
-        tgt.alpha_composite(stamp,
-                            dest=(int((tw - totw) / 2 + ox - tx_), int(yp - ty_)))
+        sel = self.tree.selection()
+        sel_total = 0.0
+        if sel:
+            for iid in sel:
+                if 'separator' in self.tree.item(iid, "tags"): continue
+                val_str = self.tree.item(iid, 'values')[1]
+                sel_total += extract_price(val_str)
 
-        # ═══ 渲染管线 ═══
+        mark_sums = {}
+        for child in self.tree.get_children():
+            tags = self.tree.item(child, "tags")
+            for t in tags:
+                if t.startswith('manual_mark_'):
+                    parts = t.split('_')
+                    if len(parts) > 2:
+                        color = parts[2]
+                        val_str = self.tree.item(child, 'values')[1]
+                        amt = extract_price(val_str)
+                        mark_sums[color] = mark_sums.get(color, 0) + amt
 
-    def _full(self):
-        if not self.cur:
-            return
-        try:
-            self.root.update_idletasks()
-            tn = self.cmb.get()
-            rw = int(self.ssz.get())
-            if self._tn != tn:
-                self.ti = Image.open(os.path.join(self.app_dir, tn)).convert("RGBA")
-                self._tn = tn
-            if self._rp != self.cur:
-                self._ri = Image.open(self.cur).convert("RGBA")
-                self._rp = self.cur
-            ow, oh = self._ri.size
-            r = rw / float(ow) if ow > 0 else 1
-            self.pi = self._ri.resize((rw, max(1, int(oh * r))),
-                                      Image.Resampling.LANCZOS)
-            if self._f1:
-                self.sc = 0.6 if self.ti.size[0] > 800 else 1.0
-                self._f1 = False
-            self._do_render()
-            self.bsv.config(state="normal")
-        except:
-            pass
+        if sel_total > 0:
+            self._create_stats_canvas(f"Selection: ${sel_total:.2f}", "white")
 
-    def _fast(self):
-        if self._rj:
-            self.root.after_cancel(self._rj)
-        self._rj = self.root.after(30, self._do_render)
+        for color, total in mark_sums.items():
+            self._create_stats_canvas(f"${total:.2f}", color)
 
-    def _do_render(self):
-        self._rj = None
-        if not self.ti or not self.pi:
-            return
-        try:
-            px = int(self.sx.get())
-            py = int(self.sy.get())
-            tn = self.cmb.get()
-            ts = TEMPLATE_CONFIGS.get(
-                next((k for k in TEMPLATE_CONFIGS if k == tn), None), {}
-            ).get("style", "E6_Classic")
-            tw, th = self.ti.size
+    def _create_stats_canvas(self, text, color):
+        w = len(text) * 10
+        cvs = tk.Canvas(self.frm_manual_stats, width=w, height=24, highlightthickness=0, bg="#2b2b2b")
+        cvs.pack(side=tk.LEFT, padx=5)
+        cvs.create_text(w / 2, 12, text=text, fill=color, font=("Helvetica", 10, "bold"))
 
-            pl = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
-            pl.paste(self.pi, (px, py))
+    def clear_manual_marks(self):
+        for item in self.tree.get_children():
+            tags = list(self.tree.item(item, "tags"))
+            self.tree.item(item, tags=tuple([t for t in tags if not t.startswith('manual_mark')] or ['normal_row']))
+        self._update_stats_display(False)
 
-            lv = int(self.sli.get())
-            if lv > 0:
-                ins = lv / 100.0
-                rv, gv, bv, pa = pl.split()
-                rgb = Image.merge("RGB", (rv, gv, bv))
-                gt = Image.new("RGB", (tw, th), (255, 185, 50))
-                cg = Image.blend(rgb, ImageChops.multiply(rgb, gt),
-                                 0.35 * ins).convert("RGBA")
+    def mark_selection_logic(self, mode):
+        sel = self.tree.selection()
+        if not sel: return
+        color = colorchooser.askcolor(parent=self)[1]
+        if not color: return
+        tag = f"manual_mark_{color}_{datetime.now().timestamp()}"
+        if IS_MACOS:
+            # macOS 手动标记同样用文字色，保持可见性
+            self.tree.tag_configure(tag, foreground=color, background=RULE_COLORS["DEFAULT"])
+        else:
+            self.tree.tag_configure(tag, background=color, foreground="white")
+        indices = [self.tree.index(i) for i in sel]
+        for i in range(min(indices), max(indices) + 1):
+            iid = self.tree.get_children()[i]
+            if 'separator' in self.tree.item(iid, "tags"): continue
+            val = self.tree.item(iid, 'values')[1]
+            if mode == "99" and "99.99" not in val: continue
+            tags = list(self.tree.item(iid, "tags"))
+            if 'normal_row' in tags: tags.remove('normal_row')
+            tags = [t for t in tags if not t.startswith('manual_mark')];
+            tags.append(tag)
+            self.tree.item(iid, tags=tuple(tags))
+        self._update_stats_display(False)
 
-                lw2, lh2 = 160, 160
-                md = (lw2 ** 2 + lh2 ** 2) ** 0.5
-                ms = ((lw2 / 2) ** 2 + lh2 ** 2) ** 0.5
-                yy, xx = np.mgrid[0:lh2, 0:lw2]
-                xx_f = xx.astype(np.float64)
-                yy_f = yy.astype(np.float64)
-
-                dL = np.sqrt(xx_f ** 2 + yy_f ** 2)
-                pL = np.clip(1 - dL / (md * 0.85), 0, 1) ** 1.6
-                dR = np.sqrt((lw2 - xx_f) ** 2 + yy_f ** 2)
-                pR = np.clip(1 - dR / (md * 0.85), 0, 1) ** 1.6
-                tp = np.clip(pL + pR, 0, 1)
-                la = np.zeros((lh2, lw2, 4), dtype=np.uint8)
-                la[..., 0] = 255
-                la[..., 1] = 235
-                la[..., 2] = 150
-                la[..., 3] = np.minimum(255, (190 * tp * ins)).astype(np.uint8)
-                lb = Image.fromarray(la, "RGBA")
-
-                ds = np.sqrt((lw2 / 2 - xx_f) ** 2 + (lh2 - yy_f) ** 2)
-                sr = np.clip(1 - ds / (ms * 0.9), 0, 1)
-                sa = np.zeros((lh2, lw2, 4), dtype=np.uint8)
-                sa[..., 0] = 25
-                sa[..., 1] = 12
-                sa[..., 3] = np.minimum(255, (145 * sr ** 1.2 * ins)).astype(np.uint8)
-                sb = Image.fromarray(sa, "RGBA")
-
-                lm = lb.resize((tw, th), Image.Resampling.BICUBIC)
-                sm = sb.resize((tw, th), Image.Resampling.BICUBIC)
-                lit = Image.alpha_composite(Image.alpha_composite(cg, sm), lm)
-                mem = Image.merge("RGBA", (*lit.split()[:3], pa))
+    def on_select(self, event):
+        sel = self.tree.selection()
+        self._update_stats_display(selection_only=True)
+        if not sel: return
+        iid = sel[0]
+        if iid not in self.cache_view: return
+        self.txt.delete("1.0", tk.END)
+        if self.calc_mode == "special":
+            log_text = self.cache_special_log.get(iid, "").strip()
+            if log_text:
+                self.txt.insert("1.0", log_text)
             else:
-                mem = pl
+                self.txt.insert("1.0", "当前行没有最终生效的借单结果。")
+        else:
+            self.txt.insert("1.0", "当前是普通计算模式，切到“特殊计算”后可查看借单日志。")
 
-            mem = Image.alpha_composite(mem, self.ti)
+        for child in self.tree.get_children():
+            tags = list(self.tree.item(child, "tags"))
+            keep = [t for t in tags if t.startswith('separator') or t.startswith('manual_mark')]
+            self.tree.item(child, tags=tuple(keep or ['normal_row']))
 
-            for _, ct in self.fld.items():
-                tv = ct["e"].get().strip()
-                if not tv:
-                    continue
-                self._dtxt(mem, tv, tw, th, int(ct["ss"].get()),
-                           int(ct["sx"].get()), int(ct["sy"].get()),
-                           ct["c"], ct["s"], ts)
+        self.f_ach_cards.clear();
+        self.f_con_cards.clear();
 
-            self.final = mem.copy()
-            self._disp()
-        except:
-            pass
-
-    def _disp(self):
-        if not self.final:
-            return
-        self.cv.delete("all")
-        w, h = self.final.size
-        nw = max(10, int(w * self.sc))
-        nh = max(10, int(h * self.sc))
-        self.tki = ImageTk.PhotoImage(
-            self.final.resize((nw, nh), Image.Resampling.LANCZOS))
-        cx = self.cv.winfo_width() / 2 + self.vx
-        cy = self.cv.winfo_height() / 2 + self.vy
-        self.cid = self.cv.create_image(cx, cy, anchor=tk.CENTER, image=self.tki)
         try:
-            if self.pi:
-                bx = cx - nw / 2 + int(self.sx.get()) * self.sc
-                by = cy - nh / 2 + int(self.sy.get()) * self.sc
-                self.cv.create_rectangle(
-                    bx, by,
-                    bx + self.pi.size[0] * self.sc,
-                    by + self.pi.size[1] * self.sc,
-                    outline="#00FFCC", width=1, dash=(5, 3))
+            raw_events = self.cache_view.get(iid, [])
+            events = [e for e in raw_events if isinstance(e, dict) and 'type' in e and 'rule' in e and 'data' in e]
+            events = sorted(events, key=lambda x: (0 if x.get('type') == 'achieved' else 1, x.get('rule', {}).get('priority', 999)))
+
+            b_cons = {}
+            has_contact = False
+
+            for e in events:
+                if e.get('type') == 'achieved':
+                    txt = format_event_text_full(e)
+                    oids = [str(o.get('oid', '')) for o in e.get('data', {}).get('orders', [])]
+                    self.f_ach_cards.add_card(e.get('rule', {}).get('name', 'ACH'), txt, "success", oids)
+
+                    for o in e.get('data', {}).get('orders', []):
+                        tgt = self.oid_to_iid.get(str(o.get('oid', '')))
+                        if tgt:
+                            ct = list(self.tree.item(tgt, "tags"))
+                            if any(t.startswith('manual_mark') for t in ct): continue
+                            if 'normal_row' in ct: ct.remove('normal_row')
+                            rn = e.get('rule', {}).get('name')
+                            if rn and rn not in ct: ct.append(rn)
+                            self.tree.item(tgt, tags=tuple(ct))
+
+                elif e.get('type') == 'contact':
+                    deadline = e.get('data', {}).get('deadline')
+                    if not deadline or deadline <= self.ref_time:
+                        continue
+                    rn = e.get('rule', {}).get('name')
+                    if rn and (rn not in b_cons or e.get('miss', 9999) < b_cons[rn].get('miss', 9999)):
+                        b_cons[rn] = e
+                    has_contact = True
+
+            for r_name, e in b_cons.items():
+                t_key = "contact_count" if e.get('rule', {}).get('type') == 'count' else "contact_sum"
+                strict_deadline = e['data']['start_t'] + timedelta(hours=e['rule']['hours'])
+                msg = tmpl_mgr.render(t_key, bonus_name=r_name, reward=e['rule'].get('reward'), miss=e.get('miss', 0),
+                                      deadline=str(strict_deadline).split('.')[0])
+                oids = [str(o.get('oid', '')) for o in e.get('data', {}).get('orders', [])]
+                self.f_con_cards.add_card(r_name, msg, "warning", oids, template_text=msg)
+
+            if has_contact:
+                self.nb_cards.select(1)
+            else:
+                self.nb_cards.select(0)
+        except Exception as ex:
+            self.txt.delete("1.0", tk.END)
+            self.txt.insert("1.0", f"渲染异常: {ex}")
+            self.nb_cards.select(2)
+
+            # ================= 6. 主程序 (修改版) =================
+
+
+class PromoAnalyzerApp:
+    def __init__(self):
+        self.root = ttk.Window(title="黑道英文业绩计算器V8.0", themename="darkly")
+        self.root.geometry("1450x980")
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+        self.df_raw = None
+        self.results_cache = {2: [], 3: [], 4: [], 5: []}
+
+        self.current_ref_time = None
+        self.tree_views = []
+        self.limit_entries = {}
+        self.time_ext_val = 3.0
+
+        self.selected_days = tk.IntVar(value=3)
+        self.days_options = [2, 3, 4, 5]
+
+        # 全局保存打勾的玩家唯一键(优先real_id)的记忆本
+        self.checked_pids = set()
+
+        self._customize_styles()
+        self._init_ui()
+
+    def on_close(self):
+        if messagebox.askyesno("Exit", "Are you sure you want to quit?"): self.root.destroy()
+
+    def _customize_styles(self):
+        style = ttk.Style()
+        style.configure("Treeview", rowheight=30)
+        style.configure("TNotebook.Tab", font=("Helvetica", 10, "bold"))
+        style.configure("Day.TButton", font=("Helvetica", 10, "bold"))
+
+    def _init_ui(self):
+        main_container = ttk.Frame(self.root)
+        main_container.pack(fill=tk.X, padx=15, pady=10)
+
+        # Row 1
+        row1 = ttk.Frame(main_container)
+        row1.pack(fill=tk.X, pady=5)
+        ttk.Button(row1, text="📁 导入 Excel", bootstyle="warning-outline", command=self.load_file).pack(side=tk.LEFT)
+        ttk.Button(row1, text="📝 编辑话术", bootstyle="secondary-outline", command=self.open_template_editor).pack(
+            side=tk.LEFT, padx=10)
+
+        ttk.Label(row1, text="超时宽限(H):").pack(side=tk.LEFT, padx=(20, 0))
+        self.entry_time_ext = ttk.Entry(row1, width=5);
+        self.entry_time_ext.insert(0, "3");
+        self.entry_time_ext.pack(side=tk.LEFT, padx=5)
+
+        f_rules = ttk.Frame(row1);
+        f_rules.pack(side=tk.LEFT, padx=20)
+        for rule in ALL_RULES:
+            ttk.Label(f_rules, text=f"{rule['name']}:").pack(side=tk.LEFT, padx=(5, 0))
+            e = ttk.Entry(f_rules, width=4);
+            e.insert(0, str(rule.get('default_min_reached', 0)));
+            e.pack(side=tk.LEFT)
+            self.limit_entries[rule['name']] = e
+
+            # Row 2
+        row2 = ttk.Frame(main_container)
+        row2.pack(fill=tk.X, pady=10)
+
+        f_days = ttk.Labelframe(row2, text=" Data Range (Days) ", bootstyle="info")
+        f_days.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 15))
+
+        for d in self.days_options:
+            rb = ttk.Radiobutton(
+                f_days,
+                text=f" {d} Days ",
+                variable=self.selected_days,
+                value=d,
+                bootstyle="info-toolbutton",
+                command=self.refresh_current_view
+            )
+            rb.pack(side=tk.LEFT, padx=2, pady=5, ipady=3)
+
+        f_filter = ttk.Labelframe(row2, text=" ID Filter (One per line) ", bootstyle="secondary")
+        f_filter.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        self.txt_filter = ScrolledText(f_filter, height=3, width=50, font=("Consolas", 9))
+        self.txt_filter.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
+
+        f_filter_btns = ttk.Frame(f_filter)
+        f_filter_btns.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
+
+        ttk.Button(f_filter_btns, text="Apply Filter", bootstyle="secondary-outline",
+                   command=self.refresh_current_view).pack(fill=tk.X, pady=2)
+        ttk.Button(f_filter_btns, text="Clear Filter", bootstyle="danger-outline", command=self.clear_filter).pack(
+            fill=tk.X, pady=2)
+
+        # Row 3
+        row3 = ttk.Frame(main_container)
+        row3.pack(fill=tk.X, pady=5)
+        ttk.Button(row3, text="⚡ 开始计算 (Calc All Days)", bootstyle="warning", command=self.run_analysis).pack(
+            side=tk.LEFT)
+        self.lbl_status = ttk.Label(row3, text="READY");
+        self.lbl_status.pack(side=tk.LEFT, padx=20)
+        self.progress = ttk.Progressbar(row3, length=300, mode="determinate", bootstyle="warning-striped");
+        self.progress.pack(side=tk.LEFT)
+        ttk.Button(row3, text="🔍 单人详情", command=self.open_single_check).pack(side=tk.RIGHT)
+
+        # List Area
+        self.paned = ttk.Panedwindow(self.root, orient=tk.VERTICAL);
+        self.paned.pack(fill=tk.BOTH, expand=True, padx=15)
+        self.nb_list = ttk.Notebook(self.paned);
+        self.paned.add(self.nb_list, weight=1)
+        self.tree_all = self._add_tree(self.nb_list, " ALL PLAYERS ")
+        self.tree_achieved = self._add_tree(self.nb_list, " ✅ ACHIEVED ")
+        self.tree_contact = self._add_tree(self.nb_list, " 📞 CONTACT ")
+        self.tree_views = [self.tree_all, self.tree_achieved, self.tree_contact]
+
+        self.nb_cards = ttk.Notebook(self.paned, bootstyle="warning");
+        self.paned.add(self.nb_cards, weight=2)
+        self.f_ach_cards = SafeScrollableFrame(self.nb_cards);
+        self.nb_cards.add(self.f_ach_cards, text=" ACHIEVED ")
+        self.f_con_cards = SafeScrollableFrame(self.nb_cards);
+        self.nb_cards.add(self.f_con_cards, text=" CONTACT ")
+
+    def _add_tree(self, nb, text):
+        f = ttk.Frame(nb);
+        nb.add(f, text=text)
+        cols = ("check", "pid", "real_id", "server", "total", "summary", "mark_ratio")
+        t = ttk.Treeview(f, columns=cols, show="headings")
+        t.column("check", width=40, anchor="center");
+        t.heading("check", text="✔")
+        t.column("pid", width=150, anchor="center");
+        t.heading("pid", text="玩家昵称")
+        t.column("real_id", width=110, anchor="center");
+        t.heading("real_id", text="Player_id")
+        t.column("server", width=80, anchor="center");
+        t.heading("server", text="Server")
+        t.column("total", width=100, anchor="center");
+        t.heading("total", text="Total($)")
+        t.column("summary", width=540, anchor="w");
+        t.heading("summary", text="SUMMARY")
+        t.column("mark_ratio", width=420, anchor="w")
+        t.heading("mark_ratio", text="标记占比详情")
+
+        sc = ttk.Scrollbar(f, command=t.yview);
+        t.configure(yscrollcommand=sc.set)
+        t.pack(side=tk.LEFT, fill=tk.BOTH, expand=True);
+        sc.pack(side=tk.RIGHT, fill=tk.Y)
+        t.bind("<<TreeviewSelect>>", self.on_player_select)
+        t.bind("<Button-1>", self.on_tree_click)
+        t.bind("<Double-1>", self.open_single_check)
+
+        def _copy_tr(e):
+            sel = t.selection()
+            if sel: val = t.item(sel[0], 'values'); self.root.clipboard_clear(); self.root.clipboard_append(str(val[2]))
+            show_copy_toast("COPIED", "Player ID Copied")
+
+        t.bind("<Control-c>", _copy_tr)
+        return t
+
+    def on_tree_click(self, event):
+        tree = event.widget
+        col_id = tree.identify_column(event.x)
+        if col_id == "#1":
+            row_id = tree.identify_row(event.y)
+            if row_id:
+                vals = list(tree.item(row_id, "values"))
+                new_state = "☑" if vals[0] == "☐" else "☐"
+                vals[0] = new_state
+                player_key = vals[2]
+
+                # 把状态记入内存。勾选就加入，取消就移除
+                if new_state == "☑":
+                    self.checked_pids.add(player_key)
+                else:
+                    self.checked_pids.discard(player_key)
+
+                for t in self.tree_views:
+                    for child in t.get_children():
+                        if str(t.item(child, 'values')[2]) == player_key:
+                            v = list(t.item(child, 'values'))
+                            v[0] = new_state
+                            tags = ('processed',) if new_state == "☑" else ()
+                            t.item(child, values=v, tags=tags)
+
+    def _normalize_player_id(self, x):
+        s = str(x).strip()
+        if not s or s in ['nan', 'None', 'NaN', 'NAN']:
+            return ""
+        s = s.replace(" ", "").replace("\u3000", "")
+        if s.endswith('.0'):
+            s = s[:-2]
+        # 统一纯数字ID格式，避免 123 / 123.0 / 00123 等格式差异导致过滤失效
+        if re.fullmatch(r"[+-]?\d+(\.0+)?", s):
+            try:
+                s = str(int(float(s)))
+            except:
+                pass
+        return s
+
+    def _normalize_pack_name(self, val):
+        s = str(val).strip().lower()
+        if not s or s in ['nan', 'none']:
+            return ""
+        s = re.sub(r'[\s\-_]+', '', s)
+        s = re.sub(r'[^a-z0-9\u4e00-\u9fff]', '', s)
+        return s
+
+    def _is_noname_pack(self, val):
+        normalized = self._normalize_pack_name(val)
+        if not normalized:
+            return False
+        # 兼容“9000006-No Name Pack”等带前缀编号的礼包名
+        return "nonamepack" in normalized
+
+    def _detect_pack_name_columns(self, columns):
+        cand = []
+        for col in columns:
+            col_str = str(col).strip().lower()
+            # 兼容中文“礼包名称”及常见英文字段名
+            if ('礼包' in col_str and '名' in col_str) or \
+                    (('pack' in col_str or 'gift' in col_str) and 'name' in col_str):
+                cand.append(col)
+        return cand
+
+    def load_internal_player_ids(self):
+        bp = get_app_path();
+        fp = os.path.join(bp, "内玩ID.xlsx")
+        if not os.path.exists(fp):
+            return set(), None
+        try:
+            df = pd.read_excel(fp) if fp.endswith('.xlsx') else pd.read_excel(fp)
+            ids = set()
+            for x in df.iloc[:, 0]:
+                nid = self._normalize_player_id(x)
+                if nid:
+                    ids.add(nid)
+            return ids, None
+        except Exception as e:
+            return set(), f"读取内玩ID文件失败: {e}"
+
+    def load_file(self):
+        fp = filedialog.askopenfilename(filetypes=[("Data", "*.csv *.xlsx")])
+        if not fp: return
+        self.root.config(cursor="watch");
+        self.root.update()
+        try:
+            df = pd.read_excel(fp) if fp.endswith('.xlsx') else pd.read_csv(fp, encoding='gbk')
+            df.rename(columns=lambda x: x.strip(), inplace=True)
+            rev_map = {v: k for k, v in COLUMN_MAPPING_CONFIG.items()}
+            df.rename(columns=rev_map, inplace=True)
+            if 'real_id' in df.columns:
+                df['real_id'] = df['real_id'].apply(self._normalize_player_id)
+            before_cnt = len(df)
+            removed_cnt = 0
+            noname_removed_cnt = 0
+            internals, internal_err = self.load_internal_player_ids()
+            if internal_err:
+                messagebox.showwarning("内玩ID读取失败", internal_err)
+            if internals and 'real_id' in df.columns:
+                df = df[~df['real_id'].isin(internals)]
+                removed_cnt = before_cnt - len(df)
+            pack_cols = self._detect_pack_name_columns(df.columns)
+            if pack_cols:
+                no_name_mask = pd.Series(False, index=df.index)
+                for c in pack_cols:
+                    no_name_mask = no_name_mask | df[c].apply(self._is_noname_pack)
+                noname_removed_cnt = int(no_name_mask.sum())
+                if noname_removed_cnt > 0:
+                    df = df[~no_name_mask]
+            if 'time' in df.columns: df['time'] = pd.to_datetime(df['time'])
+            if 'real_id' in df.columns:
+                df.sort_values(by=['real_id', 'time'], inplace=True)
+            else:
+                df.sort_values(by=['pid', 'time'], inplace=True)
+            self.df_raw = df
+            self.lbl_status.config(
+                text=f"LOADED {len(df)} ROWS | 内玩ID剔除 {removed_cnt} 条 | NoNamePack剔除 {noname_removed_cnt} 条"
+            )
+        except Exception as e:
+            messagebox.showerror("Error", str(e))
+        finally:
+            self.root.config(cursor="")
+
+    def get_filter_ids(self):
+        raw = self.txt_filter.get("1.0", tk.END).strip()
+        if not raw: return None
+        raw = raw.replace(',', '\n').replace('，', '\n')
+        return set(line.strip() for line in raw.split('\n') if line.strip())
+
+    def clear_filter(self):
+        self.txt_filter.delete("1.0", tk.END)
+        self.refresh_current_view()
+
+    def run_analysis(self):
+        if self.df_raw is None: return
+        try:
+            self.time_ext_val = float(self.entry_time_ext.get())
+            self.limit_config_map = {k: int(v.get()) for k, v in self.limit_entries.items()}
         except:
+            return
+
+        self.root.config(cursor="watch")
+        self.current_ref_time = datetime.utcnow()
+        t_str = self.current_ref_time.strftime("%Y-%m-%d %H:%M:%S")
+
+        df = self.df_raw.to_dict('records')
+        for r in df: r['time_obj'] = r['time']; r['time_str'] = str(r['time'])
+        def build_player_key(row):
+            rid = str(row.get('real_id', '')).strip()
+            if rid and rid not in ['nan', 'None', '']:
+                return rid
+            return f"PID::{str(row.get('pid', '')).strip()}"
+
+        grouped_raw = {}
+        for row in df:
+            k = build_player_key(row)
+            if k not in grouped_raw:
+                grouped_raw[k] = []
+            grouped_raw[k].append(row)
+
+        self.results_cache = {2: [], 3: [], 4: [], 5: []}
+        total_steps = len(grouped_raw) * len(self.days_options)
+        current_step = 0
+
+        for days_lookback in self.days_options:
+            target_date = self.current_ref_time - timedelta(days=(days_lookback - 1))
+            cutoff_time = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
+
+            day_results = []
+            for player_key, all_orders in grouped_raw.items():
+                filtered_orders = [o for o in all_orders if o['time_obj'] >= cutoff_time]
+
+                if not filtered_orders:
+                    current_step += 1
+                    continue
+
+                if current_step % 100 == 0:
+                    self.progress['value'] = (current_step / total_steps) * 100
+                    self.root.update()
+
+                total_amt = sum(o['amt'] for o in filtered_orders)
+
+                # 使用 find_best_scenario 寻找最优起点
+                evts = find_best_scenario(filtered_orders, ALL_RULES, self.time_ext_val, self.limit_config_map,
+                                          self.current_ref_time)
+
+                has_achieved = any(e['type'] == 'achieved' for e in evts)
+                active_contacts = [e for e in evts if
+                                   e['type'] == 'contact' and e['data']['deadline'] > self.current_ref_time]
+                has_active_contact = len(active_contacts) > 0
+
+                if not has_achieved and not has_active_contact:
+                    current_step += 1
+                    continue
+
+                summary = generate_summary_grouped(evts, calc_mode="normal", ref_time=self.current_ref_time)
+                mark_ratio = build_mark_ratio_text(evts)
+
+                min_ddl = datetime.max
+                if has_active_contact:
+                    for e in active_contacts:
+                        if e['data']['deadline'] < min_ddl: min_ddl = e['data']['deadline']
+
+                # 昵称展示：按时间顺序汇总，显示“当前昵称 + 曾用昵称”
+                nick_history = []
+                for o in all_orders:
+                    n = str(o.get('pid', '')).strip()
+                    if n and n not in nick_history:
+                        nick_history.append(n)
+                current_nick = nick_history[-1] if nick_history else str(filtered_orders[-1].get('pid', ''))
+                old_nicks = [n for n in nick_history if n != current_nick]
+                if old_nicks:
+                    pid_display = f"{current_nick} (曾用: {', '.join(old_nicks)})"
+                else:
+                    pid_display = current_nick
+
+                res_obj = {
+                    'player_key': player_key,
+                    'pid': pid_display,
+                    'real_id': filtered_orders[0].get('real_id'),
+                    'server': filtered_orders[0].get('server'),
+                    'total_amt': total_amt,
+                    'orders_list': filtered_orders, 'events': evts, 'summary': summary,
+                    'mark_ratio': mark_ratio,
+                    'has_achieved': has_achieved, 'has_contact': has_active_contact, 'min_ddl': min_ddl
+                }
+                day_results.append(res_obj)
+                current_step += 1
+
+            day_results.sort(key=lambda x: (0 if x['has_contact'] else 1, x['min_ddl']))
+            self.results_cache[days_lookback] = day_results
+
+        self.lbl_status.config(text=f"DONE @ {t_str} (UTC)")
+        self.root.config(cursor="")
+        self.refresh_current_view()
+
+    def refresh_current_view(self):
+        for t in self.tree_views: t.delete(*t.get_children())
+        self.f_ach_cards.clear()
+        self.f_con_cards.clear()
+
+        days = self.selected_days.get()
+        filter_ids = self.get_filter_ids()
+
+        data_source = self.results_cache.get(days, [])
+        if not data_source: return
+
+        count_shown = 0
+        for r in data_source:
+            if filter_ids:
+                rid = str(r.get('real_id', ''))
+                if rid not in filter_ids:
+                    continue
+
+            pid = r['pid']
+            player_key = str(r.get('player_key', r.get('real_id', '')))
+            amt_str = f"{r['total_amt']:.2f}"
+            mark_ratio = r.get('mark_ratio', '')
+
+            # 勾选记忆使用唯一键，避免昵称变更后状态丢失
+            is_checked = player_key in self.checked_pids
+            check_state = "☑" if is_checked else "☐"
+            tags = ('processed',) if is_checked else ()
+
+            vals = (check_state, pid, player_key, r['server'], amt_str, r['summary'], mark_ratio)
+
+            self.tree_all.insert("", "end", values=vals, tags=tags)
+            if r['has_achieved']: self.tree_achieved.insert("", "end", values=vals, tags=tags)
+            if r['has_contact']: self.tree_contact.insert("", "end", values=vals, tags=tags)
+            count_shown += 1
+
+        self.lbl_status.config(text=f"Showing {days} Days | {count_shown} Players")
+
+    def on_player_select(self, event):
+        sel = event.widget.selection()
+        if not sel: return
+        try:
+            player_key = str(event.widget.item(sel[0], 'values')[2])
+        except:
+            return
+
+        current_data = self.results_cache.get(self.selected_days.get(), [])
+        data = next((item for item in current_data if str(item.get('player_key')) == player_key), None)
+        if not data: return
+
+        self.f_ach_cards.clear();
+        self.f_con_cards.clear()
+        best_contacts = {};
+        has_contact = False
+        for e in data['events']:
+            if e['type'] == 'achieved':
+                txt = format_event_text_full(e)
+                oids = [str(o['oid']) for o in e['data']['orders']]
+                self.f_ach_cards.add_card(e['rule']['name'], txt, "success", oids)
+            elif e['type'] == 'contact':
+                if e['data']['deadline'] <= self.current_ref_time: continue
+                rn = e['rule']['name']
+                if rn not in best_contacts or e['miss'] < best_contacts[rn]['miss']: best_contacts[rn] = e
+                has_contact = True
+        for r_name, e in best_contacts.items():
+            t_key = "contact_count" if e['rule']['type'] == 'count' else "contact_sum"
+
+            # --- 核心修改开始 ---
+            # 同样应用：重新计算严格截止时间
+            strict_deadline = e['data']['start_t'] + timedelta(hours=e['rule']['hours'])
+
+            msg = tmpl_mgr.render(t_key, bonus_name=r_name, reward=e['rule'].get('reward'), miss=e['miss'],
+                                  deadline=str(strict_deadline).split('.')[0])
+            # --- 核心修改结束 ---
+
+            oids = [str(o['oid']) for o in e['data']['orders']]
+            self.f_con_cards.add_card(r_name, msg, "warning", oids, template_text=msg)
+        if has_contact:
+            self.nb_cards.select(1)
+        else:
+            self.nb_cards.select(0)
+
+    def open_single_check(self, event=None):
+        try:
+            if event:
+                widget = event.widget
+            else:
+                tab_id = self.nb_list.select()
+                tab_frame = self.nb_list.nametowidget(tab_id)
+                widget = None
+                for child in tab_frame.winfo_children():
+                    if isinstance(child, ttk.Treeview):
+                        widget = child
+                        break
+
+            if not widget: return
+            sel = widget.selection()
+            if not sel:
+                messagebox.showinfo("Hint", "Select a player first")
+                return
+
+            player_key = str(widget.item(sel[0], 'values')[2])
+            current_data = self.results_cache.get(self.selected_days.get(), [])
+            player_data = next((item for item in current_data if str(item.get('player_key')) == player_key), None)
+
+            if player_data:
+                SinglePlayerCheck(self.root, player_data, self.time_ext_val, self.limit_config_map,
+                                  self.current_ref_time)
+        except Exception as e:
+            print(e)
             pass
 
+    def open_template_editor(self):
+        TemplateEditorWindow(self.root)
 
-if __name__ == "__main__":
-    root = TkinterDnD.Tk()
-    App(root)
-    root.mainloop()
+    def main_loop(self):
+        self.root.mainloop()
+
+
+if __name__ == "__main__": app = PromoAnalyzerApp(); app.main_loop()

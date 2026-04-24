@@ -1,3 +1,2 @@
-numpy
-pillow
-tkinterdnd2
+ttkbootstrap
+pandas
