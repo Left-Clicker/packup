@@ -1,1665 +1,890 @@
-import ttkbootstrap as ttk
-from ttkbootstrap.constants import *
-from ttkbootstrap.toast import ToastNotification
-from ttkbootstrap.scrolled import ScrolledText
-from tkinter import filedialog, messagebox, colorchooser
-import tkinter as tk
-import pandas as pd
-import math
-import re
+#!/usr/bin/env python3
+"""
+Crowdin Translation Checker
+Paste Chinese + English draft → 3-column table with glossary terms → copy back to Crowdin.
+Glossary auto-loaded from "Mafia War's Glossary.csv" in the same directory.
+"""
+
+import csv
+import http.server
 import json
 import os
+import subprocess
 import sys
-import copy
-import time
 import threading
-from datetime import datetime, timedelta
-from itertools import groupby
-from operator import itemgetter
+import time
+import webbrowser
 
-os.environ['TK_SILENCE_DEPRECATION'] = '1'
-IS_MACOS = sys.platform == "darwin"
+PORT = 8765
+# When packaged with PyInstaller (--onefile), __file__ points to a temporary
+# extraction directory, not where the user actually placed the binary. Use the
+# executable's directory in that case so the glossary CSV can sit next to the
+# binary and be edited without rebuilding.
+if getattr(sys, "frozen", False):
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+GLOSSARY_FILE = "Mafia War's Glossary.csv"
 
 
-# ================= 0. 模板管理器 =================
+# Crowdin glossary export columns are fixed:
+#   A (0)  -> Term [zh-CN]    源术语（中文）
+#   M (12) -> Term [en-US]    目标术语（英文）
+ZH_COL = 0
+EN_COL = 12
 
-class TemplateManager:
-    FILE_NAME = "templates.json"
 
-    DEFAULT_TEMPLATES = {
-        "contact_sum": (
-            "Hi dear, your account will reach {bonus_name} bonus and get free {reward}*$99.99 packs, "
-            "if you purchase {miss} more $99.99 packs before {deadline} City Time."
-        ),
-        "contact_count": (
-            "Hi dear, your account will reach {bonus_name} bonus and get free {reward}*$99.99 packs, "
-            "if you purchase {miss} more $99.99 non-Diamonds packs before {deadline} City Time."
-        )
+def load_glossary():
+    path = os.path.join(SCRIPT_DIR, GLOSSARY_FILE)
+    if not os.path.exists(path):
+        return [], f"Glossary file not found: {GLOSSARY_FILE}"
+
+    with open(path, newline='', encoding='utf-8-sig') as f:
+        rows = list(csv.reader(f))
+
+    if len(rows) < 2:
+        return [], "Glossary is empty or contains only a header row"
+
+    terms = []
+    for row in rows[1:]:
+        zh = row[ZH_COL].strip() if len(row) > ZH_COL else ''
+        en = row[EN_COL].strip() if len(row) > EN_COL else ''
+        if zh and en:
+            terms.append({'zh': zh, 'en': en})
+
+    return terms, f"Loaded {len(terms)} glossary terms"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Embedded frontend
+# ─────────────────────────────────────────────────────────────────────────────
+HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Crowdin Translation Checker</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+     background:#0d1117;color:#c9d1d9;min-height:100vh}
+
+/* ── Header ── */
+.hdr{background:#161b22;border-bottom:1px solid #30363d;padding:12px 24px;
+     display:flex;align-items:center;gap:16px;position:sticky;top:0;z-index:100}
+.hdr h1{font-size:15px;font-weight:600;color:#f0f6fc;white-space:nowrap}
+.gloss-tag{margin-left:auto;font-size:12px;padding:4px 12px;border-radius:20px;
+           background:#122d20;color:#56d364;white-space:nowrap}
+.gloss-tag.warn{background:#32100b;color:#f85149}
+.gloss-tag.loading{background:#1c2a3a;color:#8b949e}
+
+/* ── Buttons ── */
+.btn{padding:7px 16px;border-radius:6px;border:none;cursor:pointer;
+     font-size:13px;font-weight:500;transition:background .15s;white-space:nowrap}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn-blue{background:#1f6feb;color:#fff}.btn-blue:hover:not(:disabled){background:#388bfd}
+.btn-green{background:#238636;color:#fff}.btn-green:hover:not(:disabled){background:#2ea043}
+.btn-sky{background:#0969da;color:#fff}.btn-sky:hover:not(:disabled){background:#1f6feb}
+.btn-gray{background:#21262d;color:#c9d1d9;border:1px solid #30363d}
+.btn-gray:hover:not(:disabled){background:#30363d}
+.btn-sm{padding:4px 10px;font-size:11px;border-radius:5px;border:none;cursor:pointer;
+        font-weight:500;transition:background .15s;white-space:nowrap;
+        background:#21262d;color:#8b949e;border:1px solid #30363d}
+.btn-sm:hover{background:#30363d;color:#c9d1d9}
+.btn-sm.active{background:#1c2a3a;color:#79c0ff;border-color:#1f4068}
+
+/* ── Input panel ── */
+.panel{padding:16px 24px;background:#161b22;border-bottom:1px solid #30363d}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:12px}
+.field label{display:block;font-size:11px;color:#8b949e;margin-bottom:6px;
+             font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+.field label span{text-transform:none;font-weight:400;color:#484f58}
+textarea{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;
+         padding:9px 11px;color:#c9d1d9;font-size:12.5px;
+         font-family:'SFMono-Regular',Consolas,monospace;resize:vertical;
+         min-height:130px;line-height:1.6;overflow-y:auto;overflow-x:hidden}
+textarea:focus{outline:none;border-color:#388bfd}
+.row-btns{display:flex;gap:10px;align-items:center}
+.status{font-size:13px;padding:5px 12px;border-radius:6px;display:none}
+.status.info{background:#1c3557;color:#79c0ff;display:inline-block}
+.status.ok  {background:#122d20;color:#56d364;display:inline-block}
+.status.err {background:#32100b;color:#f85149;display:inline-block}
+
+/* ── Blocks wrapper ── */
+.blocks-wrap{padding:16px 24px}
+.blocks-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.blocks-hdr>span{font-size:13px;color:#8b949e}
+.blocks-actions{display:flex;gap:8px}
+
+/* ── Paragraph block ── */
+.para-block{background:#161b22;border:1px solid #30363d;border-radius:8px;
+            margin-bottom:12px;overflow:hidden}
+.block-hdr{display:flex;align-items:center;gap:10px;padding:8px 14px;
+           background:#1c2128;border-bottom:1px solid #30363d;flex-wrap:wrap}
+.block-label{font-size:12px;font-weight:600;color:#8b949e;
+             background:#21262d;padding:2px 9px;border-radius:10px;white-space:nowrap}
+.block-pills{flex:1;display:flex;flex-wrap:wrap;gap:4px}
+.pill{display:inline-block;background:#1c2a3a;color:#79c0ff;padding:2px 9px;
+      border-radius:12px;font-size:11px;white-space:nowrap;border:1px solid #1f4068}
+.pill .pill-zh{color:#c9d1d9}
+.pill .pill-eq{color:#484f58;margin:0 4px}
+.no-term{color:#484f58;font-size:11px}
+.term-hit{text-decoration:underline dashed #79c0ff;
+          text-underline-offset:3px;cursor:help}
+
+/* ── Help / tutorial panel ── */
+.help-panel{background:#0d2030;border-bottom:1px solid #1f4068;padding:14px 24px;
+            font-size:12.5px;line-height:1.7;color:#8b949e;display:none}
+.help-panel.on{display:block}
+.help-panel h3{font-size:12px;color:#79c0ff;text-transform:uppercase;
+               letter-spacing:.6px;font-weight:600;margin-bottom:8px}
+.help-panel ol{margin-left:20px;color:#b0b8c0}
+.help-panel ol li{margin-bottom:4px}
+.help-panel code{background:#161b22;padding:1px 6px;border-radius:4px;
+                 font-family:'SFMono-Regular',Consolas,monospace;font-size:11.5px;
+                 color:#79c0ff}
+.help-toggle{background:#21262d;color:#8b949e;border:1px solid #30363d;
+             border-radius:50%;width:26px;height:26px;cursor:pointer;
+             font-size:13px;font-weight:600;line-height:1;padding:0}
+.help-toggle:hover{background:#30363d;color:#c9d1d9}
+.help-toggle.active{background:#1c2a3a;color:#79c0ff;border-color:#1f4068}
+
+/* ── Merge / unmerge buttons ── */
+.btn-merge{padding:4px 10px;font-size:11px;border-radius:5px;border:1px solid #1f4068;
+           background:#0d2030;color:#79c0ff;cursor:pointer;font-weight:500;
+           white-space:nowrap;transition:background .15s}
+.btn-merge:hover:not(:disabled){background:#1c2a3a}
+.btn-merge:disabled{opacity:.3;cursor:not-allowed}
+
+/* ── Paragraph divider inside a merged group ── */
+.para-divider{padding:5px 14px;color:#79c0ff;font-size:10.5px;
+              background:#0d2030;border-top:1px solid #1f4068;
+              border-bottom:1px solid #1f4068;letter-spacing:.4px;
+              font-weight:500}
+.para-block.is-merged{border-color:#1f4068}
+.para-block.is-merged .block-hdr{background:#0d2030}
+
+/* ── Sentence rows inside a block ── */
+.block-body{width:100%}
+.sent-row{display:grid;grid-template-columns:38px 1fr 1fr;border-bottom:1px solid #21262d}
+.sent-row:last-child{border-bottom:none}
+.sent-row:hover{background:#1c2128}
+.sent-num{display:flex;align-items:flex-start;justify-content:center;
+          padding:10px 4px;color:#484f58;font-size:11px;font-weight:600;
+          border-right:1px solid #21262d;min-width:38px}
+.sent-zh{padding:10px 12px;font-size:13px;line-height:1.8;color:#c9d1d9;
+         border-right:1px solid #21262d;word-break:break-all}
+.sent-en{padding:8px 10px}
+.sent-en textarea{width:100%;background:transparent;border:1px solid transparent;
+                  border-radius:4px;padding:4px 8px;color:#c9d1d9;font-size:13px;
+                  font-family:'SFMono-Regular',Consolas,monospace;resize:none;
+                  line-height:1.8;overflow:hidden;min-height:32px;display:block}
+.sent-en textarea:hover{border-color:#30363d;background:#0d1117}
+.sent-en textarea:focus{border-color:#388bfd;background:#0d1117;outline:none}
+
+/* ── Combined view (per block) ── */
+.combined-view{display:none;padding:0}
+.combined-body{display:grid;grid-template-columns:1fr 1fr}
+.combined-zh{padding:12px 14px;font-size:13px;line-height:1.9;color:#c9d1d9;
+             border-right:1px solid #21262d;word-break:break-all}
+.sent-sep{display:block;color:#484f58;font-size:11px;margin:4px 0 2px}
+.combined-en{padding:10px 12px}
+.combined-en textarea{width:100%;background:#0d1117;border:1px solid #30363d;
+                      border-radius:6px;padding:10px 12px;color:#c9d1d9;
+                      font-size:13px;font-family:'SFMono-Regular',Consolas,monospace;
+                      resize:none;line-height:1.9;overflow:hidden;display:block}
+.combined-en textarea:focus{border-color:#388bfd;outline:none}
+
+/* ── Preview modal ── */
+.overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.82);
+         z-index:200;overflow-y:auto;padding:24px 16px}
+.overlay.on{display:flex;justify-content:center;align-items:flex-start}
+.modal{background:#161b22;border:1px solid #30363d;border-radius:12px;
+       width:100%;max-width:980px;margin:auto}
+.modal-hdr{padding:14px 20px;border-bottom:1px solid #30363d;
+           display:flex;align-items:center;justify-content:space-between}
+.modal-hdr h2{font-size:15px;font-weight:600;color:#f0f6fc}
+.close-btn{background:none;border:none;color:#8b949e;font-size:22px;
+           cursor:pointer;line-height:1;padding:0 4px}
+.close-btn:hover{color:#c9d1d9}
+.modal-body{padding:20px}
+.preview-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.preview-col h3{font-size:11px;color:#8b949e;text-transform:uppercase;
+                letter-spacing:.5px;margin-bottom:10px;font-weight:600}
+.preview-box{background:#0d1117;border:1px solid #30363d;border-radius:8px;
+             padding:14px 16px;font-size:13px;line-height:1.9;
+             max-height:62vh;overflow-y:auto;word-break:break-word}
+.pv-para{margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid #21262d}
+.pv-para:last-child{border-bottom:none;margin-bottom:0}
+.modal-ftr{padding:14px 20px;border-top:1px solid #30363d;
+           display:flex;gap:10px;justify-content:flex-end}
+
+/* ── Toast ── */
+.toast{position:fixed;bottom:22px;right:22px;background:#238636;color:#fff;
+       padding:10px 20px;border-radius:8px;font-size:13px;z-index:999;
+       display:none;box-shadow:0 4px 14px rgba(0,0,0,.5)}
+.toast.on{display:block;animation:slideUp .2s ease}
+@keyframes slideUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+</style>
+</head>
+<body>
+
+<!-- ── Header ── -->
+<div class="hdr">
+  <h1>🎮 Crowdin Translation Checker</h1>
+  <button class="help-toggle" id="helpToggle" onclick="toggleHelp()" title="Show / hide instructions">?</button>
+  <div class="gloss-tag loading" id="glossTag">Loading glossary…</div>
+</div>
+
+<!-- ── Help / tutorial panel ── -->
+<div class="help-panel" id="helpPanel">
+  <h3>How to use</h3>
+  <ol>
+    <li>Paste the <strong>Chinese source</strong> on the left. The <strong>English draft</strong> on the right is <em>optional</em> &mdash; paste one to review/edit, or leave it empty to translate from scratch directly in the table below.</li>
+    <li>Use the literal token <code>\n</code> to separate paragraphs &mdash; in both inputs when present, ideally one-to-one. If the English side has fewer (or no) <code>\n</code>, the output will follow the Chinese source's <code>\n</code> structure.</li>
+    <li>Click <strong>Build Table</strong>. Each paragraph becomes a row that you can edit sentence by sentence, or toggle <strong>Merge view</strong> to edit a whole paragraph at once.</li>
+    <li>Glossary hits are shown as <code>中文 = English</code> pills above each block; matched substrings in the source get a <span class="term-hit">dashed underline</span> (hover for the English term).</li>
+    <li><strong>⬇ Merge next</strong> visually combines two adjacent blocks so you can review related paragraphs side by side. <em>This is view-only</em> &mdash; the copied output is unaffected. Press <strong>↑ Unmerge</strong> on a merged block to split it back apart.</li>
+    <li><strong>Preview</strong> renders edits live: color codes like <code>[E7594C]…[-]</code> become colored text, and any literal <code>\n</code> you type inside an edit area becomes a real line break. Both are preserved verbatim in the copied output.</li>
+    <li>Click <strong>Copy</strong> &mdash; the result always preserves the <em>exact</em> <code>\n</code> structure of your English draft (e.g. <code>\n\n</code> stays <code>\n\n</code>), no matter how you merge / unmerge. Nothing is auto-added.</li>
+  </ol>
+</div>
+
+<!-- ── Input panel ── -->
+<div class="panel">
+  <div class="grid2">
+    <div class="field">
+      <label>Chinese Source <span>(use \n to separate paragraphs; supports [RRGGBB]…[-] color codes)</span></label>
+      <textarea id="zh"
+        placeholder="Paste Chinese source, e.g.&#10;各位市民即将可以选择离开本城市。但为了维护本城秩序，请遵守规定。\n[E7594C]请注意！[-]活动期间请保持冷静。"></textarea>
+    </div>
+    <div class="field">
+      <label>English Draft <span>(optional — leave empty to translate from scratch; use \n to separate paragraphs, should match the Chinese 1:1)</span></label>
+      <textarea id="en"
+        placeholder="Optional. Paste an existing English draft to review, or leave empty and fill it in below.&#10;e.g. Citizens will soon be able to leave the city.\n[E7594C]Please note![-] Stay calm during the event."></textarea>
+    </div>
+  </div>
+  <div class="row-btns">
+    <button class="btn btn-blue" onclick="buildBlocks()">📊 Build Table</button>
+    <div class="status" id="status"></div>
+  </div>
+</div>
+
+<!-- ── Paragraph blocks ── -->
+<div class="blocks-wrap" id="blocksWrap" style="display:none">
+  <div class="blocks-hdr">
+    <span><strong id="cnt" style="color:#f0f6fc">0</strong> paragraph(s)</span>
+    <div class="blocks-actions">
+      <button class="btn btn-sky" onclick="showPreview()">👁 Preview</button>
+      <button class="btn btn-green" onclick="doCopy()">📋 Copy Final Result</button>
+    </div>
+  </div>
+  <div id="blocks"></div>
+</div>
+
+<!-- ── Preview modal ── -->
+<div class="overlay" id="overlay">
+  <div class="modal">
+    <div class="modal-hdr">
+      <h2>Preview &mdash; Colors &amp; Paragraph Layout</h2>
+      <button class="close-btn" onclick="closePreview()">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="preview-grid">
+        <div class="preview-col">
+          <h3>Chinese Source</h3>
+          <div class="preview-box" id="pvZh"></div>
+        </div>
+        <div class="preview-col">
+          <h3>English (current edit)</h3>
+          <div class="preview-box" id="pvEn"></div>
+        </div>
+      </div>
+    </div>
+    <div class="modal-ftr">
+      <button class="btn btn-gray" onclick="closePreview()">Close</button>
+      <button class="btn btn-green" onclick="confirmAndCopy()">✓ Confirm &amp; Copy to Clipboard</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Toast ── -->
+<div class="toast" id="toast">✓ Copied! Paste back into Crowdin.</div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────
+let glossary = [];
+
+// IMMUTABLE after buildBlocks() — these define the original input structure and
+// the final output structure. Merge / unmerge NEVER touches them.
+//   paras[i]  = { zhFull, enFull, zhSentences, enSentences }
+//   zhSeps[i] / enSeps[i] = literal-\n separator string between paras[i] / paras[i+1]
+let paras = [], zhSeps = [], enSeps = [];
+
+// MUTABLE view-layer state. Each group is a visual block on screen.
+// Merging adjacent groups concatenates their paraIdxs; unmerging splits back.
+//   groups[gi] = { paraIdxs: number[], combined: boolean }
+// Initial state: groups.length === paras.length, each holds one paragraph.
+let groups = [];
+
+// ── Help toggle ─────────────────────────────────────────────────────────────
+function toggleHelp() {
+  document.getElementById('helpPanel').classList.toggle('on');
+  document.getElementById('helpToggle').classList.toggle('active');
+}
+
+// ── Load glossary ───────────────────────────────────────────────────────────
+window.addEventListener('load', async () => {
+  const tag = document.getElementById('glossTag');
+  try {
+    const res  = await fetch('/api/glossary');
+    const data = await res.json();
+    if (data.error) {
+      tag.textContent = '⚠ ' + data.error;
+      tag.className = 'gloss-tag warn';
+    } else {
+      glossary = data.terms;
+      tag.textContent = '✓ Glossary: ' + glossary.length + ' terms';
+      tag.className = 'gloss-tag';
     }
+  } catch (e) {
+    tag.textContent = '⚠ Failed to load glossary';
+    tag.className = 'gloss-tag warn';
+  }
+});
 
-    def __init__(self):
-        self.templates = self.load_templates()
-
-    def load_templates(self):
-        base_path = get_app_path()
-        full_path = os.path.join(base_path, self.FILE_NAME)
-        if not os.path.exists(full_path): return self.DEFAULT_TEMPLATES.copy()
-        try:
-            with open(full_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                for k, v in self.DEFAULT_TEMPLATES.items():
-                    if k not in data: data[k] = v
-                return data
-        except:
-            return self.DEFAULT_TEMPLATES.copy()
-
-    def save_templates(self, new_data):
-        self.templates = new_data
-        base_path = get_app_path()
-        full_path = os.path.join(base_path, self.FILE_NAME)
-        try:
-            with open(full_path, "w", encoding="utf-8") as f:
-                json.dump(new_data, f, ensure_ascii=False, indent=4)
-            return True
-        except Exception as e:
-            return False
-
-    def get(self, key):
-        return self.templates.get(key, self.DEFAULT_TEMPLATES[key])
-
-    def render(self, key, **kwargs):
-        tmpl = self.get(key)
-        try:
-            return tmpl.format(**kwargs)
-        except KeyError as e:
-            return f"Error: Template missing variable {{{e.args[0]}}}. Raw: {tmpl}"
-
-
-def get_app_path():
-    if getattr(sys, 'frozen', False):
-        return os.path.dirname(sys.executable)
-    else:
-        return os.path.dirname(os.path.abspath(__file__))
-
-
-tmpl_mgr = TemplateManager()
-
-# ================= 1. 配置区域 =================
-
-RULE_COLORS = {
-    "1000+180": "#FF6B6B",
-    "500+85": "#FF9F43",
-    "168+25": "#Feca57",
-    "68+8": "#2ECC71",
-    "34+4": "#54A0FF",
-    "10+1": "#D980FA",
-    "DEFAULT": "#333333"
+// ── Helpers ─────────────────────────────────────────────────────────────────
+function colorize(text) {
+  return text.replace(/\[([0-9A-Fa-f]{6})\]([\s\S]*?)\[-\]/g,
+    (_, hex, body) => '<span style="color:#' + hex + '">' + body + '</span>');
 }
 
-COLUMN_MAPPING_CONFIG = {
-    'oid': '订单号', 'pid': '玩家昵称', 'real_id': '玩家Player_id', 'amt': '礼包价格',
-    'time': '订单发放日期', 'server': '服务器昵称', 'status': '是否发放元宝',
-    'is_marked': '是否已标记绩效', 'perf_owner': '业绩归属人', 'free_event': '是否计入免费包活动'
+function esc(s) {
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
-SUM_RULES = [
-    {"name": "1000+180", "hours": 72, "type": "sum", "target": 99990.00, "priority": 10, "default_min_reached": 700,
-     "reward": 180},
-    {"name": "500+85", "hours": 48, "type": "sum", "target": 49995.00, "priority": 20, "default_min_reached": 300,
-     "reward": 85},
-    {"name": "168+25", "hours": 48, "type": "sum", "target": 16798.32, "priority": 30, "default_min_reached": 100,
-     "reward": 25},
-    {"name": "68+8", "hours": 48, "type": "sum", "target": 6799.32, "priority": 40, "default_min_reached": 54,
-     "reward": 8},
-    {"name": "34+4", "hours": 24, "type": "sum", "target": 3399.66, "priority": 50, "default_min_reached": 20,
-     "reward": 4},
-]
+// Convert literal "\n" (backslash + n, two chars) typed by the user inside an
+// edit textarea into a real <br> for rendered HTML output. Safe to apply AFTER
+// esc()/highlightTerms() because neither emits nor escapes a backslash, so the
+// only "\n" sequences left in the html are the user's own.
+function nlToBr(html) {
+  return html.replace(/\\n/g, '<br>');
+}
 
-COUNT_RULE = {"name": "10+1", "hours": 24, "type": "count", "target": 10, "unit_price": 99.99, "priority": 60,
-              "default_min_reached": 5, "reward": 1}
+function autoH(ta) {
+  ta.style.height = 'auto';
+  ta.style.height = (ta.scrollHeight + 2) + 'px';
+}
 
-# 必须按优先级排序 (1000 -> 10)
-ALL_RULES = sorted(SUM_RULES + [COUNT_RULE], key=lambda x: x['priority'])
+function setStatus(msg, type) {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = 'status ' + type;
+}
+
+function findTerms(zhText) {
+  return glossary.filter(({zh}) => zhText.includes(zh));
+}
+
+// Wrap matched glossary terms in <span class="term-hit"> while escaping HTML.
+// Operates on raw text so we can safely interleave escaped chunks with markup.
+// Longer terms win when overlapping (e.g. "首领部队" beats "首领").
+function highlightTerms(rawText, terms) {
+  if (!terms || !terms.length) return esc(rawText);
+
+  const sorted = [...terms].sort((a, b) => b.zh.length - a.zh.length);
+  const matches = [];
+  for (const t of sorted) {
+    let idx = 0;
+    while ((idx = rawText.indexOf(t.zh, idx)) !== -1) {
+      const start = idx, end = idx + t.zh.length;
+      const overlaps = matches.some(m => start < m.end && end > m.start);
+      if (!overlaps) matches.push({ start, end, term: t });
+      idx = end;
+    }
+  }
+  matches.sort((a, b) => a.start - b.start);
+
+  let html = '', cursor = 0;
+  for (const m of matches) {
+    html += esc(rawText.slice(cursor, m.start));
+    html += '<span class="term-hit" title="' + esc(m.term.en) + '">'
+         +  esc(rawText.slice(m.start, m.end))
+         +  '</span>';
+    cursor = m.end;
+  }
+  html += esc(rawText.slice(cursor));
+  return html;
+}
+
+// Render ZH text with term highlighting + literal \n -> <br> + color codes.
+// Pipeline order matters: highlightTerms wraps escaped chunks, nlToBr converts
+// any user-typed \n inside the body, and colorize finally wraps [RRGGBB]…[-].
+function renderZh(text) {
+  return colorize(nlToBr(highlightTerms(text, findTerms(text))));
+}
+
+// Mask [RRGGBB]...[‐] spans so their internal punctuation doesn't trigger splits.
+// Returns masked string (same length, placeholder chars).
+function maskColors(text) {
+  return text.replace(/\[[0-9A-Fa-f]{6}\][\s\S]*?\[-\]/g,
+    m => '\x01'.repeat(m.length));
+}
+
+// Split ZH paragraph into sentences, keeping [color]...[‐] spans atomic.
+// Terminators: 。！？
+function splitZhSentences(text) {
+  if (!text.trim()) return [text];
+  const masked = maskColors(text);
+  const parts = [];
+  // \x01 is NOT a terminator; runs of it stay with surrounding text
+  const re = /[^。！？]+[。！？]*/g;
+  let m;
+  while ((m = re.exec(masked)) !== null) {
+    const slice = text.slice(m.index, m.index + m[0].length).trim();
+    if (slice) parts.push(slice);
+  }
+  return parts.length ? parts : [text.trim()];
+}
+
+// Split EN paragraph into sentences.
+// Only split at .!? that is followed by whitespace + an uppercase letter.
+// This avoids false splits on decimals (0.1%), abbreviations, color codes, etc.
+//
+// Two-pass strategy:
+//   1) Split on the standard "<.!?> + whitespace + UPPERCASE" boundary.
+//   2) Re-glue tiny list-marker fragments (e.g. "1.", "2.", "i.", "I.") onto
+//      the next sentence so "1. During the event..." stays as one sentence
+//      instead of becoming ["1.", "During the event..."].
+function splitEnSentences(text) {
+  if (!text.trim()) return [text];
+  const raw = text.split(/(?<=[.!?])\s+(?=[A-Z])/).map(s => s.trim()).filter(Boolean);
+  const isListMarker = s => /^[0-9]{1,3}\.$/.test(s) || /^[ivxIVX]{1,4}\.$/.test(s);
+
+  const out = [];
+  let pending = '';
+  for (const p of raw) {
+    if (isListMarker(p)) {
+      pending = pending ? pending + ' ' + p : p;
+    } else {
+      out.push(pending ? pending + ' ' + p : p);
+      pending = '';
+    }
+  }
+  if (pending) out.push(pending);
+  return out;
+}
+
+// Parse raw Crowdin input into non-empty paragraphs PLUS the exact \n separator
+// between each adjacent pair. Splitting on literal \n yields tokens; runs of empty
+// tokens in between encode multi-\n separators (e.g. "A\n\nB" -> ["A","","B"] = sep "\n\n").
+// Returns { paras: string[], seps: string[] } where seps.length === paras.length - 1.
+function parseRawWithSeps(raw) {
+  const tokens = raw.split('\\n');
+  const out = [], seps = [];
+  let pendingEmpty = 0;
+  for (const tok of tokens) {
+    const trimmed = tok.trim();
+    if (trimmed) {
+      if (out.length > 0) {
+        // Separator = (1 boundary \n) + (one extra \n per empty token in between)
+        seps.push('\\n'.repeat(1 + pendingEmpty));
+      }
+      out.push(trimmed);
+      pendingEmpty = 0;
+    } else {
+      pendingEmpty++;
+    }
+  }
+  return { paras: out, seps };
+}
+
+// ── Build blocks ─────────────────────────────────────────────────────────────
+function buildBlocks() {
+  const zhRaw = document.getElementById('zh').value.trim();
+  const enRaw = document.getElementById('en').value.trim();
+  if (!zhRaw) { alert('Please paste the Chinese source.'); return; }
+  // English draft is OPTIONAL — leave it empty to translate from scratch using
+  // the table's per-sentence textareas.
+
+  const zh = parseRawWithSeps(zhRaw);
+  const en = parseRawWithSeps(enRaw);
+  const n  = Math.max(zh.paras.length, en.paras.length);
+
+  paras = [];
+  for (let i = 0; i < n; i++) {
+    const zhFull = zh.paras[i] || '';
+    const enFull = en.paras[i] || '';
+    paras.push({
+      zhFull,
+      enFull,
+      zhSentences: splitZhSentences(zhFull),
+      enSentences: splitEnSentences(enFull)
+    });
+  }
+
+  // Fill separators for the n-1 gaps. EN can be partial / empty; when no EN
+  // separator is available, fall back to the ZH separator so the eventual
+  // copied output mirrors the source's \n structure rather than collapsing it.
+  zhSeps = [];
+  enSeps = [];
+  for (let i = 0; i < n - 1; i++) {
+    const zSep = zh.seps[i] !== undefined ? zh.seps[i] : '\\n';
+    const eSep = en.seps[i] !== undefined ? en.seps[i] : zSep;
+    zhSeps.push(zSep);
+    enSeps.push(eSep);
+  }
+
+  // Reset view-layer: every paragraph starts as its own group
+  groups = paras.map((_, i) => ({ paraIdxs: [i], combined: false }));
+
+  document.getElementById('cnt').textContent = n;
+
+  // Show wrapper BEFORE renderBlocks so textareas have non-zero scrollHeight
+  // when autoH measures them (otherwise heights collapse to min-height = 1 line
+  // and long EN content gets clipped by overflow:hidden).
+  const wrap = document.getElementById('blocksWrap');
+  wrap.style.display = 'block';
+  renderBlocks();
+  wrap.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  setStatus('Built ' + n + ' paragraph(s) ✓', 'ok');
+}
+
+// VIEW-LAYER ONLY. Merge group `gi` with group `gi+1` so they render as one
+// visual block. Original paras/seps are untouched -> Copy & Preview output the
+// EXACT \n structure of the user's draft regardless of how many merges happen.
+function mergeWithNext(gi) {
+  if (gi < 0 || gi >= groups.length - 1) return;
+  groups[gi].paraIdxs = [...groups[gi].paraIdxs, ...groups[gi + 1].paraIdxs];
+  groups[gi].combined = false; // combined-view doesn't make sense for merged groups
+  groups.splice(gi + 1, 1);
+  renderBlocks();
+  const labels = groups[gi].paraIdxs.map(i => i + 1).join(' + ');
+  setStatus('View-merged paragraphs ' + labels + ' ✓ (output unchanged)', 'ok');
+}
+
+// VIEW-LAYER ONLY. Split a multi-paragraph group back into individual groups.
+function unmergeGroup(gi) {
+  if (gi < 0 || gi >= groups.length) return;
+  const g = groups[gi];
+  if (g.paraIdxs.length < 2) return;
+  const expanded = g.paraIdxs.map(idx => ({ paraIdxs: [idx], combined: false }));
+  groups.splice(gi, 1, ...expanded);
+  renderBlocks();
+  setStatus('Unmerged ✓', 'ok');
+}
+
+function renderBlocks() {
+  const container = document.getElementById('blocks');
+  container.innerHTML = '';
+  groups.forEach((g, gi) => container.appendChild(makeBlock(g, gi)));
+  // rAF ensures layout has settled before reading scrollHeight
+  requestAnimationFrame(() => {
+    container.querySelectorAll('textarea').forEach(autoH);
+  });
+}
+
+// Render one visual block per group. A group with N paragraphs renders all N
+// paragraphs' sentences sequentially with a divider between them.
+function makeBlock(g, gi) {
+  const isMulti = g.paraIdxs.length > 1;
+  const isLast  = (gi === groups.length - 1);
+
+  // ── Aggregate glossary hits across all paragraphs in this group (deduped)
+  const seen  = new Set();
+  const terms = [];
+  for (const pIdx of g.paraIdxs) {
+    for (const t of findTerms(paras[pIdx].zhFull)) {
+      const key = t.zh + '\x01' + t.en;
+      if (!seen.has(key)) { seen.add(key); terms.push(t); }
+    }
+  }
+  const termHtml = terms.length
+    ? terms.map(t =>
+        '<span class="pill">'
+      +   '<span class="pill-zh">' + esc(t.zh) + '</span>'
+      +   '<span class="pill-eq">=</span>'
+      +   esc(t.en)
+      + '</span>'
+      ).join('')
+    : '<span class="no-term">no glossary hits</span>';
+
+  // ── Sentence rows. Walk every paragraph in the group; insert a divider
+  //    before each paragraph after the first so users can still see the
+  //    original boundary. Each textarea is bound to its ORIGINAL paragraph
+  //    index via data-para so edits are attributed correctly even after merge.
+  let sentRows = '';
+  let rowNum   = 0;
+  g.paraIdxs.forEach((pIdx, idxInGroup) => {
+    const p = paras[pIdx];
+    if (idxInGroup > 0) {
+      sentRows += `<div class="para-divider">— Paragraph ${pIdx + 1} —</div>`;
+    }
+    const rowCount = Math.max(p.zhSentences.length, p.enSentences.length, 1);
+    for (let si = 0; si < rowCount; si++) {
+      rowNum++;
+      const zhVal = p.zhSentences[si] !== undefined ? p.zhSentences[si] : '';
+      const enVal = p.enSentences[si] !== undefined ? p.enSentences[si] : '';
+      sentRows += `<div class="sent-row">
+        <div class="sent-num">${rowNum}</div>
+        <div class="sent-zh">${zhVal ? renderZh(zhVal) : ''}</div>
+        <div class="sent-en"><textarea
+          data-para="${pIdx}" data-sent="${si}"
+          oninput="autoH(this);syncCombined(${gi})">${esc(enVal)}</textarea></div>
+      </div>`;
+    }
+  });
+
+  // ── Combined view (works for both single and merged groups). Sentence-level
+  //    textareas always exist in the DOM (just hidden behind combined view) and
+  //    keep their data-para attribution, so syncSentences distributes re-split
+  //    sentences back into the correct ORIGINAL paragraphs by DOM order.
+  const zhSentencesAll = g.paraIdxs.flatMap(pIdx => paras[pIdx].zhSentences);
+  const zhCombined = zhSentencesAll.length > 1
+    ? zhSentencesAll.map((s, si) =>
+        (si > 0 ? '<span class="sent-sep"> </span>' : '') + renderZh(s)
+      ).join('')
+    : renderZh(zhSentencesAll[0] || '');
+  const enJoined = g.paraIdxs.map(pIdx => paras[pIdx].enFull).filter(Boolean).join(' ');
+  const combinedHtml = `
+    <div class="combined-view" id="body-comb-${gi}">
+      <div class="combined-body">
+        <div class="combined-zh">${zhCombined}</div>
+        <div class="combined-en">
+          <textarea data-combined="1"
+            oninput="autoH(this);syncSentences(${gi})">${esc(enJoined)}</textarea>
+        </div>
+      </div>
+    </div>`;
+
+  // ── Header: label + pills + buttons
+  const labelText = isMulti
+    ? 'Paragraphs ' + g.paraIdxs.map(i => i + 1).join(' + ')
+    : 'Paragraph ' + (g.paraIdxs[0] + 1);
+  const unmergeBtn = isMulti
+    ? `<button class="btn-merge" onclick="unmergeGroup(${gi})"
+         title="Split this merged group back into individual paragraphs">↑ Unmerge</button>`
+    : '';
+  const mergeBtn = `<button class="btn-merge" onclick="mergeWithNext(${gi})" ${isLast ? 'disabled' : ''}
+       title="Merge with next block (view-only — does not change the copied output)">⬇ Merge next</button>`;
+  const toggleBtn = `<button class="btn-sm" id="toggle-${gi}" onclick="toggleBlock(${gi})">Merge view ▾</button>`;
+
+  const div = document.createElement('div');
+  div.className = 'para-block' + (isMulti ? ' is-merged' : '');
+  div.id = 'block-' + gi;
+  div.innerHTML = `
+    <div class="block-hdr">
+      <span class="block-label">${labelText}</span>
+      <div class="block-pills">${termHtml}</div>
+      ${unmergeBtn}
+      ${mergeBtn}
+      ${toggleBtn}
+    </div>
+    <div class="block-body" id="body-sent-${gi}">${sentRows}</div>
+    ${combinedHtml}`;
+
+  return div;
+}
+
+// ── Toggle a group between sentence-level rows and a single combined textarea.
+//    Works for both single-paragraph and merged groups; in merged groups the
+//    combined textarea spans all paragraphs and on edit-commit the resulting
+//    sentences flow back into the correct ORIGINAL paragraphs by DOM order
+//    (each sent-row textarea preserves its data-para attribution).
+function toggleBlock(gi) {
+  const g = groups[gi];
+  if (!g) return;
+  g.combined = !g.combined;
+
+  const sentView = document.getElementById('body-sent-' + gi);
+  const combView = document.getElementById('body-comb-' + gi);
+  const btn      = document.getElementById('toggle-' + gi);
+
+  if (g.combined) {
+    const sentTas = sentView.querySelectorAll('textarea');
+    const joined  = Array.from(sentTas).map(ta => ta.value).filter(Boolean).join(' ');
+    const combTa  = combView.querySelector('textarea');
+    combTa.value  = joined;
+    sentView.style.display = 'none';
+    combView.style.display = 'block';
+    btn.textContent = 'Split view ▴';
+    btn.classList.add('active');
+    autoH(combTa);
+  } else {
+    const combTa  = combView.querySelector('textarea');
+    const reSplit = splitEnSentences(combTa.value);
+    const sentTas = sentView.querySelectorAll('textarea');
+    sentTas.forEach((ta, si) => {
+      ta.value = reSplit[si] !== undefined ? reSplit[si] : '';
+    });
+    sentView.style.display = 'block';
+    combView.style.display = 'none';
+    btn.textContent = 'Merge view ▾';
+    btn.classList.remove('active');
+    sentTas.forEach(autoH);
+  }
+}
+
+// Sync combined textarea when a sentence textarea changes (single-para groups).
+function syncCombined(gi) {
+  const combTa = document.querySelector('#body-comb-' + gi + ' textarea');
+  if (!combTa) return; // multi-para groups have no combined view
+  const sentTas = document.querySelectorAll('#body-sent-' + gi + ' textarea');
+  combTa.value = Array.from(sentTas).map(ta => ta.value).filter(Boolean).join(' ');
+  autoH(combTa);
+}
+
+// Re-split combined EN into sentence rows when combined textarea changes.
+function syncSentences(gi) {
+  const combTa  = document.querySelector('#body-comb-' + gi + ' textarea');
+  if (!combTa) return;
+  const reSplit = splitEnSentences(combTa.value);
+  const sentTas = document.querySelectorAll('#body-sent-' + gi + ' textarea');
+  sentTas.forEach((ta, si) => {
+    ta.value = reSplit[si] !== undefined ? reSplit[si] : '';
+    autoH(ta);
+  });
+}
+
+// ── Collect final EN for ORIGINAL paragraph index `pIdx`, regardless of which
+//    group currently displays it. Sentence-level textareas are always present
+//    in the DOM (even when hidden behind combined view) and are kept in sync
+//    by syncSentences, so they are the single source of truth.
+function getParaEN(pIdx) {
+  const tas = document.querySelectorAll(
+    'textarea[data-para="' + pIdx + '"][data-sent]'
+  );
+  return Array.from(tas).map(ta => ta.value).filter(Boolean).join(' ');
+}
+
+// ── Preview modal ────────────────────────────────────────────────────────────
+// Always renders the ORIGINAL paragraph structure with the EXACT \n separators
+// from the user's draft. Merge / unmerge are pure view-layer operations and
+// have NO effect here.
+function showPreview() {
+  if (!paras.length) { alert('Please build the table first.'); return; }
+
+  const nlCount = sep => (sep.match(/\\n/g) || []).length;
+
+  let zhHtml = '';
+  let enHtml = '';
+  paras.forEach((p, i) => {
+    zhHtml += renderZh(p.zhFull);
+    // EN side may contain user-typed color codes [RRGGBB]…[-] AND literal \n.
+    // Pipeline: esc -> nlToBr -> colorize so all three get rendered live.
+    enHtml += colorize(nlToBr(esc(getParaEN(i))));
+    if (i < paras.length - 1) {
+      zhHtml += '<br>'.repeat(nlCount(zhSeps[i]));
+      enHtml += '<br>'.repeat(nlCount(enSeps[i]));
+    }
+  });
+  document.getElementById('pvZh').innerHTML = zhHtml;
+  document.getElementById('pvEn').innerHTML = enHtml;
+
+  document.getElementById('overlay').classList.add('on');
+}
+
+function closePreview() {
+  document.getElementById('overlay').classList.remove('on');
+}
+
+document.getElementById('overlay').addEventListener('click', e => {
+  if (e.target === document.getElementById('overlay')) closePreview();
+});
+
+// ── Copy: rebuild the result using the ORIGINAL paragraph list and the EXACT
+//         \n separators captured from the user's draft. Merge / unmerge are
+//         purely visual and never touch this output. Nothing is auto-inserted.
+async function doCopy() {
+  let result = '';
+  paras.forEach((_, i) => {
+    result += getParaEN(i);
+    if (i < paras.length - 1) result += enSeps[i];
+  });
+
+  try {
+    await navigator.clipboard.writeText(result);
+  } catch {
+    const ta = document.createElement('textarea');
+    ta.value = result;
+    ta.style.cssText = 'position:fixed;opacity:0;top:0;left:0';
+    document.body.appendChild(ta);
+    ta.focus(); ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+  }
+  const toast = document.getElementById('toast');
+  toast.classList.add('on');
+  setTimeout(() => toast.classList.remove('on'), 3000);
+}
+
+function confirmAndCopy() { doCopy(); closePreview(); }
+</script>
+</body>
+</html>"""
 
 
-def is_marked_performance(row): return str(row.get('is_marked', '')).strip() == '是'
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP request handler
+# ─────────────────────────────────────────────────────────────────────────────
+class Handler(http.server.BaseHTTPRequestHandler):
 
-
-def is_free_event_pack(row): return str(row.get('free_event', '否')).strip() != '否'
-
-
-def has_owner_or_perf_mark(row):
-    perf_owner = str(row.get('perf_owner', '')).strip()
-    has_owner = perf_owner and perf_owner not in ['nan', 'None', '']
-    return is_marked_performance(row) or has_owner
-
-
-def format_percent(value):
-    if abs(value - round(value)) < 1e-9:
-        return f"{int(round(value))}%"
-    return f"{value:.1f}%"
-
-
-def build_mark_ratio_text(events):
-    merged_by_rule = {}
-    rule_order = []
-
-    for e in events:
-        if e.get('type') != 'achieved':
-            continue
-        rule = e.get('rule', {})
-        rule_name = str(rule.get('name', '')).strip()
-        if not rule_name:
-            continue
-        if rule_name not in merged_by_rule:
-            merged_by_rule[rule_name] = []
-            rule_order.append((rule.get('priority', 999), rule_name))
-
-        orders = e.get('data', {}).get('orders', [])
-        total = len(orders)
-        if total <= 0:
-            continue
-
-        # 归属标记 + 免费包标记合并口径：任一命中即计为“已标记”
-        merged_cnt = sum(1 for o in orders if (has_owner_or_perf_mark(o) or is_free_event_pack(o)))
-        merged_by_rule[rule_name].append(format_percent(merged_cnt * 100.0 / total))
-
-    if not merged_by_rule:
-        return ""
-
-    merged_parts = []
-    for _, rule_name in sorted(rule_order, key=lambda x: x[0]):
-        vals = merged_by_rule.get(rule_name, [])
-        if vals:
-            merged_parts.append(f"{rule_name}:{'/'.join(vals)}")
-    if not merged_parts:
-        return ""
-    return "标记占比详情 " + " | ".join(merged_parts)
-
-
-def format_event_text_full(e):
-    oids = ", ".join([str(o['oid']) for o in e['data']['orders']])
-    return f"Rule: {e['rule']['name']}\nTotal: ${e['data']['total']:.2f}\nCount: {e['data']['count']}\nOrders: {oids}"
-
-
-def show_copy_toast(title, message):
-    try:
-        toast = ToastNotification(
-            title=title,
-            message=message,
-            duration=2000,
-            bootstyle="success",
-            position=(50, 50, 'se')
-        )
-        toast.show_toast()
-    except:
+    def log_message(self, fmt, *args):
         pass
 
-        # Display Logic
+    def _send_json(self, code: int, data: dict):
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-
-def generate_summary_grouped(events, calc_mode="normal", ref_time=None, current_oid=None, suppress_map=None):
-    if not events: return ""
-
-    # 【修复调整】彻底废除了原本用来隐藏 miss<=1 的 cutoff_priority 拦截逻辑
-    # 确保上方的 Treeview 列表与底部卡片读取数据源保持绝对一致，如实显示差1。
-
-    grouped = {}
-    for e in events:
-        r_name = e['rule']['name']
-        r_priority = e['rule']['priority']
-
-        if r_name not in grouped: grouped[r_name] = {'priority': r_priority, 'achieved_sets': 0, 'contacts': set()}
-
-        if e['type'] == 'achieved':
-            grouped[r_name]['achieved_sets'] += e['sets']
-        elif e['type'] == 'contact':
-            # 过滤已超时的催单
-            if ref_time and e['data']['deadline'] <= ref_time: continue
-
-            # 【被删除的代码】：不再拦截强行剔除 e['miss'] <= 1 的数据
-
-            grouped[r_name]['contacts'].add(e['miss'])
-
-    sorted_groups = sorted(grouped.items(), key=lambda x: x[1]['priority'])
-    parts = []
-    for r_name, data in sorted_groups:
-        sub_parts = []
-        if data['achieved_sets'] > 0: sub_parts.append(f"{r_name}达成x{data['achieved_sets']}")
-        if data['contacts']:
-            min_miss = min(data['contacts'])
-            sub_parts.append(f"{r_name}差{min_miss}")
-        if sub_parts: parts.append(" ".join(sub_parts))
-    return " | ".join(parts)
-
-
-# --- 核心计算引擎 (Standard - Waterfall) ---
-# 逻辑：优先达成大额，达成即消耗并停止检查(Break)；未达成则检查催单，并继续检查低档位(Continue)。
-def calculate_achievements_normal(orders, all_rules, time_ext, limit_configs={}, ref_time=None):
-    if ref_time is None: ref_time = datetime.utcnow()
-    n = len(orders)
-    events = []
-    used_indices = set()
-
-    i = 0
-    while i < n:
-        if i in used_indices:
-            i += 1
-            continue
-
-        consumed_in_this_pass = False
-
-        for rule in all_rules:
-            # 1. 确定起点
-            target_price = rule.get('unit_price', 99.99)
-            actual_start_idx = i
-
-            if rule['type'] == 'count':
-                temp_idx = i
-                found_valid_start = False
-                while temp_idx < n:
-                    if temp_idx in used_indices:
-                        temp_idx += 1;
-                        continue
-                    if abs(orders[temp_idx]['amt'] - target_price) < 0.05:
-                        actual_start_idx = temp_idx
-                        found_valid_start = True
-                        break
-                    temp_idx += 1
-                if not found_valid_start: continue
-
-            st = orders[actual_start_idx]['time_obj']
-            t_ext_val = time_ext if rule['type'] == 'sum' else 0
-            window_s = (rule['hours'] + t_ext_val) * 3600
-            deadline = st + timedelta(seconds=window_s)
-
-            scan_indices = []
-            acc_val = 0.0
-            valid_cnt = 0
-
-            for j in range(actual_start_idx, n):
-                if j in used_indices: continue
-                row = orders[j]
-                if row['time_obj'] > deadline: break
-
-                is_valid = False
-                if rule['type'] == 'sum':
-                    acc_val += row['amt'];
-                    is_valid = True
-                elif rule['type'] == 'count':
-                    if abs(row['amt'] - target_price) < 0.05:
-                        valid_cnt += 1;
-                        is_valid = True
-
-                if is_valid: scan_indices.append(j)
-
-                # 2. 判断状态
-            is_achieved = False
-            # 【修复1：防浮点不达成】增加 0.05 的容错，防止本该达成却判定失败
-            if rule['type'] == 'sum' and acc_val >= (rule['target'] - 0.05):
-                is_achieved = True
-            elif rule['type'] == 'count' and valid_cnt >= int(rule['target']):
-                is_achieved = True
-
-            if is_achieved:
-                # === 达成 ===
-                final_orders = []
-                temp_sum = 0.0;
-                temp_cnt = 0
-                for idx in scan_indices:
-                    o = orders[idx]
-                    final_orders.append(o)
-                    used_indices.add(idx)
-                    if rule['type'] == 'sum':
-                        temp_sum += o['amt']
-                        if temp_sum >= (rule['target'] - 0.05): break
-                    elif rule['type'] == 'count':
-                        temp_cnt += 1
-                        if temp_cnt >= int(rule['target']): break
-
-                events.append({
-                    'type': 'achieved', 'rule': rule, 'sets': 1,
-                    'data': {'orders': final_orders, 'total': sum(x['amt'] for x in final_orders),
-                             'count': len(final_orders), 'start_t': final_orders[0]['time_obj'], 'deadline': deadline}
-                })
-                consumed_in_this_pass = True
-                break
-
+    def do_GET(self):
+        if self.path == "/":
+            body = HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/api/glossary":
+            terms, msg = load_glossary()
+            if terms:
+                self._send_json(200, {"terms": terms, "message": msg})
             else:
-                # === 催单 ===
-                limit = limit_configs.get(rule['name'], 0)
-                if limit > 0:
-                    is_contact = False;
-                    miss = 0
-                    if rule['type'] == 'sum':
-                        if acc_val >= (limit * 99.99 - 0.05):
-                            is_contact = True
-                            # 【修复2：彻底解决连续13和最后多算1包的问题】
-                            # 利用 round 先将结果逼近规范小数位，再 ceil 抹去末尾脏数据进行整数进位
-                            miss = math.ceil(round((rule['target'] - acc_val) / 99.99, 4))
-                    elif rule['type'] == 'count':
-                        if valid_cnt >= limit:
-                            is_contact = True
-                            miss = int(rule['target']) - valid_cnt
-
-                    if is_contact:
-                        events.append({
-                            'type': 'contact', 'rule': rule, 'miss': miss,
-                            'data': {'orders': [orders[k] for k in scan_indices], 'total': acc_val,
-                                     'count': len(scan_indices), 'start_t': st, 'deadline': deadline}
-                        })
-
-        if not consumed_in_this_pass:
-            i += 1
-
-    return events, used_indices
-
-
-# Kernel logic with Pure Surplus Check (Safest Mode)
-def calculate_achievements_complex(orders, all_rules, time_ext, limit_configs, ref_time, debug_trace=None):
-    if debug_trace is None:
-        debug_trace = []
-
-    sum_rules = [r for r in all_rules if r['type'] == 'sum']
-    normal_events, _ = calculate_achievements_normal(orders, sum_rules, time_ext, limit_configs, ref_time)
-    achieved_sum_events = [e for e in normal_events if e['type'] == 'achieved']
-    order_to_sum_event_idx = {}
-    for idx, evt in enumerate(achieved_sum_events):
-        for o in evt['data']['orders']: order_to_sum_event_idx[str(o['oid'])] = idx
-
-    # 特殊模式口径：
-    # 1) 已达成累充中的订单属于“已使用”，借给10+1时必须保证原达成仍成立；
-    # 2) 未达成(仅contact)链路中的订单不锁定，可直接用于低档(10+1)达成。
-    orders_99 = [o for o in orders if abs(o['amt'] - 99.99) < 0.05]
-    n99 = len(orders_99)
-    count_rule = next((r for r in all_rules if r['type'] == 'count'), None)
-    if not count_rule: return normal_events, set()
-
-    achieved_count_events = [];
-    ids_consumed_by_count = set()
-    i = 0
-    while i <= n99 - 10:
-        if str(orders_99[i]['oid']) in ids_consumed_by_count: i += 1; continue
-        st = orders_99[i]['time_obj'];
-        ddl = st + timedelta(hours=24)
-        grp = [];
-        temp_j = i
-        while temp_j < n99:
-            o = orders_99[temp_j]
-            if str(o['oid']) in ids_consumed_by_count: temp_j += 1; continue
-            if o['time_obj'] > ddl: break
-            grp.append(o);
-            if len(grp) == 10: break
-            temp_j += 1
-        if len(grp) < 10: i += 1; continue
-
-        bounds = {}
-        for o in grp:
-            oid = str(o['oid'])
-            if oid in order_to_sum_event_idx:
-                idx = order_to_sum_event_idx[oid]
-                if idx not in bounds: bounds[idx] = []
-                bounds[idx].append(o)
-
-        possible = True;
-        plans = {}
-        reserved_refill_oids = set()
-        for e_idx, stolen in bounds.items():
-            evt = achieved_sum_events[e_idx]
-            cur = evt['data']['total'];
-            tgt = evt['rule']['target']
-            need = tgt - (cur - sum(o['amt'] for o in stolen))
-            if need <= 0.05: plans[e_idx] = []; continue
-            est = evt['data']['start_t'];
-            eed = evt['data']['deadline']
-            pot = []
-            c_ids = {str(o['oid']) for o in grp}
-            for o in orders:
-                oid = str(o['oid'])
-                if o['time_obj'] < est or o['time_obj'] > eed: continue
-                # 特殊模式补单去重：同一轮中已分配给其它事件的订单不可重复使用
-                # 同时排除已被10+1消耗的订单，避免“一单两用”导致结果虚增
-                if (oid not in order_to_sum_event_idx and oid not in c_ids
-                        and oid not in reserved_refill_oids and oid not in ids_consumed_by_count):
-                    pot.append(o)
-            refill = [];
-            r_tot = 0.0
-            for sp in pot:
-                refill.append(sp);
-                r_tot += sp['amt']
-                if r_tot >= need - 0.05: break
-            if r_tot < need - 0.05: possible = False; break
-            plans[e_idx] = refill
-            reserved_refill_oids.update(str(x['oid']) for x in refill)
-
-        if possible:
-            impact_parts = []
-            for e_idx, stolen in bounds.items():
-                evt = achieved_sum_events[e_idx];
-                sps = plans[e_idx]
-                s_ids = [str(o['oid']) for o in stolen]
-                for s_oid in s_ids:
-                    # 被借走的订单不再属于原累充事件，必须清理映射
-                    if order_to_sum_event_idx.get(s_oid) == e_idx:
-                        del order_to_sum_event_idx[s_oid]
-                new_list = [o for o in evt['data']['orders'] if str(o['oid']) not in s_ids] + sps
-                evt['data']['orders'] = new_list
-                evt['data']['total'] = sum(o['amt'] for o in new_list)
-                evt['data']['count'] = len(new_list)
-                for o in sps: order_to_sum_event_idx[str(o['oid'])] = e_idx
-                impact_parts.append(
-                    f"{evt['rule']['name']} 借{len(stolen)}单({', '.join(s_ids)}) "
-                    f"回填{len(sps)}单({', '.join(str(o['oid']) for o in sps) if sps else '无需回填'})"
-                )
-            debug_trace.append(
-                f"10+1 达成 | 起点OID={grp[0]['oid']} | 借走10单: {', '.join(str(o['oid']) for o in grp)} | "
-                f"影响: {' ; '.join(impact_parts) if impact_parts else '无'}"
-            )
-            achieved_count_events.append({'type': 'achieved', 'rule': count_rule, 'sets': 1,
-                                          'data': {'orders': grp, 'total': sum(o['amt'] for o in grp), 'count': 10,
-                                                   'start_t': grp[0]['time_obj'], 'deadline': ddl}
-                                          })
-            for o in grp: ids_consumed_by_count.add(str(o['oid']))
-        i += 1
-
-    final = achieved_sum_events + achieved_count_events
-    min_r = limit_configs.get(count_rule['name'], 0)
-
-    def is_borrowable_safely(oid):
-        if oid in ids_consumed_by_count: return False
-        # 不在已达成累充中的99.99，视为未锁定，可直接用于10+1
-        if oid not in order_to_sum_event_idx: return True
-        e_idx = order_to_sum_event_idx[oid]
-        evt = achieved_sum_events[e_idx]
-        if (evt['data']['total'] - 99.99) >= (evt['rule']['target'] - 0.05):
-            return True
-        return False
-
-    if min_r > 0:
-        i = 0
-        while i < n99:
-            o_start = orders_99[i]
-            oid_start = str(o_start['oid'])
-            if not is_borrowable_safely(oid_start):
-                i += 1;
-                continue
-            st = o_start['time_obj'];
-            ddl = st + timedelta(hours=24)
-            current_chain = [o_start]
-            for j in range(i + 1, n99):
-                o_curr = orders_99[j]
-                if o_curr['time_obj'] > ddl: break
-                oid_curr = str(o_curr['oid'])
-                if is_borrowable_safely(oid_curr):
-                    current_chain.append(o_curr)
-            cnt = len(current_chain)
-            if cnt >= min_r and cnt < 10 and ref_time < ddl:
-                final.append({'type': 'contact', 'rule': count_rule, 'miss': 10 - cnt,
-                              'data': {'orders': current_chain, 'total': sum(o['amt'] for o in current_chain),
-                                       'count': cnt, 'start_t': st, 'deadline': ddl}
-                              })
-            i += 1
-
-    final += [e for e in normal_events if e['type'] == 'contact']
-    return final, set()
-
-
-# 全局辅助函数：寻找最佳起点 (Best Scenario)
-def find_best_scenario(orders, all_rules, time_ext, limit_map, ref_time):
-    if not orders: return []
-    best_score = -1
-    best_events = []
-
-    scan_limit = min(len(orders), 100)
-
-    for i in range(scan_limit):
-        sub_orders = orders[i:]
-        evts, _ = calculate_achievements_normal(sub_orders, all_rules, time_ext, limit_map, ref_time)
-        score = sum(e['rule'].get('reward', 0) * e['sets'] for e in evts if e['type'] == 'achieved')
-
-        if score > best_score:
-            best_score = score
-            best_events = evts
-
-    return best_events
-
-
-# ================= 3. 编辑器 UI =================
-
-class TemplateEditorWindow(ttk.Toplevel):
-    def __init__(self, parent):
-        super().__init__(title="Edit Templates", master=parent)
-        self.geometry("800x600")
-        self.data = tmpl_mgr.load_templates()
-        self.text_widgets = {}
-
-        ttk.Label(self, text="模板编辑器", font=("Helvetica", 14, "bold"), bootstyle="primary").pack(pady=10)
-        container = ttk.Frame(self)
-        container.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
-
-        f1 = ttk.Labelframe(container, text="累充规则模板 (Sum Rules)", bootstyle="primary")
-        f1.pack(fill=tk.BOTH, expand=True, pady=5)
-        t1 = ScrolledText(f1, height=5, font=("Consolas", 10))
-        t1.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        t1.insert("1.0", self.data.get("contact_sum", ""))
-        self.text_widgets["contact_sum"] = t1
-
-        f2 = ttk.Labelframe(container, text="计数规则模板 (Count Rules)", bootstyle="success")
-        f2.pack(fill=tk.BOTH, expand=True, pady=5)
-        t2 = ScrolledText(f2, height=5, font=("Consolas", 10))
-        t2.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-        t2.insert("1.0", self.data.get("contact_count", ""))
-        self.text_widgets["contact_count"] = t2
-
-        ttk.Button(self, text="💾 保存并生效", bootstyle="success", command=self.save).pack(pady=10, fill=tk.X, padx=50)
-
-    def save(self):
-        new_data = {}
-        for k, w in self.text_widgets.items(): new_data[k] = w.get("1.0", "end-1c").strip()
-        if tmpl_mgr.save_templates(new_data): self.destroy()
-
-        # ================= 4. UI 组件 (SafeScrollableFrame) =================
-
-
-class SafeScrollableFrame(ttk.Frame):
-    def __init__(self, parent, columns=2, *args, **kwargs):
-        super().__init__(parent, *args, **kwargs)
-        self.columns = columns
-        style = ttk.Style()
-        bg_color = style.lookup("TFrame", "background")
-        self.canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0, bg=bg_color)
-        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
-        self.scrollable_frame = ttk.Frame(self.canvas)
-        self.scrollable_frame.bind("<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
-        self.canvas_window = self.canvas.create_window((0, 0), window=self.scrollable_frame, anchor="nw")
-        self.canvas.bind('<Configure>', self._configure_window_width)
-        self.canvas.configure(yscrollcommand=self.scrollbar.set)
-        self.canvas.pack(side="left", fill="both", expand=True)
-        self.scrollbar.pack(side="right", fill="y")
-        self.bind_all("<MouseWheel>", self._on_mousewheel)
-
-    def _configure_window_width(self, event):
-        self.canvas.itemconfig(self.canvas_window, width=event.width)
-
-    def _on_mousewheel(self, event):
-        try:
-            x, y = self.winfo_pointerxy()
-            widget = self.winfo_containing(x, y)
-            if widget and str(self) in str(widget):
-                self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
-        except:
-            pass
-
-    def clear(self):
-        for widget in self.scrollable_frame.winfo_children(): widget.destroy()
-
-    def add_card(self, title, content, bootstyle="secondary", oids=None, template_text=None):
-        count = len(self.scrollable_frame.winfo_children())
-        row, col = count // self.columns, count % self.columns
-        card = ttk.Labelframe(self.scrollable_frame, text=f" {title} ", bootstyle=bootstyle)
-        card.grid(row=row, column=col, padx=10, pady=10, sticky="nsew")
-
-        txt = tk.Text(card, height=5, width=40, font=("Consolas", 9), bg="#2b2b2b", fg="#eee", relief="flat",
-                      insertbackground="white")
-        txt.insert("1.0", content)
-        txt.config(state=tk.DISABLED)
-        txt.pack(fill="both", expand=True, padx=5, pady=5)
-
-        def _enter_txt(e):
-            self.unbind_all("<MouseWheel>")
-
-        def _leave_txt(e):
-            self.bind_all("<MouseWheel>", self._on_mousewheel)
-
-        txt.bind("<Enter>", _enter_txt);
-        txt.bind("<Leave>", _leave_txt)
-
-        btn_frame = ttk.Frame(card);
-        btn_frame.pack(fill=tk.X, padx=5, pady=5)
-
-        def copy_str(s, msg):
-            self.winfo_toplevel().clipboard_clear()
-            self.winfo_toplevel().clipboard_append(s)
-            show_copy_toast("COPIED", msg)
-
-        if oids:
-            if isinstance(oids, list):
-                o_str = "\n".join(oids)
-            else:
-                o_str = str(oids)
-            ttk.Button(btn_frame, text="🆔 Copy Orders", bootstyle="info-outline", cursor="hand2",
-                       command=lambda: copy_str(o_str, f"{len(oids)} Orders Copied")).pack(side=tk.LEFT, padx=5,
-                                                                                           fill=tk.X, expand=True)
-        if template_text:
-            ttk.Button(btn_frame, text="📋 Copy Msg", bootstyle="success-outline", cursor="hand2",
-                       command=lambda: copy_str(template_text, "Template Text Copied")).pack(side=tk.LEFT, padx=5,
-                                                                                             fill=tk.X, expand=True)
-        self.scrollable_frame.grid_columnconfigure(col, weight=1)
-
-        # ================= 5. 单玩家检查窗口类 =================
-
-
-class SinglePlayerCheck(ttk.Toplevel):
-    def __init__(self, parent, player_data, time_ext, limit_configs, ref_time):
-        t_str = ref_time.strftime("%Y-%m-%d %H:%M:%S") if ref_time else "Unknown"
-        super().__init__(title=f"单玩家检查 (ID:{player_data.get('real_id', '?')}) @ Ref: {t_str}", master=parent)
-        self.geometry("1550x850")
-        self.p_data = player_data
-        self.time_ext = time_ext
-        self.limit_configs = limit_configs
-        self.ref_time = ref_time
-
-        self.calc_mode = "normal"
-        self.opt_diff_val = 0
-        self.opt_10_info = ""
-        self.frm_manual_stats = None
-
-        self.precalc_data = {'normal': [], 'special': []}
-        self.cache_view = {}
-        self.cache_special_log = {}
-        self.iid_to_oid = {}
-        self.oid_to_iid = {}
-
-        self._init_ui()
-        self._setup_tags()
-        self._precompute_all()
-        self._refresh_view()
-
-    def _init_ui(self):
-        frame_top = ttk.Frame(self);
-        frame_top.pack(side=tk.TOP, fill=tk.X, padx=10, pady=10)
-
-        frame_legend = ttk.LabelFrame(frame_top, text=" Color Legend ")
-        frame_legend.pack(side=tk.TOP, fill=tk.X, pady=(0, 10), ipadx=5, ipady=5)
-        for rule_name, color_hex in RULE_COLORS.items():
-            if rule_name == "DEFAULT": continue
-            canvas = tk.Canvas(frame_legend, width=90, height=26, bg="#444444", highlightthickness=0)
-            canvas.pack(side=tk.LEFT, padx=5, pady=5)
-            canvas.create_text(45, 13, text=rule_name, fill=color_hex, font=("Helvetica", 10, "bold"))
-
-        frame_controls = ttk.Frame(frame_top);
-        frame_controls.pack(side=tk.TOP, fill=tk.X)
-        self.frm_manual_stats = ttk.Frame(frame_controls);
-        self.frm_manual_stats.pack(side=tk.LEFT, padx=(0, 20))
-
-        # ================== 【新增区域：下拉菜单按钮组】 ==================
-        filter_frame = ttk.Frame(frame_controls)
-        filter_frame.pack(side=tk.LEFT, padx=10)
-
-        # 1. 剔除归属人下拉菜单
-        mb_owner = ttk.Menubutton(filter_frame, text="⛔ 剔除归属人订单", bootstyle="warning-outline")
-        mb_owner.pack(side=tk.LEFT, padx=2)
-        menu_owner = tk.Menu(mb_owner, tearoff=0)
-        menu_owner.add_command(label="剔除【所有】归属人/标记订单", command=lambda: self.filter_owner(keep_10_1=False))
-        menu_owner.add_command(label="剔除归属人 (但保留 '24小时内买10送1')",
-                               command=lambda: self.filter_owner(keep_10_1=True))
-        mb_owner['menu'] = menu_owner
-
-        # 2. 剔除免费包下拉菜单
-        mb_free = ttk.Menubutton(filter_frame, text="🆓 剔除免费包订单", bootstyle="warning-outline")
-        mb_free.pack(side=tk.LEFT, padx=2)
-        menu_free = tk.Menu(mb_free, tearoff=0)
-        menu_free.add_command(label="剔除【所有】免费包订单", command=lambda: self.filter_free_event(keep_10_1=False))
-        menu_free.add_command(label="剔除免费包 (但保留 '24小时内买10送1')",
-                              command=lambda: self.filter_free_event(keep_10_1=True))
-        mb_free['menu'] = menu_free
-
-        # 3. 重置按钮 (保持普通按钮)
-        ttk.Button(filter_frame, text="🔄 重置列表", bootstyle="info-outline", command=self.reset_filter).pack(
-            side=tk.LEFT, padx=2)
-        # ==========================================================
-
-        rt_frame = ttk.Frame(frame_controls);
-
-        rt_frame.pack(side=tk.RIGHT)
-        ttk.Button(rt_frame, text="🧹 Clear Marks", bootstyle="danger-outline", command=self.clear_manual_marks).pack(
-            side=tk.LEFT, padx=5)
-        self.btn_mode = ttk.Button(rt_frame, text="计算中...", bootstyle="secondary", state=tk.DISABLED,
-                                   command=self.toggle_mode)
-        self.btn_mode.pack(side=tk.LEFT, padx=5)
-        ttk.Button(rt_frame, text="📜 特殊借单日志", bootstyle="info-outline", command=self.show_special_log).pack(
-            side=tk.LEFT, padx=5)
-
-        ttk.Label(frame_controls, text="Shift+Click选范围 -> 右键手动标记", font=("Helvetica", 9),
-                  bootstyle="secondary").pack(side=tk.LEFT)
-
-        self.paned = ttk.Panedwindow(self, orient=tk.VERTICAL);
-        self.paned.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-        frame_list = ttk.Frame(self.paned);
-        self.paned.add(frame_list, weight=3)
-        cols = ("time", "oid", "result", "score")
-        self.tree = ttk.Treeview(frame_list, columns=cols, show="headings", height=10)
-        self.tree.heading("time", text="Start Time (GMT+0)");
-        self.tree.column("time", width=150)
-        self.tree.heading("oid", text="Order | Price");
-        self.tree.column("oid", width=220)
-        self.tree.heading("result", text="Analysis Result");
-        self.tree.column("result", width=850)
-        self.tree.heading("score", text="Reward");
-        self.tree.column("score", width=80, anchor="center")
-        sb = ttk.Scrollbar(frame_list, command=self.tree.yview);
-        self.tree.configure(yscrollcommand=sb.set)
-        self.tree.pack(side="left", fill="both", expand=True);
-        sb.pack(side=tk.RIGHT, fill=tk.Y)
-        self.tree.bind("<<TreeviewSelect>>", self.on_select)
-
-        def _copy_id(e):
-            sel = self.tree.selection()
-            if sel: val = self.tree.item(sel[0], 'values'); self.clipboard_clear(); self.clipboard_append(
-                val[1].split('|')[0].strip())
-            show_copy_toast("COPIED", "Copied")
-
-        self.tree.bind("<Control-c>", _copy_id)
-
-        self.cm = tk.Menu(self.tree, tearoff=0)
-        self.cm.add_command(label="Mark Selection (Mixed)", command=lambda: self.mark_selection_logic("all"))
-        self.cm.add_command(label="Mark Selection (Only 99.99)", command=lambda: self.mark_selection_logic("99"))
-        self.tree.bind("<Button-3>", lambda e: self.cm.post(e.x_root, e.y_root))
-
-        frame_bottom = ttk.Frame(self.paned);
-        self.paned.add(frame_bottom, weight=2)
-        self.nb_cards = ttk.Notebook(frame_bottom, bootstyle="warning");
-        self.nb_cards.pack(fill=tk.BOTH, expand=True)
-        self.f_ach_cards = SafeScrollableFrame(self.nb_cards);
-        self.nb_cards.add(self.f_ach_cards, text=" ACHIEVED ")
-        self.f_con_cards = SafeScrollableFrame(self.nb_cards);
-        self.nb_cards.add(self.f_con_cards, text=" CONTACT ")
-        f_tmpl = ttk.Frame(self.nb_cards);
-        self.nb_cards.add(f_tmpl, text=" LOGS ")
-        self.txt = ScrolledText(f_tmpl, height=8, font=("Consolas", 10), bootstyle="secondary");
-        self.txt.pack(fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-    def _setup_tags(self):
-        for name, color in RULE_COLORS.items():
-            if name != "DEFAULT":
-                if IS_MACOS:
-                    # macOS 下 Treeview 行背景色可能不生效，改用文字着色高亮，避免影响 Windows 现有效果
-                    self.tree.tag_configure(name, foreground=color, background=RULE_COLORS["DEFAULT"])
-                else:
-                    self.tree.tag_configure(name, background=color, foreground="white")
-        self.tree.tag_configure('separator', background='#444444', foreground='#dddddd')
-        self.tree.tag_configure('normal_row', background=RULE_COLORS["DEFAULT"], foreground="#cccccc")
-
-        # ================== 【基础抽取改写区域】提取带参数据生成器 ==================
-
-    def _precompute_data(self, orders):
-        t_strict = self.ref_time - timedelta(hours=24)
-        t_loose = self.ref_time - timedelta(hours=24 + self.time_ext)
-
-        def compute_mode(mode):
-            max_score = -1
-            scan_limit = min(len(orders), 100)
-
-            best_evts_for_suppress = []
-
-            for k in range(scan_limit):
-                sub = orders[k:]
-                if mode == "normal":
-                    evts_k, _ = calculate_achievements_normal(sub, ALL_RULES, self.time_ext, self.limit_configs,
-                                                              self.ref_time)
-                else:
-                    evts_k, _ = calculate_achievements_complex(sub, ALL_RULES, self.time_ext, self.limit_configs,
-                                                               self.ref_time)
-
-                score_k = sum(e['rule'].get('reward', 0) * e['sets'] for e in evts_k if e['type'] == 'achieved')
-
-                if score_k > max_score:
-                    max_score = score_k
-                    best_evts_for_suppress = evts_k
-                elif max_score == -1 and k == 0:
-                    max_score = score_k
-                    best_evts_for_suppress = evts_k
-
-            suppress_map = {}
-            if mode == "normal":
-                for e in best_evts_for_suppress:
-                    if e['type'] == 'achieved':
-                        p = e['rule']['priority']
-                        for o in e['data']['orders']:
-                            oid = str(o['oid'])
-                            if oid not in suppress_map or p < suppress_map[oid]:
-                                suppress_map[oid] = p
-
-            rows = []
-            inserts_s, inserts_l = False, False
-            has_10 = False
-
-            for i, row in enumerate(orders):
-                sep = None
-                if not inserts_l and row['time_obj'] > t_loose:
-                    sep = ("-" * 20, f"--- 24H + {self.time_ext}H Tolerance ---", "-", "")
-                    inserts_l = True
-                if not inserts_s and row['time_obj'] > t_strict:
-                    if sep: rows.append({'sep': True, 'val': sep})
-                    sep = ("-" * 20, "--- 24H Strict Limit (10+1) ---", "-", "")
-                    inserts_s = True
-                if sep: rows.append({'sep': True, 'val': sep})
-
-                sub = orders[i:]
-                if mode == "normal":
-                    evts, _ = calculate_achievements_normal(sub, ALL_RULES, self.time_ext, self.limit_configs,
-                                                            self.ref_time)
-                    special_log_text = ""
-                else:
-                    debug_lines = []
-                    evts, _ = calculate_achievements_complex(sub, ALL_RULES, self.time_ext, self.limit_configs,
-                                                             self.ref_time, debug_trace=debug_lines)
-                    special_log_text = "\n".join(debug_lines)
-
-                oid_disp = f"{row['oid']} | {row['amt']}"
-                is_marked = str(row.get('is_marked', '否')).strip()
-                perf_owner = str(row.get('perf_owner', '')).strip()
-                free_evt = str(row.get('free_event', '否')).strip()
-                extra_tags = []
-                if is_marked not in ['否', 'nan', '', 'None', 'NO']:
-                    if perf_owner and perf_owner not in ['nan', 'None', '']:
-                        extra_tags.append(perf_owner)
-                    else:
-                        extra_tags.append("绩效✔")
-                if free_evt not in ['否', 'nan', '', 'None', 'NO']: extra_tags.append(free_evt)
-                if extra_tags: oid_disp += f" [{'|'.join(extra_tags)}]"
-
-                sc = sum(e['rule'].get('reward', 0) * e['sets'] for e in evts if e['type'] == 'achieved')
-                row_sum = generate_summary_grouped(evts, mode, self.ref_time, str(row.get('oid')), suppress_map)
-
-                rows.append({
-                    'sep': False,
-                    'val': (row['time_str'], oid_disp, row_sum, str(sc) if sc else ""),
-                    'evt': evts,
-                    'oid': str(row.get('oid', f"idx_{i}")),
-                    'special_log': special_log_text
-                })
-
-                if mode == 'special' and not has_10:
-                    if any(e['type'] == 'contact' and e['rule']['name'] == '10+1' for e in evts): has_10 = True
-
-            return rows, max_score, has_10
-
-        n_data, sc_norm, _ = compute_mode("normal")
-        s_data, sc_spec, h10 = compute_mode("special")
-
-        return {'normal': n_data, 'special': s_data}, sc_spec - sc_norm, "10+1 Contact" if h10 else ""
-
-    def _precompute_all(self):
-        # 缓存最原始数据及生成最初底图计算
-        self.original_orders = self.p_data['orders_list']
-        self.default_precalc_data, self.default_opt_diff_val, self.default_opt_10_info = self._precompute_data(
-            self.original_orders)
-
-        self.precalc_data = self.default_precalc_data
-        self.opt_diff_val = self.default_opt_diff_val
-        self.opt_10_info = self.default_opt_10_info
-
-        self.btn_mode.config(state=tk.NORMAL)
-        self._update_button_style()
-
-        # ================== 【新增功能区域】过滤方法 ==================
-
-    def filter_owner(self, keep_10_1=False):
-        filtered_orders = []
-        for row in self.original_orders:
-            perf_owner = str(row.get('perf_owner', '')).strip()
-            has_owner = perf_owner and perf_owner not in ['nan', 'None', '']
-            is_marked = is_marked_performance(row)
-            free_event_val = str(row.get('free_event', '')).strip()
-
-            # 判断是否是需要被剔除的"已标记归属人"的订单
-            if is_marked or has_owner:
-                # 如果开启了"保留10+1"模式，且该订单正好是"24小时内买10送1"，则免于剔除
-                if keep_10_1 and "24小时内买10送1" in free_event_val:
-                    pass  # 放行保留
-                else:
-                    continue  # 正式剔除
-            filtered_orders.append(row)
-        self._apply_new_orders(filtered_orders)
-
-    def filter_free_event(self, keep_10_1=False):
-        filtered_orders = []
-        for row in self.original_orders:
-            is_free = is_free_event_pack(row)
-            free_event_val = str(row.get('free_event', '')).strip()
-
-            # 判断是否是免费包订单
-            if is_free:
-                # 如果开启了"保留10+1"模式，且该订单正好是"24小时内买10送1"，则免于剔除
-                if keep_10_1 and "24小时内买10送1" in free_event_val:
-                    pass  # 放行保留
-                else:
-                    continue  # 正式剔除
-            filtered_orders.append(row)
-        self._apply_new_orders(filtered_orders)
-
-    def reset_filter(self):
-        self.precalc_data = self.default_precalc_data
-        self.opt_diff_val = self.default_opt_diff_val
-        self.opt_10_info = self.default_opt_10_info
-
-        # 刷新视图并清理卡片防残影
-        self._refresh_view()
-        self.f_ach_cards.clear()
-        self.f_con_cards.clear()
-        for w in self.frm_manual_stats.winfo_children(): w.destroy()
-        self._update_button_style()
-
-    def _apply_new_orders(self, modified_orders):
-        # 执行实时过滤计算并更新
-        self.precalc_data, self.opt_diff_val, self.opt_10_info = self._precompute_data(modified_orders)
-        self._refresh_view()
-        self.f_ach_cards.clear()
-        self.f_con_cards.clear()
-        for w in self.frm_manual_stats.winfo_children(): w.destroy()
-        self._update_button_style()
-
-        # ==========================================================
-
-    def _refresh_view(self):
-        self.tree.delete(*self.tree.get_children())
-        self.cache_view = {}
-        self.cache_special_log = {}
-        self.iid_to_oid = {};
-        self.oid_to_iid = {}
-
-        data = self.precalc_data[self.calc_mode]
-        for item in data:
-            if item['sep']:
-                self.tree.insert("", tk.END, values=item['val'], tags=('separator',))
-            else:
-                iid = self.tree.insert("", tk.END, values=item['val'], tags=('normal_row',))
-                self.cache_view[iid] = item['evt']
-                self.cache_special_log[iid] = item.get('special_log', "")
-                self.iid_to_oid[iid] = item['oid']
-                self.oid_to_iid[item['oid']] = iid
-
-    def show_special_log(self):
-        sel = self.tree.selection()
-        if not sel:
-            messagebox.showinfo("Hint", "请先选中一行再查看日志")
-            return
-        iid = sel[0]
-        if self.calc_mode != "special":
-            messagebox.showinfo("Hint", "请先切换到“特殊计算”模式后再查看")
-            return
-
-        text = self.cache_special_log.get(iid, "").strip()
-        if not text:
-            text = "当前行没有最终生效的借单结果。"
-
-        self.txt.delete("1.0", tk.END)
-        self.txt.insert("1.0", text)
-        self.nb_cards.select(2)
-
-    def toggle_mode(self):
-        self.calc_mode = "special" if self.calc_mode == "normal" else "normal"
-        self._update_button_style()
-        self._refresh_view()
-
-    def _update_button_style(self):
-        if self.calc_mode == "normal":
-            if self.opt_diff_val > 0:
-                self.btn_mode.configure(text=f"🚀 推荐: 特殊模式 (收益 +{self.opt_diff_val})", bootstyle="success")
-            elif self.opt_10_info:
-                self.btn_mode.configure(text=f"✨ 特殊: {self.opt_10_info} (收益 +{self.opt_diff_val})",
-                                        bootstyle="info")
-            else:
-                self.btn_mode.configure(text="切换: 特殊计算 (优先10+1)", bootstyle="info-outline")
+                self._send_json(200, {"terms": [], "error": msg})
         else:
-            self.btn_mode.configure(text="切换: 普通计算 (Standard)", bootstyle="secondary-outline")
+            self.send_error(404)
 
-    def _update_stats_display(self, selection_only=False):
-        for w in self.frm_manual_stats.winfo_children(): w.destroy()
 
-        def extract_price(val_str):
-            try:
-                price_part = val_str.split('|')[1]
-                return float(re.search(r"(\d+\.?\d*)", price_part).group(1))
-            except:
-                return 0.0
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
+class _Server(http.server.HTTPServer):
+    allow_reuse_address = True
 
-        sel = self.tree.selection()
-        sel_total = 0.0
-        if sel:
-            for iid in sel:
-                if 'separator' in self.tree.item(iid, "tags"): continue
-                val_str = self.tree.item(iid, 'values')[1]
-                sel_total += extract_price(val_str)
 
-        mark_sums = {}
-        for child in self.tree.get_children():
-            tags = self.tree.item(child, "tags")
-            for t in tags:
-                if t.startswith('manual_mark_'):
-                    parts = t.split('_')
-                    if len(parts) > 2:
-                        color = parts[2]
-                        val_str = self.tree.item(child, 'values')[1]
-                        amt = extract_price(val_str)
-                        mark_sums[color] = mark_sums.get(color, 0) + amt
+if __name__ == "__main__":
+    # Kill any process still holding the port
+    subprocess.run(f"lsof -ti:{PORT} | xargs kill -9 2>/dev/null; true",
+                   shell=True, check=False)
+    time.sleep(0.3)
 
-        if sel_total > 0:
-            self._create_stats_canvas(f"Selection: ${sel_total:.2f}", "white")
+    server = _Server(("127.0.0.1", PORT), Handler)
+    print(f"Crowdin Checker  →  http://localhost:{PORT}")
+    print(f"Glossary: {os.path.join(SCRIPT_DIR, GLOSSARY_FILE)}")
+    print("Press Ctrl+C to stop.\n")
 
-        for color, total in mark_sums.items():
-            self._create_stats_canvas(f"${total:.2f}", color)
+    def _open_browser():
+        time.sleep(0.7)
+        webbrowser.open(f"http://localhost:{PORT}")
 
-    def _create_stats_canvas(self, text, color):
-        w = len(text) * 10
-        cvs = tk.Canvas(self.frm_manual_stats, width=w, height=24, highlightthickness=0, bg="#2b2b2b")
-        cvs.pack(side=tk.LEFT, padx=5)
-        cvs.create_text(w / 2, 12, text=text, fill=color, font=("Helvetica", 10, "bold"))
+    threading.Thread(target=_open_browser, daemon=True).start()
 
-    def clear_manual_marks(self):
-        for item in self.tree.get_children():
-            tags = list(self.tree.item(item, "tags"))
-            self.tree.item(item, tags=tuple([t for t in tags if not t.startswith('manual_mark')] or ['normal_row']))
-        self._update_stats_display(False)
-
-    def mark_selection_logic(self, mode):
-        sel = self.tree.selection()
-        if not sel: return
-        color = colorchooser.askcolor(parent=self)[1]
-        if not color: return
-        tag = f"manual_mark_{color}_{datetime.now().timestamp()}"
-        if IS_MACOS:
-            # macOS 手动标记同样用文字色，保持可见性
-            self.tree.tag_configure(tag, foreground=color, background=RULE_COLORS["DEFAULT"])
-        else:
-            self.tree.tag_configure(tag, background=color, foreground="white")
-        indices = [self.tree.index(i) for i in sel]
-        for i in range(min(indices), max(indices) + 1):
-            iid = self.tree.get_children()[i]
-            if 'separator' in self.tree.item(iid, "tags"): continue
-            val = self.tree.item(iid, 'values')[1]
-            if mode == "99" and "99.99" not in val: continue
-            tags = list(self.tree.item(iid, "tags"))
-            if 'normal_row' in tags: tags.remove('normal_row')
-            tags = [t for t in tags if not t.startswith('manual_mark')];
-            tags.append(tag)
-            self.tree.item(iid, tags=tuple(tags))
-        self._update_stats_display(False)
-
-    def on_select(self, event):
-        sel = self.tree.selection()
-        self._update_stats_display(selection_only=True)
-        if not sel: return
-        iid = sel[0]
-        if iid not in self.cache_view: return
-        self.txt.delete("1.0", tk.END)
-        if self.calc_mode == "special":
-            log_text = self.cache_special_log.get(iid, "").strip()
-            if log_text:
-                self.txt.insert("1.0", log_text)
-            else:
-                self.txt.insert("1.0", "当前行没有最终生效的借单结果。")
-        else:
-            self.txt.insert("1.0", "当前是普通计算模式，切到“特殊计算”后可查看借单日志。")
-
-        for child in self.tree.get_children():
-            tags = list(self.tree.item(child, "tags"))
-            keep = [t for t in tags if t.startswith('separator') or t.startswith('manual_mark')]
-            self.tree.item(child, tags=tuple(keep or ['normal_row']))
-
-        self.f_ach_cards.clear();
-        self.f_con_cards.clear();
-
-        try:
-            raw_events = self.cache_view.get(iid, [])
-            events = [e for e in raw_events if isinstance(e, dict) and 'type' in e and 'rule' in e and 'data' in e]
-            events = sorted(events, key=lambda x: (0 if x.get('type') == 'achieved' else 1, x.get('rule', {}).get('priority', 999)))
-
-            b_cons = {}
-            has_contact = False
-
-            for e in events:
-                if e.get('type') == 'achieved':
-                    txt = format_event_text_full(e)
-                    oids = [str(o.get('oid', '')) for o in e.get('data', {}).get('orders', [])]
-                    self.f_ach_cards.add_card(e.get('rule', {}).get('name', 'ACH'), txt, "success", oids)
-
-                    for o in e.get('data', {}).get('orders', []):
-                        tgt = self.oid_to_iid.get(str(o.get('oid', '')))
-                        if tgt:
-                            ct = list(self.tree.item(tgt, "tags"))
-                            if any(t.startswith('manual_mark') for t in ct): continue
-                            if 'normal_row' in ct: ct.remove('normal_row')
-                            rn = e.get('rule', {}).get('name')
-                            if rn and rn not in ct: ct.append(rn)
-                            self.tree.item(tgt, tags=tuple(ct))
-
-                elif e.get('type') == 'contact':
-                    deadline = e.get('data', {}).get('deadline')
-                    if not deadline or deadline <= self.ref_time:
-                        continue
-                    rn = e.get('rule', {}).get('name')
-                    if rn and (rn not in b_cons or e.get('miss', 9999) < b_cons[rn].get('miss', 9999)):
-                        b_cons[rn] = e
-                    has_contact = True
-
-            for r_name, e in b_cons.items():
-                t_key = "contact_count" if e.get('rule', {}).get('type') == 'count' else "contact_sum"
-                strict_deadline = e['data']['start_t'] + timedelta(hours=e['rule']['hours'])
-                msg = tmpl_mgr.render(t_key, bonus_name=r_name, reward=e['rule'].get('reward'), miss=e.get('miss', 0),
-                                      deadline=str(strict_deadline).split('.')[0])
-                oids = [str(o.get('oid', '')) for o in e.get('data', {}).get('orders', [])]
-                self.f_con_cards.add_card(r_name, msg, "warning", oids, template_text=msg)
-
-            if has_contact:
-                self.nb_cards.select(1)
-            else:
-                self.nb_cards.select(0)
-        except Exception as ex:
-            self.txt.delete("1.0", tk.END)
-            self.txt.insert("1.0", f"渲染异常: {ex}")
-            self.nb_cards.select(2)
-
-            # ================= 6. 主程序 (修改版) =================
-
-
-class PromoAnalyzerApp:
-    def __init__(self):
-        self.root = ttk.Window(title="黑道英文业绩计算器V8.0", themename="darkly")
-        self.root.geometry("1450x980")
-        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-
-        self.df_raw = None
-        self.results_cache = {2: [], 3: [], 4: [], 5: []}
-
-        self.current_ref_time = None
-        self.tree_views = []
-        self.limit_entries = {}
-        self.time_ext_val = 3.0
-
-        self.selected_days = tk.IntVar(value=3)
-        self.days_options = [2, 3, 4, 5]
-
-        # 全局保存打勾的玩家唯一键(优先real_id)的记忆本
-        self.checked_pids = set()
-
-        self._customize_styles()
-        self._init_ui()
-
-    def on_close(self):
-        if messagebox.askyesno("Exit", "Are you sure you want to quit?"): self.root.destroy()
-
-    def _customize_styles(self):
-        style = ttk.Style()
-        style.configure("Treeview", rowheight=30)
-        style.configure("TNotebook.Tab", font=("Helvetica", 10, "bold"))
-        style.configure("Day.TButton", font=("Helvetica", 10, "bold"))
-
-    def _init_ui(self):
-        main_container = ttk.Frame(self.root)
-        main_container.pack(fill=tk.X, padx=15, pady=10)
-
-        # Row 1
-        row1 = ttk.Frame(main_container)
-        row1.pack(fill=tk.X, pady=5)
-        ttk.Button(row1, text="📁 导入 Excel", bootstyle="warning-outline", command=self.load_file).pack(side=tk.LEFT)
-        ttk.Button(row1, text="📝 编辑话术", bootstyle="secondary-outline", command=self.open_template_editor).pack(
-            side=tk.LEFT, padx=10)
-
-        ttk.Label(row1, text="超时宽限(H):").pack(side=tk.LEFT, padx=(20, 0))
-        self.entry_time_ext = ttk.Entry(row1, width=5);
-        self.entry_time_ext.insert(0, "3");
-        self.entry_time_ext.pack(side=tk.LEFT, padx=5)
-
-        f_rules = ttk.Frame(row1);
-        f_rules.pack(side=tk.LEFT, padx=20)
-        for rule in ALL_RULES:
-            ttk.Label(f_rules, text=f"{rule['name']}:").pack(side=tk.LEFT, padx=(5, 0))
-            e = ttk.Entry(f_rules, width=4);
-            e.insert(0, str(rule.get('default_min_reached', 0)));
-            e.pack(side=tk.LEFT)
-            self.limit_entries[rule['name']] = e
-
-            # Row 2
-        row2 = ttk.Frame(main_container)
-        row2.pack(fill=tk.X, pady=10)
-
-        f_days = ttk.Labelframe(row2, text=" Data Range (Days) ", bootstyle="info")
-        f_days.pack(side=tk.LEFT, fill=tk.Y, padx=(0, 15))
-
-        for d in self.days_options:
-            rb = ttk.Radiobutton(
-                f_days,
-                text=f" {d} Days ",
-                variable=self.selected_days,
-                value=d,
-                bootstyle="info-toolbutton",
-                command=self.refresh_current_view
-            )
-            rb.pack(side=tk.LEFT, padx=2, pady=5, ipady=3)
-
-        f_filter = ttk.Labelframe(row2, text=" ID Filter (One per line) ", bootstyle="secondary")
-        f_filter.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        self.txt_filter = ScrolledText(f_filter, height=3, width=50, font=("Consolas", 9))
-        self.txt_filter.pack(side=tk.LEFT, fill=tk.BOTH, expand=True, padx=5, pady=5)
-
-        f_filter_btns = ttk.Frame(f_filter)
-        f_filter_btns.pack(side=tk.LEFT, fill=tk.Y, padx=5, pady=5)
-
-        ttk.Button(f_filter_btns, text="Apply Filter", bootstyle="secondary-outline",
-                   command=self.refresh_current_view).pack(fill=tk.X, pady=2)
-        ttk.Button(f_filter_btns, text="Clear Filter", bootstyle="danger-outline", command=self.clear_filter).pack(
-            fill=tk.X, pady=2)
-
-        # Row 3
-        row3 = ttk.Frame(main_container)
-        row3.pack(fill=tk.X, pady=5)
-        ttk.Button(row3, text="⚡ 开始计算 (Calc All Days)", bootstyle="warning", command=self.run_analysis).pack(
-            side=tk.LEFT)
-        self.lbl_status = ttk.Label(row3, text="READY");
-        self.lbl_status.pack(side=tk.LEFT, padx=20)
-        self.progress = ttk.Progressbar(row3, length=300, mode="determinate", bootstyle="warning-striped");
-        self.progress.pack(side=tk.LEFT)
-        ttk.Button(row3, text="🔍 单人详情", command=self.open_single_check).pack(side=tk.RIGHT)
-
-        # List Area
-        self.paned = ttk.Panedwindow(self.root, orient=tk.VERTICAL);
-        self.paned.pack(fill=tk.BOTH, expand=True, padx=15)
-        self.nb_list = ttk.Notebook(self.paned);
-        self.paned.add(self.nb_list, weight=1)
-        self.tree_all = self._add_tree(self.nb_list, " ALL PLAYERS ")
-        self.tree_achieved = self._add_tree(self.nb_list, " ✅ ACHIEVED ")
-        self.tree_contact = self._add_tree(self.nb_list, " 📞 CONTACT ")
-        self.tree_views = [self.tree_all, self.tree_achieved, self.tree_contact]
-
-        self.nb_cards = ttk.Notebook(self.paned, bootstyle="warning");
-        self.paned.add(self.nb_cards, weight=2)
-        self.f_ach_cards = SafeScrollableFrame(self.nb_cards);
-        self.nb_cards.add(self.f_ach_cards, text=" ACHIEVED ")
-        self.f_con_cards = SafeScrollableFrame(self.nb_cards);
-        self.nb_cards.add(self.f_con_cards, text=" CONTACT ")
-
-    def _add_tree(self, nb, text):
-        f = ttk.Frame(nb);
-        nb.add(f, text=text)
-        cols = ("check", "pid", "real_id", "server", "total", "summary", "mark_ratio")
-        t = ttk.Treeview(f, columns=cols, show="headings")
-        t.column("check", width=40, anchor="center");
-        t.heading("check", text="✔")
-        t.column("pid", width=150, anchor="center");
-        t.heading("pid", text="玩家昵称")
-        t.column("real_id", width=110, anchor="center");
-        t.heading("real_id", text="Player_id")
-        t.column("server", width=80, anchor="center");
-        t.heading("server", text="Server")
-        t.column("total", width=100, anchor="center");
-        t.heading("total", text="Total($)")
-        t.column("summary", width=540, anchor="w");
-        t.heading("summary", text="SUMMARY")
-        t.column("mark_ratio", width=420, anchor="w")
-        t.heading("mark_ratio", text="标记占比详情")
-
-        sc = ttk.Scrollbar(f, command=t.yview);
-        t.configure(yscrollcommand=sc.set)
-        t.pack(side=tk.LEFT, fill=tk.BOTH, expand=True);
-        sc.pack(side=tk.RIGHT, fill=tk.Y)
-        t.bind("<<TreeviewSelect>>", self.on_player_select)
-        t.bind("<Button-1>", self.on_tree_click)
-        t.bind("<Double-1>", self.open_single_check)
-
-        def _copy_tr(e):
-            sel = t.selection()
-            if sel: val = t.item(sel[0], 'values'); self.root.clipboard_clear(); self.root.clipboard_append(str(val[2]))
-            show_copy_toast("COPIED", "Player ID Copied")
-
-        t.bind("<Control-c>", _copy_tr)
-        return t
-
-    def on_tree_click(self, event):
-        tree = event.widget
-        col_id = tree.identify_column(event.x)
-        if col_id == "#1":
-            row_id = tree.identify_row(event.y)
-            if row_id:
-                vals = list(tree.item(row_id, "values"))
-                new_state = "☑" if vals[0] == "☐" else "☐"
-                vals[0] = new_state
-                player_key = vals[2]
-
-                # 把状态记入内存。勾选就加入，取消就移除
-                if new_state == "☑":
-                    self.checked_pids.add(player_key)
-                else:
-                    self.checked_pids.discard(player_key)
-
-                for t in self.tree_views:
-                    for child in t.get_children():
-                        if str(t.item(child, 'values')[2]) == player_key:
-                            v = list(t.item(child, 'values'))
-                            v[0] = new_state
-                            tags = ('processed',) if new_state == "☑" else ()
-                            t.item(child, values=v, tags=tags)
-
-    def _normalize_player_id(self, x):
-        s = str(x).strip()
-        if not s or s in ['nan', 'None', 'NaN', 'NAN']:
-            return ""
-        s = s.replace(" ", "").replace("\u3000", "")
-        if s.endswith('.0'):
-            s = s[:-2]
-        # 统一纯数字ID格式，避免 123 / 123.0 / 00123 等格式差异导致过滤失效
-        if re.fullmatch(r"[+-]?\d+(\.0+)?", s):
-            try:
-                s = str(int(float(s)))
-            except:
-                pass
-        return s
-
-    def _normalize_pack_name(self, val):
-        s = str(val).strip().lower()
-        if not s or s in ['nan', 'none']:
-            return ""
-        s = re.sub(r'[\s\-_]+', '', s)
-        s = re.sub(r'[^a-z0-9\u4e00-\u9fff]', '', s)
-        return s
-
-    def _is_noname_pack(self, val):
-        normalized = self._normalize_pack_name(val)
-        if not normalized:
-            return False
-        # 兼容“9000006-No Name Pack”等带前缀编号的礼包名
-        return "nonamepack" in normalized
-
-    def _detect_pack_name_columns(self, columns):
-        cand = []
-        for col in columns:
-            col_str = str(col).strip().lower()
-            # 兼容中文“礼包名称”及常见英文字段名
-            if ('礼包' in col_str and '名' in col_str) or \
-                    (('pack' in col_str or 'gift' in col_str) and 'name' in col_str):
-                cand.append(col)
-        return cand
-
-    def load_internal_player_ids(self):
-        bp = get_app_path();
-        fp = os.path.join(bp, "内玩ID.xlsx")
-        if not os.path.exists(fp):
-            return set(), None
-        try:
-            df = pd.read_excel(fp) if fp.endswith('.xlsx') else pd.read_excel(fp)
-            ids = set()
-            for x in df.iloc[:, 0]:
-                nid = self._normalize_player_id(x)
-                if nid:
-                    ids.add(nid)
-            return ids, None
-        except Exception as e:
-            return set(), f"读取内玩ID文件失败: {e}"
-
-    def load_file(self):
-        fp = filedialog.askopenfilename(filetypes=[("Data", "*.csv *.xlsx")])
-        if not fp: return
-        self.root.config(cursor="watch");
-        self.root.update()
-        try:
-            df = pd.read_excel(fp) if fp.endswith('.xlsx') else pd.read_csv(fp, encoding='gbk')
-            df.rename(columns=lambda x: x.strip(), inplace=True)
-            rev_map = {v: k for k, v in COLUMN_MAPPING_CONFIG.items()}
-            df.rename(columns=rev_map, inplace=True)
-            if 'real_id' in df.columns:
-                df['real_id'] = df['real_id'].apply(self._normalize_player_id)
-            before_cnt = len(df)
-            removed_cnt = 0
-            noname_removed_cnt = 0
-            internals, internal_err = self.load_internal_player_ids()
-            if internal_err:
-                messagebox.showwarning("内玩ID读取失败", internal_err)
-            if internals and 'real_id' in df.columns:
-                df = df[~df['real_id'].isin(internals)]
-                removed_cnt = before_cnt - len(df)
-            pack_cols = self._detect_pack_name_columns(df.columns)
-            if pack_cols:
-                no_name_mask = pd.Series(False, index=df.index)
-                for c in pack_cols:
-                    no_name_mask = no_name_mask | df[c].apply(self._is_noname_pack)
-                noname_removed_cnt = int(no_name_mask.sum())
-                if noname_removed_cnt > 0:
-                    df = df[~no_name_mask]
-            if 'time' in df.columns: df['time'] = pd.to_datetime(df['time'])
-            if 'real_id' in df.columns:
-                df.sort_values(by=['real_id', 'time'], inplace=True)
-            else:
-                df.sort_values(by=['pid', 'time'], inplace=True)
-            self.df_raw = df
-            self.lbl_status.config(
-                text=f"LOADED {len(df)} ROWS | 内玩ID剔除 {removed_cnt} 条 | NoNamePack剔除 {noname_removed_cnt} 条"
-            )
-        except Exception as e:
-            messagebox.showerror("Error", str(e))
-        finally:
-            self.root.config(cursor="")
-
-    def get_filter_ids(self):
-        raw = self.txt_filter.get("1.0", tk.END).strip()
-        if not raw: return None
-        raw = raw.replace(',', '\n').replace('，', '\n')
-        return set(line.strip() for line in raw.split('\n') if line.strip())
-
-    def clear_filter(self):
-        self.txt_filter.delete("1.0", tk.END)
-        self.refresh_current_view()
-
-    def run_analysis(self):
-        if self.df_raw is None: return
-        try:
-            self.time_ext_val = float(self.entry_time_ext.get())
-            self.limit_config_map = {k: int(v.get()) for k, v in self.limit_entries.items()}
-        except:
-            return
-
-        self.root.config(cursor="watch")
-        self.current_ref_time = datetime.utcnow()
-        t_str = self.current_ref_time.strftime("%Y-%m-%d %H:%M:%S")
-
-        df = self.df_raw.to_dict('records')
-        for r in df: r['time_obj'] = r['time']; r['time_str'] = str(r['time'])
-        def build_player_key(row):
-            rid = str(row.get('real_id', '')).strip()
-            if rid and rid not in ['nan', 'None', '']:
-                return rid
-            return f"PID::{str(row.get('pid', '')).strip()}"
-
-        grouped_raw = {}
-        for row in df:
-            k = build_player_key(row)
-            if k not in grouped_raw:
-                grouped_raw[k] = []
-            grouped_raw[k].append(row)
-
-        self.results_cache = {2: [], 3: [], 4: [], 5: []}
-        total_steps = len(grouped_raw) * len(self.days_options)
-        current_step = 0
-
-        for days_lookback in self.days_options:
-            target_date = self.current_ref_time - timedelta(days=(days_lookback - 1))
-            cutoff_time = target_date.replace(hour=0, minute=0, second=0, microsecond=0)
-
-            day_results = []
-            for player_key, all_orders in grouped_raw.items():
-                filtered_orders = [o for o in all_orders if o['time_obj'] >= cutoff_time]
-
-                if not filtered_orders:
-                    current_step += 1
-                    continue
-
-                if current_step % 100 == 0:
-                    self.progress['value'] = (current_step / total_steps) * 100
-                    self.root.update()
-
-                total_amt = sum(o['amt'] for o in filtered_orders)
-
-                # 使用 find_best_scenario 寻找最优起点
-                evts = find_best_scenario(filtered_orders, ALL_RULES, self.time_ext_val, self.limit_config_map,
-                                          self.current_ref_time)
-
-                has_achieved = any(e['type'] == 'achieved' for e in evts)
-                active_contacts = [e for e in evts if
-                                   e['type'] == 'contact' and e['data']['deadline'] > self.current_ref_time]
-                has_active_contact = len(active_contacts) > 0
-
-                if not has_achieved and not has_active_contact:
-                    current_step += 1
-                    continue
-
-                summary = generate_summary_grouped(evts, calc_mode="normal", ref_time=self.current_ref_time)
-                mark_ratio = build_mark_ratio_text(evts)
-
-                min_ddl = datetime.max
-                if has_active_contact:
-                    for e in active_contacts:
-                        if e['data']['deadline'] < min_ddl: min_ddl = e['data']['deadline']
-
-                # 昵称展示：按时间顺序汇总，显示“当前昵称 + 曾用昵称”
-                nick_history = []
-                for o in all_orders:
-                    n = str(o.get('pid', '')).strip()
-                    if n and n not in nick_history:
-                        nick_history.append(n)
-                current_nick = nick_history[-1] if nick_history else str(filtered_orders[-1].get('pid', ''))
-                old_nicks = [n for n in nick_history if n != current_nick]
-                if old_nicks:
-                    pid_display = f"{current_nick} (曾用: {', '.join(old_nicks)})"
-                else:
-                    pid_display = current_nick
-
-                res_obj = {
-                    'player_key': player_key,
-                    'pid': pid_display,
-                    'real_id': filtered_orders[0].get('real_id'),
-                    'server': filtered_orders[0].get('server'),
-                    'total_amt': total_amt,
-                    'orders_list': filtered_orders, 'events': evts, 'summary': summary,
-                    'mark_ratio': mark_ratio,
-                    'has_achieved': has_achieved, 'has_contact': has_active_contact, 'min_ddl': min_ddl
-                }
-                day_results.append(res_obj)
-                current_step += 1
-
-            day_results.sort(key=lambda x: (0 if x['has_contact'] else 1, x['min_ddl']))
-            self.results_cache[days_lookback] = day_results
-
-        self.lbl_status.config(text=f"DONE @ {t_str} (UTC)")
-        self.root.config(cursor="")
-        self.refresh_current_view()
-
-    def refresh_current_view(self):
-        for t in self.tree_views: t.delete(*t.get_children())
-        self.f_ach_cards.clear()
-        self.f_con_cards.clear()
-
-        days = self.selected_days.get()
-        filter_ids = self.get_filter_ids()
-
-        data_source = self.results_cache.get(days, [])
-        if not data_source: return
-
-        count_shown = 0
-        for r in data_source:
-            if filter_ids:
-                rid = str(r.get('real_id', ''))
-                if rid not in filter_ids:
-                    continue
-
-            pid = r['pid']
-            player_key = str(r.get('player_key', r.get('real_id', '')))
-            amt_str = f"{r['total_amt']:.2f}"
-            mark_ratio = r.get('mark_ratio', '')
-
-            # 勾选记忆使用唯一键，避免昵称变更后状态丢失
-            is_checked = player_key in self.checked_pids
-            check_state = "☑" if is_checked else "☐"
-            tags = ('processed',) if is_checked else ()
-
-            vals = (check_state, pid, player_key, r['server'], amt_str, r['summary'], mark_ratio)
-
-            self.tree_all.insert("", "end", values=vals, tags=tags)
-            if r['has_achieved']: self.tree_achieved.insert("", "end", values=vals, tags=tags)
-            if r['has_contact']: self.tree_contact.insert("", "end", values=vals, tags=tags)
-            count_shown += 1
-
-        self.lbl_status.config(text=f"Showing {days} Days | {count_shown} Players")
-
-    def on_player_select(self, event):
-        sel = event.widget.selection()
-        if not sel: return
-        try:
-            player_key = str(event.widget.item(sel[0], 'values')[2])
-        except:
-            return
-
-        current_data = self.results_cache.get(self.selected_days.get(), [])
-        data = next((item for item in current_data if str(item.get('player_key')) == player_key), None)
-        if not data: return
-
-        self.f_ach_cards.clear();
-        self.f_con_cards.clear()
-        best_contacts = {};
-        has_contact = False
-        for e in data['events']:
-            if e['type'] == 'achieved':
-                txt = format_event_text_full(e)
-                oids = [str(o['oid']) for o in e['data']['orders']]
-                self.f_ach_cards.add_card(e['rule']['name'], txt, "success", oids)
-            elif e['type'] == 'contact':
-                if e['data']['deadline'] <= self.current_ref_time: continue
-                rn = e['rule']['name']
-                if rn not in best_contacts or e['miss'] < best_contacts[rn]['miss']: best_contacts[rn] = e
-                has_contact = True
-        for r_name, e in best_contacts.items():
-            t_key = "contact_count" if e['rule']['type'] == 'count' else "contact_sum"
-
-            # --- 核心修改开始 ---
-            # 同样应用：重新计算严格截止时间
-            strict_deadline = e['data']['start_t'] + timedelta(hours=e['rule']['hours'])
-
-            msg = tmpl_mgr.render(t_key, bonus_name=r_name, reward=e['rule'].get('reward'), miss=e['miss'],
-                                  deadline=str(strict_deadline).split('.')[0])
-            # --- 核心修改结束 ---
-
-            oids = [str(o['oid']) for o in e['data']['orders']]
-            self.f_con_cards.add_card(r_name, msg, "warning", oids, template_text=msg)
-        if has_contact:
-            self.nb_cards.select(1)
-        else:
-            self.nb_cards.select(0)
-
-    def open_single_check(self, event=None):
-        try:
-            if event:
-                widget = event.widget
-            else:
-                tab_id = self.nb_list.select()
-                tab_frame = self.nb_list.nametowidget(tab_id)
-                widget = None
-                for child in tab_frame.winfo_children():
-                    if isinstance(child, ttk.Treeview):
-                        widget = child
-                        break
-
-            if not widget: return
-            sel = widget.selection()
-            if not sel:
-                messagebox.showinfo("Hint", "Select a player first")
-                return
-
-            player_key = str(widget.item(sel[0], 'values')[2])
-            current_data = self.results_cache.get(self.selected_days.get(), [])
-            player_data = next((item for item in current_data if str(item.get('player_key')) == player_key), None)
-
-            if player_data:
-                SinglePlayerCheck(self.root, player_data, self.time_ext_val, self.limit_config_map,
-                                  self.current_ref_time)
-        except Exception as e:
-            print(e)
-            pass
-
-    def open_template_editor(self):
-        TemplateEditorWindow(self.root)
-
-    def main_loop(self):
-        self.root.mainloop()
-
-
-if __name__ == "__main__": app = PromoAnalyzerApp(); app.main_loop()
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nServer stopped.")
