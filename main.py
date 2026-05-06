@@ -1,1027 +1,946 @@
-import sys
-import numpy as np
-import tkinter as tk
-from tkinter import filedialog, messagebox, ttk
-from PIL import Image, ImageDraw, ImageFont, ImageTk, ImageChops, ImageFilter
 import os
-import platform
+import re
+import traceback
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import pandas as pd
+from datetime import timedelta, datetime
+import calendar
 
-try:
-    from tkinterdnd2 import TkinterDnD, DND_FILES
-except ImportError:
-    messagebox.showerror("缺少组件", "请在终端执行: pip install tkinterdnd2")
-    exit()
+# -------------------- 配置项（默认值，可在GUI中改） --------------------
+DEFAULT_MID_FILTER = '16388'         # MID 预设（可逗号分隔多个）
+DEFAULT_REST_THRESHOLD_HOURS = 6.0   # 休息判定阈值（> 此小时数算一次停止）
+DEFAULT_REPORT_THRESHOLD_HOURS = 18.0 # 报告阈值（最长不间断 >= 此小时数则加黄底）
 
-TEMPLATE_CONFIGS = {
-    "template_E6.png": {
-        "style": "E6_Classic",
-        "photo": {"size": 405, "x": 92, "y": 122},
-        # 主景横光辉（⑨）与昵称坐标解耦；默认与旧版「昵称默认位置」视觉对齐
-        "glow": {"x": 0, "y": 514},
-        "fields": {
-            "name": {"label": "✎ 玩家名称 (Name):", "size": 28, "x": 0, "y": 502,
-                     "color": "#FAD355", "stroke": "#111111"}
-        }
-    },
-    "template_E7.png": {
-        "style": "E7_Italic",
-        "photo": {"size": 240, "x": 417, "y": 90},
-        "fields": {
-            "name": {"label": "✎ 玩家昵称 (Name):", "size": 26, "x": -6, "y": 311,
-                     "color": "#FFFFFF", "stroke": "#111111"},
-            "city": {"label": "⌂ 玩家城市 (City):", "size": 23, "x": -6, "y": 351,
-                     "color": "#FAD355", "stroke": "#111111"}
-        }
-    }
-}
+YELLOW_HL = '#FFF59D'   # 主结果高亮颜色（柔和黄）
+GREEN_DAY = '#C8E6C9'   # 列筛选面板绿色提示底色（已选择）
 
-C0 = "#0D0D0D"
-C1 = "#161616"
-C2 = "#222222"
-C3 = "#333333"
-CG = "#D4AF37"
-CT = "#E6C27A"
-CW = "#E0E0E0"
+# -------------------- 工具函数 --------------------
+def normalize_col(col: str) -> str:
+    if not isinstance(col, str):
+        col = str(col)
+    return (col.lower()
+                .replace('（', '')
+                .replace('）', '')
+                .replace('(', '')
+                .replace(')', '')
+                .replace('_', '')
+                .replace(' ', ''))
 
-
-class App:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("宣传图制作工作台 V2.2")
-        self.root.geometry("1400x850")
-        self.root.configure(bg=C0)
-        self.app_dir = self._ap()
-        self.queue = []
-        self.cur = None
-        self.final = None
-        self.fc = {}
-        self.sfonts = self._sf()
-        self.fld = {}
-        self._rp = None
-        self._ri = None
-        self._tn = None
-        self.ti = None
-        self.pi = None
-        self.sc = 1.0
-        self.vx = self.vy = 0
-        self.dsx = self.dsy = self.dbx = self.dby = 0
-        self.psx = self.psy = self.bvx = self.bvy = 0
-        self.tki = None
-        self.cid = None
-        self._f1 = True
-        self._rj = None
-        self.drag_mode = None
-        self.handle_size = 14
-        self.resize_handle = None
-
-        st = ttk.Style()
-        st.theme_use('clam')
-        st.configure("TCombobox", fieldbackground=C3, background=C2,
-                     foreground=CG, arrowcolor=CG, bordercolor=C2)
-        st.map("TCombobox", fieldbackground=[("readonly", C3)],
-               selectbackground=[("readonly", CG)], selectforeground=[("readonly", "black")],
-               foreground=[("readonly", CG)])
-        for k, v in [('background', C3), ('foreground', CG),
-                     ('selectBackground', CG), ('selectForeground', 'black')]:
-            self.root.option_add(f'*TCombobox*Listbox.{k}', v)
-
-        self._ui()
-        self._st()
-        self._dnd()
-
-    @staticmethod
-    def _ap():
-        if getattr(sys, 'frozen', False):
-            exe_dir = os.path.dirname(sys.executable)
-            internal_dir = os.path.join(exe_dir, "_internal")
-            if os.path.isdir(internal_dir):
-                return internal_dir
-            return exe_dir
-        return os.path.dirname(os.path.abspath(__file__))
-
-    def _ui(self):
-        L = tk.Frame(self.root, bg=C1, width=420)
-        L.pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=10)
-        L.pack_propagate(False)
-        tk.Label(L, text="⚜️ 核心工作台", fg=CG, bg=C1,
-                 font=("Microsoft YaHei UI", 18, "bold")).pack(pady=(15, 10))
-
-        b1 = tk.LabelFrame(L, text=" 模板与录入 ", bg=C2, fg=CG,
-                           font=("Microsoft YaHei UI", 11, "bold"), bd=1)
-        b1.pack(fill=tk.X, padx=10, pady=5)
-        self.cmb = ttk.Combobox(b1, state="readonly", font=("Arial", 12, "bold"))
-        self.cmb.pack(fill=tk.X, padx=15, pady=(15, 10))
-        self.cmb.bind("<<ComboboxSelected>>", self._tc)
-        tk.Button(b1, text="[ 点击多选 / 拖入图片 ]\n建立批量排队", command=self._sel,
-                  bg="#2B2B2B", fg=CT, activebackground=CG, activeforeground="black",
-                  font=("Microsoft YaHei UI", 10), height=2, relief="groove"
-                  ).pack(fill=tk.X, padx=15, pady=(5, 10))
-        self.lq = tk.Label(b1, text="[队列空闲]", fg="#888", bg=C2,
-                           font=("Microsoft YaHei UI", 9))
-        self.lq.pack(pady=(0, 10))
-
-        b2 = tk.LabelFrame(L, text=" 空间参数 ", bg=C2, fg=CG,
-                           font=("Microsoft YaHei UI", 10), bd=1)
-        b2.pack(fill=tk.X, padx=10, pady=5)
-        fp = tk.Frame(b2, bg=C2)
-        fp.pack(pady=10)
-
-        def mks(p, t, lo, hi, c):
-            tk.Label(p, text=t, bg=C2, fg=CW,
-                     font=("Microsoft YaHei", 9)).grid(row=0, column=c * 2, padx=(5, 0))
-            s = tk.Spinbox(p, from_=lo, to=hi, width=5, bg=C3, fg=CG,
-                           insertbackground=CG, buttonbackground=C2)
-            s.grid(row=0, column=c * 2 + 1, padx=2)
-            return s
-
-        self.ssz = mks(fp, "宽:", 10, 8000, 0)
-        self.sx = mks(fp, "X:", -4000, 4000, 1)
-        self.sy = mks(fp, "Y:", -4000, 4000, 2)
-        self.ssz.config(command=self._full)
-        self.ssz.bind("<Return>", lambda e: self._full())
-        self.sx.config(command=self._fast)
-        self.sx.bind("<Return>", lambda e: self._fast())
-        self.sy.config(command=self._fast)
-        self.sy.bind("<Return>", lambda e: self._fast())
-
-        b3 = tk.LabelFrame(L, text=" 🌟 光效 ", bg=C2, fg=CG,
-                           font=("Microsoft YaHei UI", 10), bd=1)
-        b3.pack(fill=tk.X, padx=10, pady=5)
-
-        def mksc(par, txt, lo, hi, val):
-            f = tk.Frame(par, bg=C2)
-            f.pack(fill=tk.X, padx=10, pady=4)
-            tk.Label(f, text=txt, bg=C2, fg=CW,
-                     font=("Microsoft YaHei", 9)).pack(side=tk.LEFT)
-            s = tk.Scale(f, from_=lo, to=hi, orient=tk.HORIZONTAL, bg=C2, fg=CG,
-                         bd=0, highlightthickness=0, troughcolor=C3,
-                         activebackground=CG, command=lambda v: self._fast())
-            s.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10)
-            s.set(val)
-            return s
-
-        self.sli = mksc(b3, "光线强度:", 0, 100, 80)
-        self.sfl = mksc(b3, "横光偏移:", -200, 200, 23)
-
-        # E6 专用：主景横光辉位置（与昵称「左右/上下」独立）
-        self.fglow = tk.Frame(b3, bg=C2)
-
-        def mkg(p, t, lo, hi):
-            tk.Label(p, text=t, bg=C2, fg=CW,
-                     font=("Microsoft YaHei", 9)).pack(side=tk.LEFT)
-            s = tk.Spinbox(p, from_=lo, to=hi, width=6, bg=C3, fg=CG,
-                           insertbackground=CG, buttonbackground=C2,
-                           command=self._fast)
-            s.pack(side=tk.LEFT, padx=8)
-            s.bind("<Return>", lambda e: self._fast())
-            return s
-
-        gf = tk.Frame(self.fglow, bg=C2)
-        gf.pack(fill=tk.X, padx=10, pady=4)
-        self.sgx = mkg(gf, "横光左右:", -2000, 2000)
-        self.sgy = mkg(gf, "横光上下:", -500, 2500)
-
-        self.btxt = tk.LabelFrame(L, text=" 文字编辑 ", bg=C2, fg=CG,
-                                  font=("Microsoft YaHei UI", 10), bd=1)
-        self.btxt.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
-
-        bf = tk.Frame(L, bg=C1)
-        bf.pack(fill=tk.X, padx=10, pady=15, side=tk.BOTTOM)
-        tk.Button(bf, text="⟳ 刷新", command=self._full, bg="#222", fg=CW,
-                  relief="groove").pack(fill=tk.X, pady=(0, 10))
-        self.bsv = tk.Button(bf, text="✦ 渲染输出 ✦", command=self._save, bg=CG,
-                             fg="black", activebackground="#FFE47A", activeforeground="black",
-                             font=("Microsoft YaHei UI", 13, "bold"), height=2,
-                             state="disabled", cursor="hand2")
-        self.bsv.pack(fill=tk.X)
-
-        R = tk.LabelFrame(self.root,
-                          text=" 🖥️ [滚轮缩放视图] [Ctrl+滚轮细调大小] [拖边角缩放] [左键拖位置] [右键平移] ",
-                          bg=C0, fg=CG, font=("Microsoft YaHei UI", 11, "bold"), bd=1)
-        R.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(0, 10), pady=10)
-        self.cv = tk.Canvas(R, bg="#080808", highlightthickness=0, cursor="tcross")
-        self.cv.pack(fill=tk.BOTH, expand=True)
-        self.cv.create_text(400, 300, text="等待图像…", fill="#444",
-                            font=("Microsoft YaHei", 16))
-        for ev, fn in [("<MouseWheel>", self._zm), ("<Button-4>", self._zm),
-                       ("<Button-5>", self._zm), ("<Control-MouseWheel>", self._czm),
-                       ("<Control-Button-4>", self._czm), ("<Control-Button-5>", self._czm),
-                       ("<ButtonPress-1>", self._ds), ("<B1-Motion>", self._dm),
-                       ("<ButtonRelease-1>", self._de),
-                       ("<ButtonPress-3>", self._ps), ("<B3-Motion>", self._pm),
-                       ("<ButtonPress-2>", self._ps), ("<B2-Motion>", self._pm),
-                       ("<Control-ButtonPress-1>", self._ps), ("<Control-B1-Motion>", self._pm)]:
-            self.cv.bind(ev, fn)
-
-    def _dnd(self):
-        try:
-            self.root.drop_target_register(DND_FILES)
-            self.root.dnd_bind('<<Drop>>',
-                               lambda e: self._aq(self.root.tk.splitlist(e.data)))
-        except:
-            pass
-
-    def _sel(self):
-        p = filedialog.askopenfilenames(
-            title="选择照片", filetypes=[("Images", "*.png *.jpg *.jpeg *.webp")])
-        if p:
-            self._aq(p)
-
-    def _aq(self, paths):
-        v = [p for p in paths
-             if str(p).lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))]
-        if not v:
-            return
-        self.queue.extend(v)
-        if not self.cur:
-            self._nx()
+def standardize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    mapping = {}
+    for c in df.columns:
+        n = normalize_col(c)
+        if 'playerid' in n or ('玩家' in n and 'id' in n):
+            mapping[c] = 'player_id'
+        elif 'playername' in n or '玩家昵称' in n or '玩家名' in n:
+            mapping[c] = 'player_name'
+        elif n == 'mid':
+            mapping[c] = 'mid'
+        elif 'createdat' in n or 'createat' in n or '时间' in n:
+            mapping[c] = 'created_at'
+        elif 'server' in n or '服务器id' in n or '服务器' in n:
+            mapping[c] = 'server'
         else:
-            self._uq()
+            mapping[c] = c
+    df = df.rename(columns=mapping)
+    return df
 
-    def _nx(self):
-        if not self.queue:
-            self.cur = None
-            self.lq.config(text="✅ 完成", fg="#2ECC71")
-            self.bsv.config(state="disabled", text="✦ 输出 ✦")
-            return
-        self.cur = self.queue.pop(0)
-        self._uq()
-        self._full()
+def parse_datetime(series: pd.Series) -> pd.Series:
+    s = pd.to_datetime(series, errors='coerce')
+    if s.notna().sum() < max(1, int(0.3 * len(s))):
+        s = pd.to_datetime(series, errors='coerce', dayfirst=False)
+    return s
 
-    def _uq(self):
-        nm = os.path.basename(self.cur)
-        r = len(self.queue)
-        if r > 0:
-            self.lq.config(text=f"▶ {nm} | ⏳{r}张", fg=CT)
-            self.bsv.config(text=f"✦ 保存并下一张({r}) ✦")
-        else:
-            self.lq.config(text=f"▶ {nm} | 🏁最后", fg=CG)
-            self.bsv.config(text="✦ 保存终图 ✦")
-
-    def _save(self):
-        if not self.final or not self.cur:
-            return
-        try:
-            d = os.path.dirname(self.cur)
-            n = os.path.splitext(os.path.basename(self.cur))[0]
-            tpl = self.cmb.get().lower()
-            pfx = "E7出图" if "e7" in tpl else "E6出图"
-            self.final.save(
-                os.path.join(d, f"{pfx}-{n}.png"),
-                format="PNG",
-                optimize=False,
-                compress_level=0
-            )
-            self._nx()
-            if not self.queue and not self.cur:
-                messagebox.showinfo("收工", "🎉 全部完成！")
-        except Exception as e:
-            messagebox.showerror("异常", str(e))
-
-    def _st(self):
-        vl = []
-        try:
-            for f in os.listdir(self.app_dir):
-                lo = f.lower()
-                if "template_e6" in lo and lo.endswith(('.png', '.jpg')):
-                    vl.append(f)
-                    TEMPLATE_CONFIGS[f] = TEMPLATE_CONFIGS["template_E6.png"]
-                elif "template_e7" in lo and lo.endswith(('.png', '.jpg')):
-                    vl.append(f)
-                    TEMPLATE_CONFIGS[f] = TEMPLATE_CONFIGS["template_E7.png"]
-        except:
-            pass
-        if vl:
-            self.cmb['values'] = vl
-            self.cmb.current(0)
-            self._tc()
-        else:
-            messagebox.showwarning("警告", "没找到模板！")
-
-    def _tc(self, ev=None):
-        cfg = TEMPLATE_CONFIGS.get(self.cmb.get())
-        if not cfg:
-            return
-        for s, k in [(self.ssz, "size"), (self.sx, "x"), (self.sy, "y")]:
-            s.delete(0, 'end')
-            s.insert(0, cfg["photo"][k])
-        gv = cfg.get("glow", {"x": 0, "y": 514})
-        self.sgx.delete(0, 'end')
-        self.sgx.insert(0, str(gv.get("x", 0)))
-        self.sgy.delete(0, 'end')
-        self.sgy.insert(0, str(gv.get("y", 514)))
-        if cfg.get("style") == "E6_Classic":
-            self.fglow.pack(fill=tk.X, padx=0, pady=0)
-        else:
-            self.fglow.pack_forget()
-        self.vx = self.vy = 0
-        for w in self.btxt.winfo_children():
-            w.destroy()
-        self.fld.clear()
-        for fk, fv in cfg["fields"].items():
-            g = tk.Frame(self.btxt, bg=C2)
-            g.pack(fill=tk.X, padx=10, pady=(8, 0))
-            tk.Label(g, text=fv["label"], fg=CT, bg=C2,
-                     font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
-            ent = tk.Entry(g, font=("Trebuchet MS", 12), justify="center",
-                           bg=C3, fg=CG, insertbackground=CG, bd=0)
-            ent.pack(fill=tk.X, ipady=4, pady=2)
-            ent.bind("<KeyRelease>", lambda e: self._fast())
-            fc = tk.Frame(g, bg=C2)
-            fc.pack(fill=tk.X, pady=2)
-
-            def mk(p, t, a, b):
-                tk.Label(p, text=t, bg=C2, fg=CW,
-                         font=("Microsoft YaHei", 8)).pack(side=tk.LEFT, padx=(5, 0))
-                s = tk.Spinbox(p, from_=a, to=b, width=4, bg=C3, fg=CG,
-                               buttonbackground=C2, command=self._fast)
-                s.pack(side=tk.LEFT, padx=2)
-                s.bind("<Return>", lambda e: self._fast())
-                return s
-
-            ss = mk(fc, "字号:", 10, 400)
-            ss.delete(0, 'end')
-            ss.insert(0, fv["size"])
-            sxx = mk(fc, "左右:", -1000, 1000)
-            sxx.delete(0, 'end')
-            sxx.insert(0, fv["x"])
-            syy = mk(fc, "上下:", -500, 2000)
-            syy.delete(0, 'end')
-            syy.insert(0, fv["y"])
-            self.fld[fk] = {"e": ent, "ss": ss, "sx": sxx, "sy": syy,
-                            "c": fv["color"], "s": fv["stroke"]}
-        if self.cur:
-            self._full()
-
-            # ═══ 画布交互 ═══
-
-    def _zm(self, e):
-        if not self.final or e.state & 0x0004:
-            return
-        self.sc *= 1.15 if (e.delta > 0 or e.num == 4) else 1 / 1.15
-        self._disp()
-
-    def _czm(self, e):
-        if not self.final:
-            return
-        try:
-            c = int(self.ssz.get())
-            fine = max(1, min(8, int(round(c * 0.01))))
-            coarse = max(5, min(30, int(round(c * 0.03))))
-            step = coarse if e.state & 0x0001 else fine
-            d = getattr(e, 'delta', 0)
-            if e.num == 4 or d > 0:
-                n = c + step
-            elif e.num == 5 or d < 0:
-                n = c - step
-            else:
-                return
-            self.ssz.delete(0, 'end')
-            self.ssz.insert(0, str(max(10, min(n, 8000))))
-            self._full()
-        except:
-            pass
-
-    def _ds(self, e):
-        if not self.final:
-            return
-        self.drag_mode = "move"
-        self.dsx = e.x
-        self.dsy = e.y
-        try:
-            self.dbx = int(self.sx.get())
-            self.dby = int(self.sy.get())
-            self.resize_handle = self._hit_resize_handle(e.x, e.y)
-            if self.resize_handle:
-                self.drag_mode = "resize"
-                self.dbw = int(self.ssz.get())
-        except:
-            pass
-
-    def _dm(self, e):
-        if not self.final:
-            return
-        if self.drag_mode == "resize":
-            self._drag_resize(e)
-            return
-        self.sx.delete(0, 'end')
-        self.sx.insert(0, int(self.dbx + (e.x - self.dsx) / self.sc))
-        self.sy.delete(0, 'end')
-        self.sy.insert(0, int(self.dby + (e.y - self.dsy) / self.sc))
-        self._fast()
-
-    def _ps(self, e):
-        if not self.final:
-            return
-        self.psx = e.x
-        self.psy = e.y
-        self.bvx = self.vx
-        self.bvy = self.vy
-
-    def _de(self, e):
-        self.drag_mode = None
-        self.resize_handle = None
-
-    def _pm(self, e):
-        if not self.final or not self.cid:
-            return
-        self.vx = self.bvx + (e.x - self.psx)
-        self.vy = self.bvy + (e.y - self.psy)
-        self._disp()
-
-    def _photo_bounds(self):
-        if not self.final or not self.pi:
-            return None
-        w, h = self.final.size
-        nw = max(10, int(w * self.sc))
-        nh = max(10, int(h * self.sc))
-        cx = self.cv.winfo_width() / 2 + self.vx
-        cy = self.cv.winfo_height() / 2 + self.vy
-        bx = cx - nw / 2 + int(self.sx.get()) * self.sc
-        by = cy - nh / 2 + int(self.sy.get()) * self.sc
-        bw = self.pi.size[0] * self.sc
-        bh = self.pi.size[1] * self.sc
-        return bx, by, bw, bh
-
-    def _hit_resize_handle(self, x, y):
-        bounds = self._photo_bounds()
-        if not bounds:
-            return None
-        bx, by, bw, bh = bounds
-        hs = self.handle_size
-        mx = bx + bw / 2
-        my = by + bh / 2
-        hit_boxes = {
-            "nw": (bx - hs, by - hs, bx + hs, by + hs),
-            "n": (mx - hs, by - hs, mx + hs, by + hs),
-            "ne": (bx + bw - hs, by - hs, bx + bw + hs, by + hs),
-            "e": (bx + bw - hs, my - hs, bx + bw + hs, my + hs),
-            "se": (bx + bw - hs, by + bh - hs, bx + bw + hs, by + bh + hs),
-            "s": (mx - hs, by + bh - hs, mx + hs, by + bh + hs),
-            "sw": (bx - hs, by + bh - hs, bx + hs, by + bh + hs),
-            "w": (bx - hs, my - hs, bx + hs, my + hs),
-        }
-        for name, (x1, y1, x2, y2) in hit_boxes.items():
-            if x1 <= x <= x2 and y1 <= y <= y2:
-                return name
-        return None
-
-    def _drag_resize(self, e):
-        bounds = self._photo_bounds()
-        if not bounds or not self._ri:
-            return
-        bx, by, bw, bh = bounds
-        ow, oh = self._ri.size
-        if ow <= 0 or oh <= 0 or self.sc == 0 or not self.resize_handle:
-            return
-        ratio = oh / float(ow)
-        right = bx + bw
-        bottom = by + bh
-        width_candidates = []
-        if "e" in self.resize_handle:
-            width_candidates.append((e.x - bx) / self.sc)
-        if "w" in self.resize_handle:
-            width_candidates.append((right - e.x) / self.sc)
-        if "n" in self.resize_handle:
-            width_candidates.append(((bottom - e.y) / self.sc) / ratio)
-        if "s" in self.resize_handle:
-            width_candidates.append(((e.y - by) / self.sc) / ratio)
-        if not width_candidates:
-            return
-        new_width = max(10, min(8000, int(round(max(width_candidates)))))
-        old_width = max(1, self.dbw)
-        old_height = max(1, int(round(old_width * ratio)))
-        new_height = max(1, int(round(new_width * ratio)))
-        new_x = self.dbx
-        new_y = self.dby
-        if "w" in self.resize_handle:
-            new_x = self.dbx + (old_width - new_width)
-        if "n" in self.resize_handle:
-            new_y = self.dby + (old_height - new_height)
-        self.ssz.delete(0, 'end')
-        self.ssz.insert(0, str(new_width))
-        self.sx.delete(0, 'end')
-        self.sx.insert(0, str(new_x))
-        self.sy.delete(0, 'end')
-        self.sy.insert(0, str(new_y))
-        self._full()
-
-        # ═══ 字体 ═══
-
-    def _sf(self):
-        sys_name = platform.system().lower()
-        if sys_name == "windows":
-            fd = "C:\\Windows\\Fonts"
-            names = ["seguiemj.ttf", "seguisym.ttf", "impact.ttf", "arialbd.ttf",
-                     "msyhbd.ttc", "tahomabd.ttf", "tahoma.ttf", "arial.ttf",
-                     "msyh.ttc", "simsun.ttc"]
-        elif sys_name == "darwin":
-            fd = "/System/Library/Fonts"
-            names = [
-                "PingFang.ttc", "Helvetica.ttc", "HelveticaNeue.ttc",
-                "Arial.ttf", "Arial Bold.ttf", "Hiragino Sans GB.ttc",
-                "STHeiti Medium.ttc", "Apple Color Emoji.ttc"
-            ]
-        else:
-            fd = "/usr/share/fonts"
-            names = [
-                "NotoSansCJK-Regular.ttc", "NotoSansCJK-Bold.ttc",
-                "DejaVuSans.ttf", "LiberationSans-Regular.ttf"
-            ]
-        pri = []
-        for n in names:
-            full = os.path.join(fd, n)
-            pri.append(full if os.path.exists(full) else n)
-        try:
-            extra_dirs = [fd]
-            if sys_name == "darwin":
-                extra_dirs.extend([
-                    "/Library/Fonts",
-                    os.path.expanduser("~/Library/Fonts")
-                ])
-            elif sys_name == "linux":
-                extra_dirs.extend([
-                    "/usr/local/share/fonts",
-                    os.path.expanduser("~/.fonts")
-                ])
-            ex = set(os.path.basename(p).lower() for p in pri)
-            ext = []
-            for d in extra_dirs:
-                if not os.path.isdir(d):
-                    continue
-                for f in os.listdir(d):
-                    lo = f.lower()
-                    if lo.endswith(('.ttf', '.ttc', '.otf')) and lo not in ex:
-                        ext.append(os.path.join(d, f))
-            return pri + ext
-        except:
-            return pri
-
-    def _gf(self, char, size):
-        ck = f"{char}_{size}"
-        if ck in self.fc:
-            return self.fc[ck]
-        fpk = f"__fp_{ord(char)}"
-        if fpk in self.fc:
+def read_one_file(path: str) -> pd.DataFrame:
+    ext = os.path.splitext(path)[1].lower()
+    if ext == '.csv':
+        for enc in ('utf-8-sig', 'utf-8', 'gb18030'):
             try:
-                f = ImageFont.truetype(self.fc[fpk], size)
-                self.fc[ck] = (f, char)
-                return f, char
-            except:
-                del self.fc[fpk]
-        for fp in self.sfonts:
-            try:
-                f = ImageFont.truetype(fp, size)
-                if f.getlength(char) <= 0:
-                    continue
-                if not self._fok(fp, char):
-                    continue
-                self.fc[ck] = (f, char)
-                self.fc[fpk] = fp
-                return f, char
-            except:
-                continue
-        return ImageFont.load_default(), char
-
-    def _fok(self, fp, char):
-        k = f"__ok_{fp}_{ord(char)}"
-        if k in self.fc:
-            return self.fc[k]
-        ok = False
-        try:
-            tf = ImageFont.truetype(fp, 20)
-            m1 = tf.getmask(char)
-            m2 = tf.getmask('\ufffe')
-            if m1.size != m2.size:
-                ok = m1.getbbox() is not None
-            else:
-                ok = (m1.tobytes() != m2.tobytes()) and (m1.getbbox() is not None)
-        except:
-            pass
-        self.fc[k] = ok
-        return ok
-
-        # ═══ 文字渲染引擎 ═══
-
-    def _dtxt(self, tgt, text, tw, th, sz, ox, yp, mc, sc_, sty):
-
-        # 极限 5 倍超采样抗锯齿 (SSAA)
-        SSA = 5
-        sz_s = sz * SSA
-
-        cd = []
-        totw_s = 0
-        for ch in text:
-            if ch.isspace():
-                w_s = sz_s * 0.4
-                cd.append((" ", None, w_s))
-                totw_s += w_s
-                continue
-            fn, fc = self._gf(ch, sz_s)
-            try:
-                w_s = fn.getlength(fc)
-            except:
-                w_s = sz_s * 0.8
-            cd.append((fc, fn, w_s))
-            totw_s += w_s
-
-        pad_s = int(sz_s * 2.5)
-        cw_s = int(totw_s + pad_s * 2)
-        cvh_s = int(sz_s * 4.5)
-        tx_s = pad_s
-        ty_s = sz_s
-        bw_s = max(1, int(sz_s * 0.045))
-
-        mt = Image.new("L", (cw_s, cvh_s), 0)
-        dt = ImageDraw.Draw(mt)
-        sw_s = max(2, int(sz_s * 0.07))
-        mo = Image.new("L", (cw_s, cvh_s), 0)
-        do = ImageDraw.Draw(mo)
-        gw_s = max(6, int(sz_s * 0.22))
-        mg = Image.new("L", (cw_s, cvh_s), 0)
-        dg_ = ImageDraw.Draw(mg)
-
-        # 极薄厚底设置 (使用超采样尺度)
-        dep_s = max(1, int(sz_s * 0.025))
-
-        ra = 0
-        for _, fn, _ in cd:
-            if fn:
-                ra = fn.getmetrics()[0]
-                break
-
-        cx_s = tx_s
-        for c, fn, w_s in cd:
-            if fn:
-                dy = ra - fn.getmetrics()[0]
-                dt.text((cx_s, ty_s + dy), c, font=fn, fill=255,
-                        stroke_width=bw_s, stroke_fill=255)
-                do.text((cx_s, ty_s + dy), c, font=fn, fill=255,
-                        stroke_width=sw_s + bw_s, stroke_fill=255)
-                dg_.text((cx_s, ty_s + dy), c, font=fn, fill=255,
-                         stroke_width=gw_s + bw_s, stroke_fill=255)
-            cx_s += w_s
-
-        gold = mc != "#FFFFFF"
-        up = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
-        is7 = sty == "E7_Italic"
-
-        if gold and not is7:
-            gr_s = max(3, int(sz_s * 0.18))
-            gb = mg.filter(ImageFilter.GaussianBlur(radius=gr_s))
-            gt = Image.new("RGBA", (cw_s, cvh_s), (255, 190, 60, 0))
-            ga = np.array(gb, dtype=np.float32) / 255.0
-            yt0 = max(0, ty_s - int(sz_s * 0.3))
-            yb0 = min(cvh_s - 1, ty_s + int(sz_s * 1.6))
-            vt = np.zeros(cvh_s, dtype=np.float32)
-            for y in range(cvh_s):
-                if y <= yt0:
-                    vt[y] = 0.02
-                elif y <= yb0:
-                    vt[y] = 0.02 + 0.98 * ((y - yt0) / max(1, yb0 - yt0))
-                else:
-                    vt[y] = 1.0
-            al = np.clip(ga * vt.reshape(-1, 1) * 0.8 * 255, 0, 255).astype(np.uint8)
-            gt.putalpha(Image.fromarray(al))
-            up.alpha_composite(gt)
-        elif not gold:
-            gr_s = max(3, int(sz_s * 0.18))
-            gb = mg.filter(ImageFilter.GaussianBlur(radius=gr_s))
-            gt = Image.new("RGBA", (cw_s, cvh_s), (180, 200, 255, 0))
-            gt.putalpha(gb.point(lambda p: min(255, int(p * 0.35))))
-            up.alpha_composite(gt)
-
-            # 👇 --- 修改点 7：为 E6 和 E7 重启统一的顶光阴影系统 --- 👇
-        m_full = mt.copy()
-        for i in range(1, dep_s + 1):
-            shifted = Image.new("L", (cw_s, cvh_s), 0)
-            shifted.paste(mt, (0, i))
-            m_full = ImageChops.lighter(m_full, shifted)
-
-        olw_s = max(1, int(sz_s * 0.025))
-        expanded = m_full.filter(ImageFilter.MaxFilter(olw_s * 2 + 1))
-
-        shifted_expanded = Image.new("L", (cw_s, cvh_s), 0)
-        shifted_expanded.paste(expanded, (0, olw_s + 1))
-
-        ring = ImageChops.subtract(shifted_expanded, m_full)
-        ring_soft = ring.filter(ImageFilter.GaussianBlur(2.5))
-
-        # 为金字和白字分别配制最合适的阴影颜色和透明度
-        if gold:
-            ring_soft = ring_soft.point(lambda p: int(p * 0.65))  # 金字用65%透明度
-            shadow_color = (20, 10, 0, 255)  # 暖暗褐色
-        else:
-            ring_soft = ring_soft.point(lambda p: int(p * 0.80))  # 白字需要更高透明度(80%)分离背景
-            shadow_color = (15, 15, 20, 255)  # 冷暗灰偏青色
-
-        ol_layer = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
-        ol_layer.paste(Image.new("RGBA", (cw_s, cvh_s), shadow_color), mask=ring_soft)
-        up.alpha_composite(ol_layer)
-        # 👆 ----------------------------------------------------------- 👆
-
-        # ③ 斜面厚度特效
-        bev_dep_s = max(2, dep_s // 2) if is7 else dep_s
-        for i in range(bev_dep_s, 0, -1):
-            t = i / max(1, bev_dep_s)
-            if gold:
-                r = int(230 * t + 185 * (1 - t))
-                g = int(180 * t + 145 * (1 - t))
-                b = int(45 * t + 15 * (1 - t))
-            else:
-                v = int(90 * t + 55 * (1 - t))
-                r, g, b = v, v, int(v * 1.1)
-            up.paste(Image.new("RGBA", (cw_s, cvh_s), (r, g, b, 255)),
-                     (0, i), mask=mt)
-
-            # ④ 渐变补色
-        if gold:
-            stops = [
-                (0.00, (255, 255, 245)),
-                (0.25, (255, 235, 120)),
-                (0.60, (220, 160, 20)),
-                (1.00, (110, 60, 0)),
-            ]
-        else:
-            stops = [
-                (0.00, (255, 255, 255)), (0.25, (238, 240, 248)),
-                (0.45, (175, 180, 200)), (0.55, (148, 152, 172)),
-                (0.75, (215, 220, 235)), (1.00, (248, 250, 255)),
-            ]
-
-        grd = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
-        gd = ImageDraw.Draw(grd)
-
-        bbox = mt.getbbox()
-        if bbox:
-            yt_s = bbox[1]
-            yb_s = bbox[3]
-        else:
-            yt_s = ty_s - int(sz_s * 0.08)
-            yb_s = ty_s + int(sz_s * 1.08)
-
-        sp_s = max(1, yb_s - yt_s)
-        for y in range(yt_s, yb_s + 1):
-            t = max(0.0, min(1.0, (y - yt_s) / sp_s))
-            lo, hi = stops[0], stops[-1]
-            for j in range(len(stops) - 1):
-                if stops[j][0] <= t <= stops[j + 1][0]:
-                    lo, hi = stops[j], stops[j + 1]
-                    break
-            f = (t - lo[0]) / max(0.0001, hi[0] - lo[0])
-            f = max(0.0, min(1.0, f))
-            f = f * f * (3 - 2 * f)
-            rgb = tuple(int(lo[1][c] + (hi[1][c] - lo[1][c]) * f) for c in range(3))
-            gd.line([(0, y), (cw_s, y)], fill=(*rgb, 255))
-
-        fc2 = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
-        fc2.paste(grd, mask=mt)
-        up.alpha_composite(fc2)
-
-        # ⑤ 高光点缀
-        si = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
-        sd = ImageDraw.Draw(si)
-        if gold:
-            cy2_s = ty_s + int(sz_s * 0.18)
-            cr_s = int(sz_s * 0.22)
-            for y in range(cy2_s - cr_s, cy2_s + cr_s):
-                d = abs(y - cy2_s) / max(1, cr_s)
-                a = int(140 * max(0, 1 - d ** 1.4))
-                if a > 0:
-                    sd.line([(0, y), (cw_s, y)], fill=(255, 255, 240, a))
-        else:
-            cy2_s = ty_s + int(sz_s * 0.2)
-            cr_s = int(sz_s * 0.18)
-            for y in range(cy2_s - cr_s, cy2_s + cr_s):
-                d = abs(y - cy2_s) / max(1, cr_s)
-                a = int(120 * max(0, 1 - d ** 1.5))
-                if a > 0:
-                    sd.line([(0, y), (cw_s, y)], fill=(255, 255, 255, a))
-        sf = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
-        sf.paste(si, mask=mt)
-        up.alpha_composite(sf)
-
-        # ⑥ 顶部微射反光
-        if gold:
-            eh = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
-            ed = ImageDraw.Draw(eh)
-            rim_s = max(2, int(sz_s * 0.1))
-            for y in range(yt_s, yt_s + rim_s):
-                a = int(130 * (1 - (y - yt_s) / max(1, rim_s)))
-                ed.line([(0, y), (cw_s, y)], fill=(255, 255, 248, a))
-            ef = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
-            ef.paste(eh, mask=mt)
-            up.alpha_composite(ef)
-
-            # ⑧ 斜体变形 (完美抗锯齿变形，阴影也会一起自然横斜！)
-        if is7:
-            stamp_s = up.transform((cw_s, cvh_s), Image.AFFINE,
-                                   (1, 0.22, -0.22 * (cvh_s / 2), 0, 1, 0),
-                                   resample=Image.Resampling.BICUBIC)
-        else:
-            stamp_s = up
-
-            # --- 降采样（消除所有锯齿并缩回到目标尺寸） ---
-        target_cw = int(cw_s / SSA)
-        target_cvh = int(cvh_s / SSA)
-        stamp = stamp_s.resize((target_cw, target_cvh), Image.Resampling.LANCZOS)
-
-        # 等比还原物理坐标系统
-        totw = totw_s / SSA
-        tx_ = tx_s / SSA
-        ty_ = ty_s / SSA
-
-        # ⑨ 主景横光辉（仅E6）（保持独立背景层）
-        if gold and not is7:
-            foff = int(self.sfl.get())
-            bwf, bhf = 520, 260
-            xg = np.linspace(-1, 1, bwf)
-            yg = np.linspace(-1, 1, bhf)
-            xx, yy = np.meshgrid(xg, yg)
-            core = np.exp(-(xx ** 2 / 0.01 + yy ** 2 / 0.008))
-            vs = np.maximum(0.0005, 0.014 * (1 - np.abs(xx) ** 1.6 * 0.88))
-            streak = np.exp(-(xx ** 2 / 3.5)) * np.exp(-(yy ** 2 / vs))
-            mid = np.exp(-(xx ** 2 / 0.25 + yy ** 2 / 0.018))
-            amb = np.exp(-(xx ** 2 / 0.08 + yy ** 2 / 0.035))
-            li = np.clip(core + streak * 0.65 + mid * 0.28 + amb * 0.18,
-                         0, 1).astype(np.float32)
-            rgba = np.zeros((bhf, bwf, 4), dtype=np.uint8)
-            rgba[..., 0] = np.minimum(255, 255 * li).astype(np.uint8)
-            rgba[..., 1] = np.minimum(255, 225 * li).astype(np.uint8)
-            rgba[..., 2] = np.minimum(255, 100 * li).astype(np.uint8)
-            rgba[..., 3] = np.minimum(255, 120 * li).astype(np.uint8)
-            fo = Image.fromarray(rgba, "RGBA")
-            ow2 = min(tw, int(totw * 5))
-            oh2 = int(sz * 3)
-            fo = fo.resize((ow2, oh2), Image.Resampling.BICUBIC)
-            try:
-                gx = int(self.sgx.get())
-                gy = int(self.sgy.get())
+                return pd.read_csv(path, encoding=enc)
             except Exception:
-                gx, gy = 0, 514
-            cxd = int(tw / 2 + gx) - ow2 // 2
-            cyd = gy + foff - oh2 // 2
-            bl = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
-            bl.paste(fo, (cxd, cyd))
-            tgt.alpha_composite(bl)
-
-        tgt.alpha_composite(stamp,
-                            dest=(int((tw - totw) / 2 + ox - tx_), int(yp - ty_)))
-
-        # ═══ 渲染管线 ═══
-
-    def _full(self):
-        if not self.cur:
-            return
+                continue
+        return pd.read_csv(path)
+    elif ext in ('.xlsx', '.xls'):
+        engine = 'openpyxl' if ext == '.xlsx' else None
         try:
-            self.root.update_idletasks()
-            tn = self.cmb.get()
-            rw = int(self.ssz.get())
-            if self._tn != tn:
-                self.ti = Image.open(os.path.join(self.app_dir, tn)).convert("RGBA")
-                self._tn = tn
-            if self._rp != self.cur:
-                self._ri = Image.open(self.cur).convert("RGBA")
-                self._rp = self.cur
-            ow, oh = self._ri.size
-            r = rw / float(ow) if ow > 0 else 1
-            self.pi = self._ri.resize((rw, max(1, int(oh * r))),
-                                      Image.Resampling.LANCZOS)
-            if self._f1:
-                self.sc = 0.6 if self.ti.size[0] > 800 else 1.0
-                self._f1 = False
-            self._do_render()
-            self.bsv.config(state="normal")
-        except:
+            with pd.ExcelFile(path, engine=engine) as xls:
+                sheet_names = xls.sheet_names
+                target_raw = '队列行动明细'
+                target = target_raw if target_raw in sheet_names else None
+                if target is None:
+                    def norm(s: str) -> str:
+                        return str(s).strip().replace(' ', '').replace('\u3000', '')
+                    norm_target = norm(target_raw)
+                    for s in sheet_names:
+                        if norm(s) == norm_target:
+                            target = s
+                            break
+                if target is None and sheet_names:
+                    target = sheet_names[0]
+                return pd.read_excel(xls, sheet_name=target)
+        except Exception:
+            try:
+                return pd.read_excel(path, sheet_name='队列行动明细', engine=engine)
+            except Exception:
+                try:
+                    return pd.read_excel(path, sheet_name=0, engine=engine)
+                except Exception:
+                    return pd.DataFrame()
+    else:
+        return pd.DataFrame()
+
+def parse_mid_list(mid_text: str) -> list:
+    if mid_text is None:
+        return []
+    s = str(mid_text).replace('，', ',')
+    return [t.strip() for t in s.split(',') if t.strip() != '']
+
+def filter_by_mids(df: pd.DataFrame, mids: list) -> pd.DataFrame:
+    if df.empty or 'mid' not in df.columns or not mids:
+        return pd.DataFrame()
+    mid_prefix = df['mid'].astype(str).str.split(':', n=1).str[0].str.strip()
+    return df.loc[mid_prefix.isin(set(mids))].copy()
+
+def analyze_player_sessions(group: pd.DataFrame, rest_hours: float, report_hours: float = None) -> dict:
+    g = group.sort_values('created_at').copy()
+    g = g.loc[g['created_at'].notna()]
+    if g.empty:
+        return {
+            'stop_count': 0,
+            'max_cont_hours': 0.0,
+            'max_session_start': pd.NaT,
+            'max_session_end': pd.NaT,
+            'rows': len(group),
+            'days_exceed': 0
+        }
+    diffs = g['created_at'].diff()
+    rest_threshold = pd.Timedelta(hours=rest_hours)
+    stops = diffs > rest_threshold
+    session_id = stops.cumsum()
+    g['session_id'] = session_id
+
+    agg = g.groupby('session_id')['created_at'].agg(['min', 'max'])
+    durations = (agg['max'] - agg['min'])
+    if durations.empty:
+        max_dur = pd.Timedelta(0)
+        max_idx = None
+    else:
+        max_idx = durations.idxmax()
+        max_dur = durations.loc[max_idx]
+
+    max_start = agg.loc[max_idx, 'min'] if max_idx is not None else pd.NaT
+    max_end = agg.loc[max_idx, 'max'] if max_idx is not None else pd.NaT
+    max_hours = max_dur.total_seconds() / 3600.0 if pd.notna(max_dur) else 0.0
+    stop_count = int(stops.fillna(False).sum())
+
+    # 以自然日统计：每天内的“最长不间断时长”是否 >= 报告阈值
+    days_exceed = 0
+    if report_hours is not None and not agg.empty:
+        threshold = pd.Timedelta(hours=report_hours)
+        day_max = {}
+        for _, row in agg.iterrows():
+            s_start = row['min']
+            s_end = row['max']
+            if pd.isna(s_start) or pd.isna(s_end) or s_end <= s_start:
+                continue
+            day = pd.Timestamp(s_start.date())
+            while day < s_end:
+                day_next = day + pd.Timedelta(days=1)
+                overlap_start = max(s_start, day)
+                overlap_end = min(s_end, day_next)
+                if overlap_end > overlap_start:
+                    dur = overlap_end - overlap_start
+                    dkey = overlap_start.date()
+                    if dur > day_max.get(dkey, pd.Timedelta(0)):
+                        day_max[dkey] = dur
+                day = day_next
+        days_exceed = sum(1 for _, v in day_max.items() if v >= threshold)
+
+    return {
+        'stop_count': stop_count,
+        'max_cont_hours': max_hours,
+        'max_session_start': max_start,
+        'max_session_end': max_end,
+        'rows': len(g),
+        'days_exceed': days_exceed
+    }
+
+def analyze(df: pd.DataFrame, mids: list, rest_hours: float, report_hours: float) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+
+    focus = filter_by_mids(df, mids)
+    if focus.empty:
+        return pd.DataFrame()
+
+    if 'player_id' not in focus.columns or 'created_at' not in focus.columns:
+        return pd.DataFrame()
+
+    records = []
+    def pick_one(s):
+        return s.dropna().iloc[0] if s.dropna().size else None
+
+    for pid, g in focus.groupby('player_id'):
+        stats = analyze_player_sessions(g, rest_hours, report_hours)
+        player_name = pick_one(g.get('player_name', pd.Series(dtype=object)))
+        server = pick_one(g.get('server', pd.Series(dtype=object)))
+        rec = {
+            'player_id': pid,
+            'player_name': player_name,
+            'server': server,
+            'stop_count': stats['stop_count'],
+            'max_cont_hours': round(stats['max_cont_hours'], 2),
+            'max_session_start': stats['max_session_start'],
+            'max_session_end': stats['max_session_end'],
+            'rows': stats['rows'],
+            'days_exceed': int(stats.get('days_exceed', 0)),
+        }
+        records.append(rec)
+
+    res = pd.DataFrame(records)
+    if res.empty:
+        return res
+
+    res['flagged'] = res['max_cont_hours'] >= report_hours
+    res = res.sort_values(['flagged', 'max_cont_hours', 'stop_count'],
+                          ascending=[False, False, True]).reset_index(drop=True)
+    return res
+
+# -------------------- GUI --------------------
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("资源商检索器")
+        self.geometry("1200x680")
+
+        self.style = ttk.Style(self)
+        try:
+            self.style.theme_use('clam')
+        except Exception:
             pass
+        self.style.map('Treeview',
+                       background=[('selected', '#4a90e2')],
+                       foreground=[('selected', 'white')])
 
-    def _fast(self):
-        if self._rj:
-            self.root.after_cancel(self._rj)
-        self._rj = self.root.after(30, self._do_render)
+        self.filepath = tk.StringVar()
+        self.mid_filter = tk.StringVar(value=DEFAULT_MID_FILTER)
+        self.rest_hours = tk.DoubleVar(value=DEFAULT_REST_THRESHOLD_HOURS)
+        self.report_hours = tk.DoubleVar(value=DEFAULT_REPORT_THRESHOLD_HOURS)
 
-    def _do_render(self):
-        self._rj = None
-        if not self.ti or not self.pi:
+        self.data_all = pd.DataFrame()
+        self.data_focus = pd.DataFrame()
+        self.result_df = pd.DataFrame()
+
+        self.create_widgets()
+
+    def create_widgets(self):
+        frm_top = ttk.Frame(self)
+        frm_top.pack(fill='x', padx=8, pady=8)
+
+        ttk.Label(frm_top, text="数据文件:").pack(side='left')
+        ttk.Entry(frm_top, textvariable=self.filepath, width=60).pack(side='left', padx=4)
+        ttk.Button(frm_top, text="浏览...", command=self.browse_file).pack(side='left', padx=4)
+        ttk.Button(frm_top, text="读取 + 分析", command=self.load_and_analyze).pack(side='left', padx=8)
+
+        frm_params = ttk.Frame(self)
+        frm_params.pack(fill='x', padx=8, pady=4)
+
+        ttk.Label(frm_params, text="MID筛选(逗号分隔):").pack(side='left')
+        ttk.Entry(frm_params, textvariable=self.mid_filter, width=24).pack(side='left', padx=4)
+
+        ttk.Label(frm_params, text="休息阈值(小时，>此值算停止):").pack(side='left', padx=(16,0))
+        ttk.Entry(frm_params, textvariable=self.rest_hours, width=6).pack(side='left', padx=4)
+
+        ttk.Label(frm_params, text="报告阈值(小时，>=此值黄底):").pack(side='left', padx=(16,0))
+        ttk.Entry(frm_params, textvariable=self.report_hours, width=6).pack(side='left', padx=4)
+
+        ttk.Button(frm_params, text="导出结果CSV", command=self.export_results).pack(side='right', padx=4)
+
+        cols = ('player_id', 'player_name', 'server', 'stop_count',
+                'max_cont_hours', 'days_exceed',
+                'max_session_start', 'max_session_end', 'rows')
+        self.tree = ttk.Treeview(self, columns=cols, show='headings', selectmode='extended')
+        headings = {
+            'player_id': '玩家ID',
+            'player_name': '玩家昵称',
+            'server': '服务器ID',
+            'stop_count': '停止次数(>阈值)',
+            'max_cont_hours': '最长不间断(小时)',
+            'days_exceed': '超阈天数(天)',
+            'max_session_start': '最长会话开始',
+            'max_session_end': '最长会话结束',
+            'rows': '记录数'
+        }
+        for c in cols:
+            self.tree.heading(c, text=headings.get(c, c))
+            width = 120
+            if c in ('player_name',):
+                width = 180
+            if c in ('max_session_start', 'max_session_end'):
+                width = 160
+            self.tree.column(c, width=width, anchor='center')
+
+        self.tree.tag_configure('flagged', background=YELLOW_HL)
+
+        vsb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscroll=vsb.set, xscroll=hsb.set)
+        self.tree.pack(fill='both', expand=True, padx=8, pady=(4,0))
+        vsb.pack(side='right', fill='y')
+        hsb.pack(side='bottom', fill='x')
+
+        self.tree.bind('<Double-1>', self.on_double_click_row)
+
+        frm_bottom = ttk.Frame(self)
+        frm_bottom.pack(fill='x', padx=8, pady=8)
+        ttk.Button(frm_bottom, text="查看选中玩家原始数据", command=self.view_selected_raw).pack(side='left')
+        ttk.Button(frm_bottom, text="复制标黄玩家ID", command=self.copy_flagged_ids).pack(side='right')
+
+    def browse_file(self):
+        f = filedialog.askopenfilename(
+            title="选择CSV或XLSX文件",
+            filetypes=[("数据文件", "*.csv *.xlsx *.xls"), ("CSV 文件", "*.csv"), ("Excel 文件", "*.xlsx *.xls")]
+        )
+        if f:
+            self.filepath.set(f)
+
+    def load_and_analyze(self):
+        path = self.filepath.get().strip()
+        if not path or not os.path.isfile(path):
+            messagebox.showwarning("提示", "请选择有效的文件。")
             return
         try:
-            px = int(self.sx.get())
-            py = int(self.sy.get())
-            tn = self.cmb.get()
-            ts = TEMPLATE_CONFIGS.get(
-                next((k for k in TEMPLATE_CONFIGS if k == tn), None), {}
-            ).get("style", "E6_Classic")
-            tw, th = self.ti.size
+            df = read_one_file(path)
+            if df.empty:
+                messagebox.showinfo("提示", "未读取到有效数据。请检查文件是否为CSV/XLSX，且包含列：mid、created_at、玩家ID。")
+                return
+            df = standardize_columns(df)
+            if 'created_at' in df.columns:
+                df['created_at'] = parse_datetime(df['created_at'])
+            self.data_all = df
 
-            pl = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
-            pl.paste(self.pi, (px, py))
+            mids = parse_mid_list(self.mid_filter.get().strip())
+            if not mids:
+                mids = parse_mid_list(DEFAULT_MID_FILTER)
 
-            lv = int(self.sli.get())
-            if lv > 0:
-                ins = lv / 100.0
-                rv, gv, bv, pa = pl.split()
-                rgb = Image.merge("RGB", (rv, gv, bv))
-                gt = Image.new("RGB", (tw, th), (255, 185, 50))
-                cg = Image.blend(rgb, ImageChops.multiply(rgb, gt),
-                                 0.35 * ins).convert("RGBA")
+            self.data_focus = filter_by_mids(self.data_all, mids)
+            if self.data_focus.empty:
+                messagebox.showinfo("提示", f"数据中没有所选 MID 的记录：{', '.join(mids)}")
+            self.result_df = analyze(self.data_all, mids, self.rest_hours.get(), self.report_hours.get())
+            self.refresh_tree()
+            total_players = len(self.result_df)
+            flagged_count = int(self.result_df['flagged'].sum()) if 'flagged' in self.result_df.columns else 0
+            messagebox.showinfo("完成", f"分析完成。玩家总数：{total_players}，达标(黄底)：{flagged_count}")
+        except Exception as e:
+            traceback.print_exc()
+            messagebox.showerror("错误", f"分析失败：\n{e}")
 
-                lw2, lh2 = 160, 160
-                md = (lw2 ** 2 + lh2 ** 2) ** 0.5
-                ms = ((lw2 / 2) ** 2 + lh2 ** 2) ** 0.5
-                yy, xx = np.mgrid[0:lh2, 0:lw2]
-                xx_f = xx.astype(np.float64)
-                yy_f = yy.astype(np.float64)
+    def refresh_tree(self):
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+        if self.result_df.empty:
+            return
+        for _, row in self.result_df.iterrows():
+            vals = [row.get(c, '') for c in self.tree['columns']]
+            vals_fmt = []
+            for c, v in zip(self.tree['columns'], vals):
+                if isinstance(v, pd.Timestamp):
+                    v = '' if pd.isna(v) else v.strftime('%Y-%m-%d %H:%M:%S')
+                try:
+                    is_nan = pd.isna(v) if hasattr(v, '__float__') else False
+                except Exception:
+                    is_nan = False
+                vals_fmt.append('' if is_nan else v)
+            tags = ('flagged',) if bool(row.get('flagged', False)) else ()
+            self.tree.insert('', 'end', values=vals_fmt, tags=tags)
 
-                dL = np.sqrt(xx_f ** 2 + yy_f ** 2)
-                pL = np.clip(1 - dL / (md * 0.85), 0, 1) ** 1.6
-                dR = np.sqrt((lw2 - xx_f) ** 2 + yy_f ** 2)
-                pR = np.clip(1 - dR / (md * 0.85), 0, 1) ** 1.6
-                tp = np.clip(pL + pR, 0, 1)
-                la = np.zeros((lh2, lw2, 4), dtype=np.uint8)
-                la[..., 0] = 255
-                la[..., 1] = 235
-                la[..., 2] = 150
-                la[..., 3] = np.minimum(255, (190 * tp * ins)).astype(np.uint8)
-                lb = Image.fromarray(la, "RGBA")
+    def get_selected_player_ids(self):
+        sels = self.tree.selection()
+        if not sels:
+            return []
+        pids = []
+        for iid in sels:
+            vals = self.tree.item(iid, 'values')
+            if vals:
+                pids.append(vals[0])
+        pids = [str(p).strip() for p in pids if str(p).strip() != '']
+        return list(dict.fromkeys(pids))
 
-                ds = np.sqrt((lw2 / 2 - xx_f) ** 2 + (lh2 - yy_f) ** 2)
-                sr = np.clip(1 - ds / (ms * 0.9), 0, 1)
-                sa = np.zeros((lh2, lw2, 4), dtype=np.uint8)
-                sa[..., 0] = 25
-                sa[..., 1] = 12
-                sa[..., 3] = np.minimum(255, (145 * sr ** 1.2 * ins)).astype(np.uint8)
-                sb = Image.fromarray(sa, "RGBA")
+    def on_double_click_row(self, event=None):
+        self.view_selected_raw()
 
-                lm = lb.resize((tw, th), Image.Resampling.BICUBIC)
-                sm = sb.resize((tw, th), Image.Resampling.BICUBIC)
-                lit = Image.alpha_composite(Image.alpha_composite(cg, sm), lm)
-                mem = Image.merge("RGBA", (*lit.split()[:3], pa))
+    def view_selected_raw(self):
+        pids = self.get_selected_player_ids()
+        if not pids:
+            messagebox.showinfo("提示", "请先在结果列表中选中一位或多位玩家。")
+            return
+        if self.data_focus.empty:
+            messagebox.showinfo("提示", "没有可展示的原始数据。")
+            return
+        df = self.data_focus
+        if 'player_id' not in df.columns:
+            messagebox.showinfo("提示", "缺少 player_id 列，无法筛选。")
+            return
+        sub = df.loc[df['player_id'].astype(str).isin(set(map(str, pids)))].copy()
+        if sub.empty:
+            messagebox.showinfo("提示", f"未找到所选玩家的原始数据。")
+            return
+        if 'created_at' in sub.columns:
+            sub = sub.sort_values('created_at')
+        mids = parse_mid_list(self.mid_filter.get().strip())
+        title_ids = ', '.join(pids[:5]) + ('...' if len(pids) > 5 else '')
+        RawViewer(self, sub, title=f"玩家({len(pids)}): {title_ids} - 原始数据 (MID筛选: {', '.join(mids) if mids else DEFAULT_MID_FILTER})")
+
+    def copy_flagged_ids(self):
+        if self.result_df.empty or 'flagged' not in self.result_df.columns:
+            messagebox.showinfo("提示", "没有可复制的ID。")
+            return
+        ids_series = self.result_df.loc[self.result_df['flagged'], 'player_id'].dropna()
+
+        def to_clean_str(x):
+            try:
+                if isinstance(x, float):
+                    if x.is_integer():
+                        return str(int(x))
+                    return str(int(round(x)))
+                return str(x)
+            except Exception:
+                return str(x)
+
+        ids = [to_clean_str(v) for v in ids_series.tolist() if str(v).strip() != '']
+        if not ids:
+            messagebox.showinfo("提示", "当前没有标黄的玩家。")
+            return
+        text = '\n'.join(ids)
+        try:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            self.update()
+            messagebox.showinfo("完成", f"已复制 {len(ids)} 个玩家ID到剪贴板。")
+        except Exception as e:
+            traceback.print_exc()
+            messagebox.showerror("错误", f"复制失败：\n{e}")
+
+    def export_results(self):
+        if self.result_df.empty:
+            messagebox.showinfo("提示", "没有可导出的结果。")
+            return
+        f = filedialog.asksaveasfilename(
+            title="保存结果为CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV 文件", "*.csv")]
+        )
+        if not f:
+            return
+        try:
+            out = self.result_df.copy()
+            for c in ('max_session_start', 'max_session_end'):
+                if c in out.columns and pd.api.types.is_datetime64_any_dtype(out[c]):
+                    out[c] = out[c].dt.strftime('%Y-%m-%d %H:%M:%S')
+            out.to_csv(f, index=False, encoding='utf-8-sig')
+            messagebox.showinfo("完成", f"已导出：{f}")
+        except Exception as e:
+            traceback.print_exc()
+            messagebox.showerror("错误", f"导出失败：\n{e}")
+
+# -------------------- 原始数据窗口 --------------------
+class RawViewer(tk.Toplevel):
+    def __init__(self, master, df: pd.DataFrame, title="原始数据"):
+        super().__init__(master)
+        self.title(title)
+        self.geometry("1200x760")
+
+        self.df_original = df.copy()
+        self.df_current = self.df_original.copy()
+        # 普通列: set[str]
+        # created_at: {'type': 'range', 'start': Timestamp, 'end': Timestamp}
+        self.col_filters = {}
+
+        cols = list(self.df_original.columns)
+        self.tree = ttk.Treeview(self, columns=cols, show='headings', selectmode='extended')
+        for c in cols:
+            self.tree.heading(c, text=c)
+            self.tree.column(c, width=140, anchor='center')
+
+        vsb = ttk.Scrollbar(self, orient="vertical", command=self.tree.yview)
+        hsb = ttk.Scrollbar(self, orient="horizontal", command=self.tree.xview)
+        self.tree.configure(yscroll=vsb.set, xscroll=hsb.set)
+        self.tree.pack(fill='both', expand=True)
+        vsb.pack(side='right', fill='y')
+        hsb.pack(side='bottom', fill='x')
+
+        # 点击列头打开筛选
+        self.tree.bind('<Button-1>', self.on_tree_click_heading)
+
+        self.fill_tree(self.df_current)
+
+        frm = ttk.Frame(self)
+        frm.pack(fill='x', padx=8, pady=8)
+        ttk.Button(frm, text="导出当前显示数据为CSV", command=self.export_current).pack(side='left')
+        ttk.Button(frm, text="清空所有筛选", command=self.clear_all_filters).pack(side='left', padx=8)
+
+        ttk.Label(self, text="提示：点击列头可打开筛选面板；按Ctrl/Shift可多选行。").pack(fill='x', padx=8, pady=(0,8))
+
+    def fill_tree(self, df: pd.DataFrame):
+        for i in self.tree.get_children():
+            self.tree.delete(i)
+        if list(self.tree['columns']) != list(df.columns):
+            self.tree['columns'] = list(df.columns)
+            for c in df.columns:
+                self.tree.heading(c, text=c)
+                self.tree.column(c, width=140, anchor='center')
+        for _, row in df.iterrows():
+            vals = []
+            for c in df.columns:
+                v = row.get(c, '')
+                if isinstance(v, pd.Timestamp):
+                    v = '' if pd.isna(v) else v.strftime('%Y-%m-%d %H:%M:%S')
+                try:
+                    is_nan = pd.isna(v) if hasattr(v, '__float__') else False
+                except Exception:
+                    is_nan = False
+                vals.append('' if is_nan else v)
+            self.tree.insert('', 'end', values=vals)
+
+    def apply_filters_and_refresh(self):
+        df = self.df_original
+        mask_all = pd.Series(True, index=df.index)
+
+        for col, selected in self.col_filters.items():
+            if selected is None or col not in df.columns:
+                continue
+            if col == 'created_at' and isinstance(selected, dict) and selected.get('type') == 'range':
+                ser = pd.to_datetime(df[col], errors='coerce')
+                mins = ser.dt.floor('min')
+                start = selected.get('start')
+                end = selected.get('end')
+                mask = (mins >= start) & (mins <= end)
             else:
-                mem = pl
+                ser = df[col].astype(str).str.strip()
+                mask = ser.isin({str(x).strip() for x in selected})
+            mask_all = mask_all & mask
 
-            mem = Image.alpha_composite(mem, self.ti)
+        self.df_current = df.loc[mask_all].copy()
+        self.fill_tree(self.df_current)
 
-            for _, ct in self.fld.items():
-                tv = ct["e"].get().strip()
-                if not tv:
-                    continue
-                self._dtxt(mem, tv, tw, th, int(ct["ss"].get()),
-                           int(ct["sx"].get()), int(ct["sy"].get()),
-                           ct["c"], ct["s"], ts)
+    def clear_all_filters(self):
+        self.col_filters.clear()
+        self.df_current = self.df_original.copy()
+        self.fill_tree(self.df_current)
 
-            self.final = mem.copy()
-            self._disp()
-        except:
-            pass
-
-    def _disp(self):
-        if not self.final:
+    def on_tree_click_heading(self, event):
+        region = self.tree.identify_region(event.x, event.y)
+        if region != 'heading':
             return
-        self.cv.delete("all")
-        w, h = self.final.size
-        nw = max(10, int(w * self.sc))
-        nh = max(10, int(h * self.sc))
-        self.tki = ImageTk.PhotoImage(
-            self.final.resize((nw, nh), Image.Resampling.LANCZOS))
-        cx = self.cv.winfo_width() / 2 + self.vx
-        cy = self.cv.winfo_height() / 2 + self.vy
-        self.cid = self.cv.create_image(cx, cy, anchor=tk.CENTER, image=self.tki)
+        col_id = self.tree.identify_column(event.x)
         try:
-            if self.pi:
-                bx = cx - nw / 2 + int(self.sx.get()) * self.sc
-                by = cy - nh / 2 + int(self.sy.get()) * self.sc
-                self.cv.create_rectangle(
-                    bx, by,
-                    bx + self.pi.size[0] * self.sc,
-                    by + self.pi.size[1] * self.sc,
-                    outline="#00FFCC", width=1, dash=(5, 3))
-                hs = self.handle_size
-                left = bx
-                top = by
-                right = bx + self.pi.size[0] * self.sc
-                bottom = by + self.pi.size[1] * self.sc
-                mx = (left + right) / 2
-                my = (top + bottom) / 2
-                for hx, hy in [
-                    (left, top), (mx, top), (right, top),
-                    (right, my), (right, bottom), (mx, bottom),
-                    (left, bottom), (left, my)
-                ]:
-                    self.cv.create_rectangle(
-                        hx - hs / 2, hy - hs / 2,
-                        hx + hs / 2, hy + hs / 2,
-                        fill="#00FFCC", outline="#003B33", width=1)
-        except:
-            pass
-        self.cv.create_line(self.cv.winfo_width() / 2, 0,
-                            self.cv.winfo_width() / 2, self.cv.winfo_height(),
-                            fill="#7A5C12", dash=(6, 4), width=1)
-        self.cv.create_line(0, self.cv.winfo_height() / 2,
-                            self.cv.winfo_width(), self.cv.winfo_height() / 2,
-                            fill="#7A5C12", dash=(6, 4), width=1)
+            col_idx = int(col_id.replace('#', '')) - 1
+        except Exception:
+            return
+        columns = list(self.tree['columns'])
+        if col_idx < 0 or col_idx >= len(columns):
+            return
+        col_name = columns[col_idx]
+        df_base = self.df_current.copy()
+        x = self.tree.winfo_rootx() + event.x
+        y = self.tree.winfo_rooty() + event.y + 24
+        FilterPopup(self, column=col_name, df=df_base,
+                    pre_selected=self.col_filters.get(col_name),
+                    on_ok=self.on_filter_ok,
+                    geometry=f"+{x}+{y}")
+
+    def on_filter_ok(self, column, selected_payload):
+        # 普通列: set[str] 或 空集合；None 取消该列过滤
+        # created_at: {'type':'range','start':ts,'end':ts}；None 取消该列过滤
+        if selected_payload is None:
+            if column in self.col_filters:
+                del self.col_filters[column]
+        else:
+            self.col_filters[column] = selected_payload
+        self.apply_filters_and_refresh()
+
+    def export_current(self):
+        df_to_save = self.df_current.copy()
+        if 'created_at' in df_to_save.columns and pd.api.types.is_datetime64_any_dtype(df_to_save['created_at']):
+            df_to_save['created_at'] = df_to_save['created_at'].dt.strftime('%Y-%m-%d %H:%M:%S')
+        f = filedialog.asksaveasfilename(
+            title="保存当前显示数据为CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV 文件", "*.csv")]
+        )
+        if not f:
+            return
+        try:
+            df_to_save.to_csv(f, index=False, encoding='utf-8-sig')
+            messagebox.showinfo("完成", f"已导出：{f}")
+        except Exception as e:
+            traceback.print_exc()
+            messagebox.showerror("错误", f"导出失败：\n{e}")
+
+# -------------------- 日期时间选择器 --------------------
+class DateTimePicker(ttk.Frame):
+    def __init__(self, master, years, init_ts=None):
+        super().__init__(master)
+        self.var_year = tk.IntVar()
+        self.var_month = tk.IntVar()
+        self.var_day = tk.IntVar()
+        self.var_hour = tk.IntVar()
+        self.var_min = tk.IntVar()
+
+        years = sorted(set(years)) if years else [datetime.now().year]
+        months = list(range(1,13))
+        hours = list(range(0,24))
+        mins = list(range(0,60))
+
+        ttk.Label(self, text="年").grid(row=0, column=0, padx=(0,2))
+        self.cmb_year = ttk.Combobox(self, width=5, state='readonly', values=years, textvariable=self.var_year)
+        self.cmb_year.grid(row=0, column=1, padx=(0,8))
+
+        ttk.Label(self, text="月").grid(row=0, column=2, padx=(0,2))
+        self.cmb_month = ttk.Combobox(self, width=3, state='readonly', values=months, textvariable=self.var_month)
+        self.cmb_month.grid(row=0, column=3, padx=(0,8))
+
+        ttk.Label(self, text="日").grid(row=0, column=4, padx=(0,2))
+        self.cmb_day = ttk.Combobox(self, width=3, state='readonly', values=[1], textvariable=self.var_day)
+        self.cmb_day.grid(row=0, column=5, padx=(0,8))
+
+        ttk.Label(self, text="时").grid(row=0, column=6, padx=(0,2))
+        self.cmb_hour = ttk.Combobox(self, width=3, state='readonly', values=hours, textvariable=self.var_hour)
+        self.cmb_hour.grid(row=0, column=7, padx=(0,8))
+
+        ttk.Label(self, text="分").grid(row=0, column=8, padx=(0,2))
+        self.cmb_min = ttk.Combobox(self, width=3, state='readonly', values=mins, textvariable=self.var_min)
+        self.cmb_min.grid(row=0, column=9)
+
+        self.cmb_year.bind('<<ComboboxSelected>>', self._update_days)
+        self.cmb_month.bind('<<ComboboxSelected>>', self._update_days)
+
+        ts = init_ts or datetime.now().replace(second=0, microsecond=0)
+        self.var_year.set(ts.year)
+        self.var_month.set(ts.month)
+        self._update_days()
+        self.var_day.set(min(ts.day, int(self.cmb_day['values'][-1])))
+        self.var_hour.set(ts.hour)
+        self.var_min.set(ts.minute)
+
+    def _update_days(self, event=None):
+        y = self.var_year.get() or datetime.now().year
+        m = self.var_month.get() or 1
+        last = calendar.monthrange(y, m)[1]
+        vals = list(range(1, last+1))
+        self.cmb_day['values'] = vals
+        if self.var_day.get() not in vals:
+            self.var_day.set(1)
+
+    def get_timestamp(self) -> datetime:
+        return datetime(self.var_year.get(), self.var_month.get(), self.var_day.get(),
+                        self.var_hour.get(), self.var_min.get())
+
+# -------------------- 列筛选弹窗 --------------------
+class FilterPopup(tk.Toplevel):
+    """
+    普通列：每次打开显示“原始数据全量取值”，当前已应用的取值以绿色底标记；
+           若未选择任何项点击“确定”，则不改变该列筛选；提供“取消本列筛选”按钮。
+    created_at：仅“时间区间”参与过滤；分钟勾选仅用于绿色标记。
+    """
+    def __init__(self, master: RawViewer, column: str, df: pd.DataFrame, pre_selected=None, on_ok=None, geometry=None):
+        super().__init__(master)
+        self.title(f"筛选 - {column}")
+        self.resizable(True, True)
+        if geometry:
+            self.geometry(geometry)
+        self.transient(master)
+        self.column = column
+        self.df_view = df.copy()          # 当前视图（不用于普通列取值候选）
+        self.df_all = master.df_original  # 原始全量，用于普通列取值候选
+        self.on_ok_cb = on_ok
+
+        if column == 'created_at':
+            self.pre_range = pre_selected if isinstance(pre_selected, dict) and pre_selected.get('type') == 'range' else None
+            self._build_datetime_ui()
+        else:
+            self.pre_selected_values = set(pre_selected) if isinstance(pre_selected, set) else None
+            self._build_values_ui()
+
+        self.protocol("WM_DELETE_WINDOW", self.on_cancel)
+
+    # ---------- 普通列 UI ----------
+    def _build_values_ui(self):
+        frm_top = ttk.Frame(self)
+        frm_top.pack(fill='x', padx=8, pady=6)
+        ttk.Label(frm_top, text="搜索：").pack(side='left')
+        self.ent_search = ttk.Entry(frm_top)
+        self.ent_search.pack(side='left', fill='x', expand=True, padx=4)
+        ttk.Button(frm_top, text="查找", command=self._apply_search_values).pack(side='left', padx=4)
+        ttk.Button(frm_top, text="重置", command=self._reset_search_values).pack(side='left', padx=4)
+
+        frm_mid = ttk.Frame(self)
+        frm_mid.pack(fill='both', expand=True, padx=8, pady=4)
+        self.lst = tk.Listbox(frm_mid, selectmode='extended', exportselection=False)
+        self.lst.pack(side='left', fill='both', expand=True)
+        self._list_default_bg = self.lst.cget('bg')
+        sb = ttk.Scrollbar(frm_mid, orient='vertical', command=self.lst.yview)
+        sb.pack(side='left', fill='y')
+        self.lst.configure(yscrollcommand=sb.set)
+
+        frm_btn = ttk.Frame(self)
+        frm_btn.pack(fill='x', padx=8, pady=8)
+        ttk.Button(frm_btn, text="全选", command=self._select_all_values).pack(side='left')
+        ttk.Button(frm_btn, text="清空选择", command=self._clear_select_values).pack(side='left', padx=6)
+        ttk.Button(frm_btn, text="取消本列筛选", command=self._clear_filter_values).pack(side='left', padx=6)
+        ttk.Button(frm_btn, text="确定", command=self.on_ok_values).pack(side='right')
+        ttk.Button(frm_btn, text="取消", command=self.on_cancel).pack(side='right', padx=6)
+
+        # 取值候选来自“原始全量数据”，而非当前视图
+        ser = self.df_all[self.column].astype(str).str.strip().fillna('') if self.column in self.df_all.columns else pd.Series([], dtype=str)
+        self._values_all = sorted(set(ser.tolist()))
+        self._render_values_list(self._values_all)
+
+    def _render_values_list(self, values):
+        self.lst.delete(0, 'end')
+        for v in values:
+            self.lst.insert('end', v)
+        # 绿色底标注已应用的取值
+        pre = self.pre_selected_values or set()
+        for i, v in enumerate(values):
+            if v in pre:
+                try:
+                    self.lst.itemconfig(i, bg=GREEN_DAY)
+                except Exception:
+                    pass
+
+    def _apply_search_values(self):
+        q = self.ent_search.get().strip().lower()
+        if not q:
+            self._render_values_list(self._values_all)
+            return
+        filt = [v for v in self._values_all if q in v.lower()]
+        self._render_values_list(filt)
+
+    def _reset_search_values(self):
+        self.ent_search.delete(0, 'end')
+        self._render_values_list(self._values_all)
+
+    def _select_all_values(self):
+        self.lst.selection_set(0, 'end')
+
+    def _clear_select_values(self):
+        self.lst.selection_clear(0, 'end')
+
+    def _clear_filter_values(self):
+        # 明确取消该列筛选
+        if self.on_ok_cb:
+            self.on_ok_cb(self.column, None)
+        self.destroy()
+
+    def on_ok_values(self):
+        sel_idx = self.lst.curselection()
+        if sel_idx:
+            selected = set(self.lst.get(i) for i in sel_idx)
+            if self.on_ok_cb:
+                self.on_ok_cb(self.column, selected)
+        else:
+            # 未选择任何项：不改变外部已有筛选
+            if self.on_ok_cb:
+                if self.pre_selected_values is None:
+                    # 原先无筛选，仍保持无变化
+                    self.on_ok_cb(self.column, None)
+                else:
+                    self.on_ok_cb(self.column, set(self.pre_selected_values))
+        self.destroy()
+
+    # ---------- created_at（区间 + 日期/分钟：勾选仅用于标记） ----------
+    def _build_datetime_ui(self):
+        ser = pd.to_datetime(self.df_view.get('created_at'), errors='coerce')
+        mins_all = ser.dt.floor('min').dropna().sort_values()
+        self._minutes_all = [pd.Timestamp(t) for t in mins_all.unique()]
+        self.selected_minutes = set()  # 仅用于绿色标记
+
+        years = sorted({t.year for t in self._minutes_all}) or [datetime.now().year]
+        init_start = self._minutes_all[0] if self._minutes_all else datetime.now().replace(second=0, microsecond=0)
+        init_end = self._minutes_all[-1] if self._minutes_all else init_start
+
+        frm_top = ttk.LabelFrame(self, text="时间区间")
+        frm_top.pack(fill='x', padx=8, pady=6)
+
+        ttk.Label(frm_top, text="起始").grid(row=0, column=0, sticky='w', padx=(6,4), pady=4)
+        self.dtp_start = DateTimePicker(frm_top, years=years, init_ts=(self.pre_range['start'].to_pydatetime() if self.pre_range else (init_start.to_pydatetime() if isinstance(init_start, pd.Timestamp) else init_start)))
+        self.dtp_start.grid(row=0, column=1, sticky='w', pady=4)
+
+        ttk.Label(frm_top, text="结束").grid(row=1, column=0, sticky='w', padx=(6,4), pady=4)
+        self.dtp_end = DateTimePicker(frm_top, years=years, init_ts=(self.pre_range['end'].to_pydatetime() if self.pre_range else (init_end.to_pydatetime() if isinstance(init_end, pd.Timestamp) else init_end)))
+        self.dtp_end.grid(row=1, column=1, sticky='w', pady=4)
+
+        btns = ttk.Frame(frm_top)
+        btns.grid(row=0, column=2, rowspan=2, padx=10, pady=4, sticky='nsew')
+        ttk.Button(btns, text="应用区间", command=self._apply_range).pack(fill='x', pady=(0,6))
+        ttk.Button(btns, text="清空区间", command=self._clear_range).pack(fill='x')
+
+        frm_mid = ttk.Frame(self)
+        frm_mid.pack(fill='both', expand=True, padx=8, pady=4)
+
+        lf = ttk.LabelFrame(frm_mid, text='日期')
+        lf.pack(side='left', fill='both', expand=False, padx=(0,6))
+        self.lst_days = tk.Listbox(lf, selectmode='extended', width=14, exportselection=False)
+        self.lst_days.pack(side='left', fill='both', expand=True)
+        self._day_default_bg = self.lst_days.cget('bg')
+        sb_day = ttk.Scrollbar(lf, orient='vertical', command=self.lst_days.yview)
+        sb_day.pack(side='left', fill='y')
+        self.lst_days.configure(yscrollcommand=sb_day.set)
+        self.lst_days.bind('<<ListboxSelect>>', self._on_day_select)
+
+        rf = ttk.LabelFrame(frm_mid, text='分钟（勾选仅用于标记，不影响过滤）')
+        rf.pack(side='left', fill='both', expand=True)
+        self.lst_minutes = tk.Listbox(rf, selectmode='extended', exportselection=False)
+        self.lst_minutes.pack(side='left', fill='both', expand=True)
+        sb_min = ttk.Scrollbar(rf, orient='vertical', command=self.lst_minutes.yview)
+        sb_min.pack(side='left', fill='y')
+        self.lst_minutes.configure(yscrollcommand=sb_min.set)
+        self.lst_minutes.bind('<<ListboxSelect>>', self._on_minutes_select)
+
+        frm_btn = ttk.Frame(self)
+        frm_btn.pack(fill='x', padx=8, pady=8)
+        ttk.Button(frm_btn, text="全选当前显示分钟", command=self._select_all_minutes_current).pack(side='left')
+        ttk.Button(frm_btn, text="清空当前显示分钟", command=self._clear_minutes_current).pack(side='left', padx=6)
+        ttk.Button(frm_btn, text="确定", command=self.on_ok_datetime).pack(side='right')
+        ttk.Button(frm_btn, text="取消", command=self.on_cancel).pack(side='right', padx=6)
+
+        self._build_index_all()
+        self._date_to_minutes_view = dict(self._date_to_minutes_all)
+        self._range_applied = False
+        self._range_cleared = False
+
+        if self.pre_range:
+            self._apply_range_to_view(self.pre_range['start'], self.pre_range['end'])
+            self._range_applied = True
+
+        self._update_days_list()
+        if self.lst_days.size() > 0:
+            self.lst_days.selection_set(0)
+            self._on_day_select()
+
+    def _build_index_all(self):
+        self._date_to_minutes_all = {}
+        for t in self._minutes_all:
+            d = t.date().isoformat()
+            self._date_to_minutes_all.setdefault(d, []).append(t)
+        for d in self._date_to_minutes_all:
+            self._date_to_minutes_all[d] = sorted(self._date_to_minutes_all[d])
+
+    def _apply_range_to_view(self, start, end):
+        minutes_in = [t for t in self._minutes_all if (t >= start and t <= end)]
+        self._date_to_minutes_view = {}
+        for t in minutes_in:
+            d = t.date().isoformat()
+            self._date_to_minutes_view.setdefault(d, []).append(t)
+        for d in list(self._date_to_minutes_view.keys()):
+            self._date_to_minutes_view[d] = sorted(self._date_to_minutes_view[d])
+
+    def _apply_range(self):
+        start = pd.Timestamp(self.dtp_start.get_timestamp())
+        end = pd.Timestamp(self.dtp_end.get_timestamp())
+        if end < start:
+            messagebox.showwarning("提示", "结束时间不能早于起始时间。")
+            return
+        self._apply_range_to_view(start, end)
+        self._range_applied = True
+        self._range_cleared = False
+        self._update_days_list()
+        if self.lst_days.size() > 0:
+            self.lst_days.selection_set(0)
+            self._on_day_select()
+        else:
+            self._render_minutes_list([])
+
+    def _clear_range(self):
+        # 1) 还原为全量可见
+        self._date_to_minutes_view = dict(self._date_to_minutes_all)
 
 
-if __name__ == "__main__":
-    root = TkinterDnD.Tk()
-    App(root)
-    root.mainloop()
+        # 3) 刷新日期列表
+        self._update_days_list()
+
+        # 清空分钟区（不展示任何分钟，等待用户重新选择日期）
+        self._render_minutes_list([])
+
+        # 5) 刷新日期高亮（由于已无选择，全部恢复为默认底色）
+        self._refresh_day_highlight()
+
+    def _update_days_list(self):
+        days_all = sorted(self._date_to_minutes_view.keys())
+        self.lst_days.delete(0, 'end')
+        for d in days_all:
+            self.lst_days.insert('end', d)
+        self._refresh_day_highlight()
+
+    def _minutes_for_days(self, days):
+        minutes = []
+        for d in days:
+            minutes.extend(self._date_to_minutes_view.get(d, []))
+        return sorted(set(minutes))
+
+    def _on_day_select(self, event=None):
+        sel_idx = self.lst_days.curselection()
+        sel_days = [self.lst_days.get(i) for i in sel_idx]
+        mins_sorted = self._minutes_for_days(sel_days)
+        self._render_minutes_list(mins_sorted)
+
+    def _render_minutes_list(self, mins_list):
+        self.lst_minutes.delete(0, 'end')
+        self._mins_shown = mins_list
+        for t in mins_list:
+            self.lst_minutes.insert('end', t.strftime('%Y-%m-%d %H:%M'))
+        if self.selected_minutes:
+            want = self.selected_minutes
+            for i, t in enumerate(self._mins_shown):
+                if t in want:
+                    self.lst_minutes.selection_set(i)
+
+    def _on_minutes_select(self, event=None):
+        current_sel_idx = set(self.lst_minutes.curselection())
+        current_sel_minutes = {self._mins_shown[i] for i in current_sel_idx} if self._mins_shown else set()
+        for t in self._mins_shown:
+            self.selected_minutes.discard(t)
+        self.selected_minutes |= current_sel_minutes
+        self._refresh_day_highlight()
+
+    def _select_all_minutes_current(self):
+        self.lst_minutes.selection_set(0, 'end')
+        self._on_minutes_select()
+
+    def _clear_minutes_current(self):
+        self.lst_minutes.selection_clear(0, 'end')
+        self._on_minutes_select()
+
+    def _refresh_day_highlight(self):
+        for i in range(self.lst_days.size()):
+            d = self.lst_days.get(i)
+            arr = self._date_to_minutes_view.get(d, [])
+            has = any((t in self.selected_minutes) for t in arr)
+            try:
+                self.lst_days.itemconfig(i, bg=(GREEN_DAY if has else self._day_default_bg))
+            except Exception:
+                pass
+
+    def on_ok_datetime(self):
+        if self.on_ok_cb:
+            if self._range_applied:
+                start = pd.Timestamp(self.dtp_start.get_timestamp()).floor('min')
+                end = pd.Timestamp(self.dtp_end.get_timestamp()).floor('min')
+                payload = {'type': 'range', 'start': start, 'end': end}
+                self.on_ok_cb('created_at', payload)
+            elif self._range_cleared:
+                self.on_ok_cb('created_at', None)
+            else:
+                # 未应用也未清空：不改变外部过滤
+                pass
+        self.destroy()
+
+    def on_cancel(self):
+        self.destroy()
+
+# -------------------- 入口 --------------------
+if __name__ == '__main__':
+    app = App()
+    app.mainloop()
