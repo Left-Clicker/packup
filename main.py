@@ -1,890 +1,1027 @@
-#!/usr/bin/env python3
-"""
-Crowdin Translation Checker
-Paste Chinese + English draft → 3-column table with glossary terms → copy back to Crowdin.
-Glossary auto-loaded from "Mafia War's Glossary.csv" in the same directory.
-"""
-
-import csv
-import http.server
-import json
-import os
-import subprocess
 import sys
-import threading
-import time
-import webbrowser
+import numpy as np
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from PIL import Image, ImageDraw, ImageFont, ImageTk, ImageChops, ImageFilter
+import os
+import platform
 
-PORT = 8765
-# When packaged with PyInstaller (--onefile), __file__ points to a temporary
-# extraction directory, not where the user actually placed the binary. Use the
-# executable's directory in that case so the glossary CSV can sit next to the
-# binary and be edited without rebuilding.
-if getattr(sys, "frozen", False):
-    SCRIPT_DIR = os.path.dirname(os.path.abspath(sys.executable))
-else:
-    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
-GLOSSARY_FILE = "Mafia War's Glossary.csv"
+try:
+    from tkinterdnd2 import TkinterDnD, DND_FILES
+except ImportError:
+    messagebox.showerror("缺少组件", "请在终端执行: pip install tkinterdnd2")
+    exit()
 
-
-# Crowdin glossary export columns are fixed:
-#   A (0)  -> Term [zh-CN]    源术语（中文）
-#   M (12) -> Term [en-US]    目标术语（英文）
-ZH_COL = 0
-EN_COL = 12
-
-
-def load_glossary():
-    path = os.path.join(SCRIPT_DIR, GLOSSARY_FILE)
-    if not os.path.exists(path):
-        return [], f"Glossary file not found: {GLOSSARY_FILE}"
-
-    with open(path, newline='', encoding='utf-8-sig') as f:
-        rows = list(csv.reader(f))
-
-    if len(rows) < 2:
-        return [], "Glossary is empty or contains only a header row"
-
-    terms = []
-    for row in rows[1:]:
-        zh = row[ZH_COL].strip() if len(row) > ZH_COL else ''
-        en = row[EN_COL].strip() if len(row) > EN_COL else ''
-        if zh and en:
-            terms.append({'zh': zh, 'en': en})
-
-    return terms, f"Loaded {len(terms)} glossary terms"
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Embedded frontend
-# ─────────────────────────────────────────────────────────────────────────────
-HTML = r"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Crowdin Translation Checker</title>
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
-     background:#0d1117;color:#c9d1d9;min-height:100vh}
-
-/* ── Header ── */
-.hdr{background:#161b22;border-bottom:1px solid #30363d;padding:12px 24px;
-     display:flex;align-items:center;gap:16px;position:sticky;top:0;z-index:100}
-.hdr h1{font-size:15px;font-weight:600;color:#f0f6fc;white-space:nowrap}
-.gloss-tag{margin-left:auto;font-size:12px;padding:4px 12px;border-radius:20px;
-           background:#122d20;color:#56d364;white-space:nowrap}
-.gloss-tag.warn{background:#32100b;color:#f85149}
-.gloss-tag.loading{background:#1c2a3a;color:#8b949e}
-
-/* ── Buttons ── */
-.btn{padding:7px 16px;border-radius:6px;border:none;cursor:pointer;
-     font-size:13px;font-weight:500;transition:background .15s;white-space:nowrap}
-.btn:disabled{opacity:.4;cursor:not-allowed}
-.btn-blue{background:#1f6feb;color:#fff}.btn-blue:hover:not(:disabled){background:#388bfd}
-.btn-green{background:#238636;color:#fff}.btn-green:hover:not(:disabled){background:#2ea043}
-.btn-sky{background:#0969da;color:#fff}.btn-sky:hover:not(:disabled){background:#1f6feb}
-.btn-gray{background:#21262d;color:#c9d1d9;border:1px solid #30363d}
-.btn-gray:hover:not(:disabled){background:#30363d}
-.btn-sm{padding:4px 10px;font-size:11px;border-radius:5px;border:none;cursor:pointer;
-        font-weight:500;transition:background .15s;white-space:nowrap;
-        background:#21262d;color:#8b949e;border:1px solid #30363d}
-.btn-sm:hover{background:#30363d;color:#c9d1d9}
-.btn-sm.active{background:#1c2a3a;color:#79c0ff;border-color:#1f4068}
-
-/* ── Input panel ── */
-.panel{padding:16px 24px;background:#161b22;border-bottom:1px solid #30363d}
-.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:12px}
-.field label{display:block;font-size:11px;color:#8b949e;margin-bottom:6px;
-             font-weight:600;text-transform:uppercase;letter-spacing:.5px}
-.field label span{text-transform:none;font-weight:400;color:#484f58}
-textarea{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;
-         padding:9px 11px;color:#c9d1d9;font-size:12.5px;
-         font-family:'SFMono-Regular',Consolas,monospace;resize:vertical;
-         min-height:130px;line-height:1.6;overflow-y:auto;overflow-x:hidden}
-textarea:focus{outline:none;border-color:#388bfd}
-.row-btns{display:flex;gap:10px;align-items:center}
-.status{font-size:13px;padding:5px 12px;border-radius:6px;display:none}
-.status.info{background:#1c3557;color:#79c0ff;display:inline-block}
-.status.ok  {background:#122d20;color:#56d364;display:inline-block}
-.status.err {background:#32100b;color:#f85149;display:inline-block}
-
-/* ── Blocks wrapper ── */
-.blocks-wrap{padding:16px 24px}
-.blocks-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
-.blocks-hdr>span{font-size:13px;color:#8b949e}
-.blocks-actions{display:flex;gap:8px}
-
-/* ── Paragraph block ── */
-.para-block{background:#161b22;border:1px solid #30363d;border-radius:8px;
-            margin-bottom:12px;overflow:hidden}
-.block-hdr{display:flex;align-items:center;gap:10px;padding:8px 14px;
-           background:#1c2128;border-bottom:1px solid #30363d;flex-wrap:wrap}
-.block-label{font-size:12px;font-weight:600;color:#8b949e;
-             background:#21262d;padding:2px 9px;border-radius:10px;white-space:nowrap}
-.block-pills{flex:1;display:flex;flex-wrap:wrap;gap:4px}
-.pill{display:inline-block;background:#1c2a3a;color:#79c0ff;padding:2px 9px;
-      border-radius:12px;font-size:11px;white-space:nowrap;border:1px solid #1f4068}
-.pill .pill-zh{color:#c9d1d9}
-.pill .pill-eq{color:#484f58;margin:0 4px}
-.no-term{color:#484f58;font-size:11px}
-.term-hit{text-decoration:underline dashed #79c0ff;
-          text-underline-offset:3px;cursor:help}
-
-/* ── Help / tutorial panel ── */
-.help-panel{background:#0d2030;border-bottom:1px solid #1f4068;padding:14px 24px;
-            font-size:12.5px;line-height:1.7;color:#8b949e;display:none}
-.help-panel.on{display:block}
-.help-panel h3{font-size:12px;color:#79c0ff;text-transform:uppercase;
-               letter-spacing:.6px;font-weight:600;margin-bottom:8px}
-.help-panel ol{margin-left:20px;color:#b0b8c0}
-.help-panel ol li{margin-bottom:4px}
-.help-panel code{background:#161b22;padding:1px 6px;border-radius:4px;
-                 font-family:'SFMono-Regular',Consolas,monospace;font-size:11.5px;
-                 color:#79c0ff}
-.help-toggle{background:#21262d;color:#8b949e;border:1px solid #30363d;
-             border-radius:50%;width:26px;height:26px;cursor:pointer;
-             font-size:13px;font-weight:600;line-height:1;padding:0}
-.help-toggle:hover{background:#30363d;color:#c9d1d9}
-.help-toggle.active{background:#1c2a3a;color:#79c0ff;border-color:#1f4068}
-
-/* ── Merge / unmerge buttons ── */
-.btn-merge{padding:4px 10px;font-size:11px;border-radius:5px;border:1px solid #1f4068;
-           background:#0d2030;color:#79c0ff;cursor:pointer;font-weight:500;
-           white-space:nowrap;transition:background .15s}
-.btn-merge:hover:not(:disabled){background:#1c2a3a}
-.btn-merge:disabled{opacity:.3;cursor:not-allowed}
-
-/* ── Paragraph divider inside a merged group ── */
-.para-divider{padding:5px 14px;color:#79c0ff;font-size:10.5px;
-              background:#0d2030;border-top:1px solid #1f4068;
-              border-bottom:1px solid #1f4068;letter-spacing:.4px;
-              font-weight:500}
-.para-block.is-merged{border-color:#1f4068}
-.para-block.is-merged .block-hdr{background:#0d2030}
-
-/* ── Sentence rows inside a block ── */
-.block-body{width:100%}
-.sent-row{display:grid;grid-template-columns:38px 1fr 1fr;border-bottom:1px solid #21262d}
-.sent-row:last-child{border-bottom:none}
-.sent-row:hover{background:#1c2128}
-.sent-num{display:flex;align-items:flex-start;justify-content:center;
-          padding:10px 4px;color:#484f58;font-size:11px;font-weight:600;
-          border-right:1px solid #21262d;min-width:38px}
-.sent-zh{padding:10px 12px;font-size:13px;line-height:1.8;color:#c9d1d9;
-         border-right:1px solid #21262d;word-break:break-all}
-.sent-en{padding:8px 10px}
-.sent-en textarea{width:100%;background:transparent;border:1px solid transparent;
-                  border-radius:4px;padding:4px 8px;color:#c9d1d9;font-size:13px;
-                  font-family:'SFMono-Regular',Consolas,monospace;resize:none;
-                  line-height:1.8;overflow:hidden;min-height:32px;display:block}
-.sent-en textarea:hover{border-color:#30363d;background:#0d1117}
-.sent-en textarea:focus{border-color:#388bfd;background:#0d1117;outline:none}
-
-/* ── Combined view (per block) ── */
-.combined-view{display:none;padding:0}
-.combined-body{display:grid;grid-template-columns:1fr 1fr}
-.combined-zh{padding:12px 14px;font-size:13px;line-height:1.9;color:#c9d1d9;
-             border-right:1px solid #21262d;word-break:break-all}
-.sent-sep{display:block;color:#484f58;font-size:11px;margin:4px 0 2px}
-.combined-en{padding:10px 12px}
-.combined-en textarea{width:100%;background:#0d1117;border:1px solid #30363d;
-                      border-radius:6px;padding:10px 12px;color:#c9d1d9;
-                      font-size:13px;font-family:'SFMono-Regular',Consolas,monospace;
-                      resize:none;line-height:1.9;overflow:hidden;display:block}
-.combined-en textarea:focus{border-color:#388bfd;outline:none}
-
-/* ── Preview modal ── */
-.overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.82);
-         z-index:200;overflow-y:auto;padding:24px 16px}
-.overlay.on{display:flex;justify-content:center;align-items:flex-start}
-.modal{background:#161b22;border:1px solid #30363d;border-radius:12px;
-       width:100%;max-width:980px;margin:auto}
-.modal-hdr{padding:14px 20px;border-bottom:1px solid #30363d;
-           display:flex;align-items:center;justify-content:space-between}
-.modal-hdr h2{font-size:15px;font-weight:600;color:#f0f6fc}
-.close-btn{background:none;border:none;color:#8b949e;font-size:22px;
-           cursor:pointer;line-height:1;padding:0 4px}
-.close-btn:hover{color:#c9d1d9}
-.modal-body{padding:20px}
-.preview-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
-.preview-col h3{font-size:11px;color:#8b949e;text-transform:uppercase;
-                letter-spacing:.5px;margin-bottom:10px;font-weight:600}
-.preview-box{background:#0d1117;border:1px solid #30363d;border-radius:8px;
-             padding:14px 16px;font-size:13px;line-height:1.9;
-             max-height:62vh;overflow-y:auto;word-break:break-word}
-.pv-para{margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid #21262d}
-.pv-para:last-child{border-bottom:none;margin-bottom:0}
-.modal-ftr{padding:14px 20px;border-top:1px solid #30363d;
-           display:flex;gap:10px;justify-content:flex-end}
-
-/* ── Toast ── */
-.toast{position:fixed;bottom:22px;right:22px;background:#238636;color:#fff;
-       padding:10px 20px;border-radius:8px;font-size:13px;z-index:999;
-       display:none;box-shadow:0 4px 14px rgba(0,0,0,.5)}
-.toast.on{display:block;animation:slideUp .2s ease}
-@keyframes slideUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
-</style>
-</head>
-<body>
-
-<!-- ── Header ── -->
-<div class="hdr">
-  <h1>🎮 Crowdin Translation Checker</h1>
-  <button class="help-toggle" id="helpToggle" onclick="toggleHelp()" title="Show / hide instructions">?</button>
-  <div class="gloss-tag loading" id="glossTag">Loading glossary…</div>
-</div>
-
-<!-- ── Help / tutorial panel ── -->
-<div class="help-panel" id="helpPanel">
-  <h3>How to use</h3>
-  <ol>
-    <li>Paste the <strong>Chinese source</strong> on the left. The <strong>English draft</strong> on the right is <em>optional</em> &mdash; paste one to review/edit, or leave it empty to translate from scratch directly in the table below.</li>
-    <li>Use the literal token <code>\n</code> to separate paragraphs &mdash; in both inputs when present, ideally one-to-one. If the English side has fewer (or no) <code>\n</code>, the output will follow the Chinese source's <code>\n</code> structure.</li>
-    <li>Click <strong>Build Table</strong>. Each paragraph becomes a row that you can edit sentence by sentence, or toggle <strong>Merge view</strong> to edit a whole paragraph at once.</li>
-    <li>Glossary hits are shown as <code>中文 = English</code> pills above each block; matched substrings in the source get a <span class="term-hit">dashed underline</span> (hover for the English term).</li>
-    <li><strong>⬇ Merge next</strong> visually combines two adjacent blocks so you can review related paragraphs side by side. <em>This is view-only</em> &mdash; the copied output is unaffected. Press <strong>↑ Unmerge</strong> on a merged block to split it back apart.</li>
-    <li><strong>Preview</strong> renders edits live: color codes like <code>[E7594C]…[-]</code> become colored text, and any literal <code>\n</code> you type inside an edit area becomes a real line break. Both are preserved verbatim in the copied output.</li>
-    <li>Click <strong>Copy</strong> &mdash; the result always preserves the <em>exact</em> <code>\n</code> structure of your English draft (e.g. <code>\n\n</code> stays <code>\n\n</code>), no matter how you merge / unmerge. Nothing is auto-added.</li>
-  </ol>
-</div>
-
-<!-- ── Input panel ── -->
-<div class="panel">
-  <div class="grid2">
-    <div class="field">
-      <label>Chinese Source <span>(use \n to separate paragraphs; supports [RRGGBB]…[-] color codes)</span></label>
-      <textarea id="zh"
-        placeholder="Paste Chinese source, e.g.&#10;各位市民即将可以选择离开本城市。但为了维护本城秩序，请遵守规定。\n[E7594C]请注意！[-]活动期间请保持冷静。"></textarea>
-    </div>
-    <div class="field">
-      <label>English Draft <span>(optional — leave empty to translate from scratch; use \n to separate paragraphs, should match the Chinese 1:1)</span></label>
-      <textarea id="en"
-        placeholder="Optional. Paste an existing English draft to review, or leave empty and fill it in below.&#10;e.g. Citizens will soon be able to leave the city.\n[E7594C]Please note![-] Stay calm during the event."></textarea>
-    </div>
-  </div>
-  <div class="row-btns">
-    <button class="btn btn-blue" onclick="buildBlocks()">📊 Build Table</button>
-    <div class="status" id="status"></div>
-  </div>
-</div>
-
-<!-- ── Paragraph blocks ── -->
-<div class="blocks-wrap" id="blocksWrap" style="display:none">
-  <div class="blocks-hdr">
-    <span><strong id="cnt" style="color:#f0f6fc">0</strong> paragraph(s)</span>
-    <div class="blocks-actions">
-      <button class="btn btn-sky" onclick="showPreview()">👁 Preview</button>
-      <button class="btn btn-green" onclick="doCopy()">📋 Copy Final Result</button>
-    </div>
-  </div>
-  <div id="blocks"></div>
-</div>
-
-<!-- ── Preview modal ── -->
-<div class="overlay" id="overlay">
-  <div class="modal">
-    <div class="modal-hdr">
-      <h2>Preview &mdash; Colors &amp; Paragraph Layout</h2>
-      <button class="close-btn" onclick="closePreview()">×</button>
-    </div>
-    <div class="modal-body">
-      <div class="preview-grid">
-        <div class="preview-col">
-          <h3>Chinese Source</h3>
-          <div class="preview-box" id="pvZh"></div>
-        </div>
-        <div class="preview-col">
-          <h3>English (current edit)</h3>
-          <div class="preview-box" id="pvEn"></div>
-        </div>
-      </div>
-    </div>
-    <div class="modal-ftr">
-      <button class="btn btn-gray" onclick="closePreview()">Close</button>
-      <button class="btn btn-green" onclick="confirmAndCopy()">✓ Confirm &amp; Copy to Clipboard</button>
-    </div>
-  </div>
-</div>
-
-<!-- ── Toast ── -->
-<div class="toast" id="toast">✓ Copied! Paste back into Crowdin.</div>
-
-<script>
-// ── State ──────────────────────────────────────────────────────────────────
-let glossary = [];
-
-// IMMUTABLE after buildBlocks() — these define the original input structure and
-// the final output structure. Merge / unmerge NEVER touches them.
-//   paras[i]  = { zhFull, enFull, zhSentences, enSentences }
-//   zhSeps[i] / enSeps[i] = literal-\n separator string between paras[i] / paras[i+1]
-let paras = [], zhSeps = [], enSeps = [];
-
-// MUTABLE view-layer state. Each group is a visual block on screen.
-// Merging adjacent groups concatenates their paraIdxs; unmerging splits back.
-//   groups[gi] = { paraIdxs: number[], combined: boolean }
-// Initial state: groups.length === paras.length, each holds one paragraph.
-let groups = [];
-
-// ── Help toggle ─────────────────────────────────────────────────────────────
-function toggleHelp() {
-  document.getElementById('helpPanel').classList.toggle('on');
-  document.getElementById('helpToggle').classList.toggle('active');
-}
-
-// ── Load glossary ───────────────────────────────────────────────────────────
-window.addEventListener('load', async () => {
-  const tag = document.getElementById('glossTag');
-  try {
-    const res  = await fetch('/api/glossary');
-    const data = await res.json();
-    if (data.error) {
-      tag.textContent = '⚠ ' + data.error;
-      tag.className = 'gloss-tag warn';
-    } else {
-      glossary = data.terms;
-      tag.textContent = '✓ Glossary: ' + glossary.length + ' terms';
-      tag.className = 'gloss-tag';
+TEMPLATE_CONFIGS = {
+    "template_E6.png": {
+        "style": "E6_Classic",
+        "photo": {"size": 405, "x": 92, "y": 122},
+        # 主景横光辉（⑨）与昵称坐标解耦；默认与旧版「昵称默认位置」视觉对齐
+        "glow": {"x": 0, "y": 514},
+        "fields": {
+            "name": {"label": "✎ 玩家名称 (Name):", "size": 28, "x": 0, "y": 502,
+                     "color": "#FAD355", "stroke": "#111111"}
+        }
+    },
+    "template_E7.png": {
+        "style": "E7_Italic",
+        "photo": {"size": 240, "x": 417, "y": 90},
+        "fields": {
+            "name": {"label": "✎ 玩家昵称 (Name):", "size": 26, "x": -6, "y": 311,
+                     "color": "#FFFFFF", "stroke": "#111111"},
+            "city": {"label": "⌂ 玩家城市 (City):", "size": 23, "x": -6, "y": 351,
+                     "color": "#FAD355", "stroke": "#111111"}
+        }
     }
-  } catch (e) {
-    tag.textContent = '⚠ Failed to load glossary';
-    tag.className = 'gloss-tag warn';
-  }
-});
-
-// ── Helpers ─────────────────────────────────────────────────────────────────
-function colorize(text) {
-  return text.replace(/\[([0-9A-Fa-f]{6})\]([\s\S]*?)\[-\]/g,
-    (_, hex, body) => '<span style="color:#' + hex + '">' + body + '</span>');
 }
 
-function esc(s) {
-  return String(s)
-    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
-
-// Convert literal "\n" (backslash + n, two chars) typed by the user inside an
-// edit textarea into a real <br> for rendered HTML output. Safe to apply AFTER
-// esc()/highlightTerms() because neither emits nor escapes a backslash, so the
-// only "\n" sequences left in the html are the user's own.
-function nlToBr(html) {
-  return html.replace(/\\n/g, '<br>');
-}
-
-function autoH(ta) {
-  ta.style.height = 'auto';
-  ta.style.height = (ta.scrollHeight + 2) + 'px';
-}
-
-function setStatus(msg, type) {
-  const el = document.getElementById('status');
-  el.textContent = msg;
-  el.className = 'status ' + type;
-}
-
-function findTerms(zhText) {
-  return glossary.filter(({zh}) => zhText.includes(zh));
-}
-
-// Wrap matched glossary terms in <span class="term-hit"> while escaping HTML.
-// Operates on raw text so we can safely interleave escaped chunks with markup.
-// Longer terms win when overlapping (e.g. "首领部队" beats "首领").
-function highlightTerms(rawText, terms) {
-  if (!terms || !terms.length) return esc(rawText);
-
-  const sorted = [...terms].sort((a, b) => b.zh.length - a.zh.length);
-  const matches = [];
-  for (const t of sorted) {
-    let idx = 0;
-    while ((idx = rawText.indexOf(t.zh, idx)) !== -1) {
-      const start = idx, end = idx + t.zh.length;
-      const overlaps = matches.some(m => start < m.end && end > m.start);
-      if (!overlaps) matches.push({ start, end, term: t });
-      idx = end;
-    }
-  }
-  matches.sort((a, b) => a.start - b.start);
-
-  let html = '', cursor = 0;
-  for (const m of matches) {
-    html += esc(rawText.slice(cursor, m.start));
-    html += '<span class="term-hit" title="' + esc(m.term.en) + '">'
-         +  esc(rawText.slice(m.start, m.end))
-         +  '</span>';
-    cursor = m.end;
-  }
-  html += esc(rawText.slice(cursor));
-  return html;
-}
-
-// Render ZH text with term highlighting + literal \n -> <br> + color codes.
-// Pipeline order matters: highlightTerms wraps escaped chunks, nlToBr converts
-// any user-typed \n inside the body, and colorize finally wraps [RRGGBB]…[-].
-function renderZh(text) {
-  return colorize(nlToBr(highlightTerms(text, findTerms(text))));
-}
-
-// Mask [RRGGBB]...[‐] spans so their internal punctuation doesn't trigger splits.
-// Returns masked string (same length, placeholder chars).
-function maskColors(text) {
-  return text.replace(/\[[0-9A-Fa-f]{6}\][\s\S]*?\[-\]/g,
-    m => '\x01'.repeat(m.length));
-}
-
-// Split ZH paragraph into sentences, keeping [color]...[‐] spans atomic.
-// Terminators: 。！？
-function splitZhSentences(text) {
-  if (!text.trim()) return [text];
-  const masked = maskColors(text);
-  const parts = [];
-  // \x01 is NOT a terminator; runs of it stay with surrounding text
-  const re = /[^。！？]+[。！？]*/g;
-  let m;
-  while ((m = re.exec(masked)) !== null) {
-    const slice = text.slice(m.index, m.index + m[0].length).trim();
-    if (slice) parts.push(slice);
-  }
-  return parts.length ? parts : [text.trim()];
-}
-
-// Split EN paragraph into sentences.
-// Only split at .!? that is followed by whitespace + an uppercase letter.
-// This avoids false splits on decimals (0.1%), abbreviations, color codes, etc.
-//
-// Two-pass strategy:
-//   1) Split on the standard "<.!?> + whitespace + UPPERCASE" boundary.
-//   2) Re-glue tiny list-marker fragments (e.g. "1.", "2.", "i.", "I.") onto
-//      the next sentence so "1. During the event..." stays as one sentence
-//      instead of becoming ["1.", "During the event..."].
-function splitEnSentences(text) {
-  if (!text.trim()) return [text];
-  const raw = text.split(/(?<=[.!?])\s+(?=[A-Z])/).map(s => s.trim()).filter(Boolean);
-  const isListMarker = s => /^[0-9]{1,3}\.$/.test(s) || /^[ivxIVX]{1,4}\.$/.test(s);
-
-  const out = [];
-  let pending = '';
-  for (const p of raw) {
-    if (isListMarker(p)) {
-      pending = pending ? pending + ' ' + p : p;
-    } else {
-      out.push(pending ? pending + ' ' + p : p);
-      pending = '';
-    }
-  }
-  if (pending) out.push(pending);
-  return out;
-}
-
-// Parse raw Crowdin input into non-empty paragraphs PLUS the exact \n separator
-// between each adjacent pair. Splitting on literal \n yields tokens; runs of empty
-// tokens in between encode multi-\n separators (e.g. "A\n\nB" -> ["A","","B"] = sep "\n\n").
-// Returns { paras: string[], seps: string[] } where seps.length === paras.length - 1.
-function parseRawWithSeps(raw) {
-  const tokens = raw.split('\\n');
-  const out = [], seps = [];
-  let pendingEmpty = 0;
-  for (const tok of tokens) {
-    const trimmed = tok.trim();
-    if (trimmed) {
-      if (out.length > 0) {
-        // Separator = (1 boundary \n) + (one extra \n per empty token in between)
-        seps.push('\\n'.repeat(1 + pendingEmpty));
-      }
-      out.push(trimmed);
-      pendingEmpty = 0;
-    } else {
-      pendingEmpty++;
-    }
-  }
-  return { paras: out, seps };
-}
-
-// ── Build blocks ─────────────────────────────────────────────────────────────
-function buildBlocks() {
-  const zhRaw = document.getElementById('zh').value.trim();
-  const enRaw = document.getElementById('en').value.trim();
-  if (!zhRaw) { alert('Please paste the Chinese source.'); return; }
-  // English draft is OPTIONAL — leave it empty to translate from scratch using
-  // the table's per-sentence textareas.
-
-  const zh = parseRawWithSeps(zhRaw);
-  const en = parseRawWithSeps(enRaw);
-  const n  = Math.max(zh.paras.length, en.paras.length);
-
-  paras = [];
-  for (let i = 0; i < n; i++) {
-    const zhFull = zh.paras[i] || '';
-    const enFull = en.paras[i] || '';
-    paras.push({
-      zhFull,
-      enFull,
-      zhSentences: splitZhSentences(zhFull),
-      enSentences: splitEnSentences(enFull)
-    });
-  }
-
-  // Fill separators for the n-1 gaps. EN can be partial / empty; when no EN
-  // separator is available, fall back to the ZH separator so the eventual
-  // copied output mirrors the source's \n structure rather than collapsing it.
-  zhSeps = [];
-  enSeps = [];
-  for (let i = 0; i < n - 1; i++) {
-    const zSep = zh.seps[i] !== undefined ? zh.seps[i] : '\\n';
-    const eSep = en.seps[i] !== undefined ? en.seps[i] : zSep;
-    zhSeps.push(zSep);
-    enSeps.push(eSep);
-  }
-
-  // Reset view-layer: every paragraph starts as its own group
-  groups = paras.map((_, i) => ({ paraIdxs: [i], combined: false }));
-
-  document.getElementById('cnt').textContent = n;
-
-  // Show wrapper BEFORE renderBlocks so textareas have non-zero scrollHeight
-  // when autoH measures them (otherwise heights collapse to min-height = 1 line
-  // and long EN content gets clipped by overflow:hidden).
-  const wrap = document.getElementById('blocksWrap');
-  wrap.style.display = 'block';
-  renderBlocks();
-  wrap.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  setStatus('Built ' + n + ' paragraph(s) ✓', 'ok');
-}
-
-// VIEW-LAYER ONLY. Merge group `gi` with group `gi+1` so they render as one
-// visual block. Original paras/seps are untouched -> Copy & Preview output the
-// EXACT \n structure of the user's draft regardless of how many merges happen.
-function mergeWithNext(gi) {
-  if (gi < 0 || gi >= groups.length - 1) return;
-  groups[gi].paraIdxs = [...groups[gi].paraIdxs, ...groups[gi + 1].paraIdxs];
-  groups[gi].combined = false; // combined-view doesn't make sense for merged groups
-  groups.splice(gi + 1, 1);
-  renderBlocks();
-  const labels = groups[gi].paraIdxs.map(i => i + 1).join(' + ');
-  setStatus('View-merged paragraphs ' + labels + ' ✓ (output unchanged)', 'ok');
-}
-
-// VIEW-LAYER ONLY. Split a multi-paragraph group back into individual groups.
-function unmergeGroup(gi) {
-  if (gi < 0 || gi >= groups.length) return;
-  const g = groups[gi];
-  if (g.paraIdxs.length < 2) return;
-  const expanded = g.paraIdxs.map(idx => ({ paraIdxs: [idx], combined: false }));
-  groups.splice(gi, 1, ...expanded);
-  renderBlocks();
-  setStatus('Unmerged ✓', 'ok');
-}
-
-function renderBlocks() {
-  const container = document.getElementById('blocks');
-  container.innerHTML = '';
-  groups.forEach((g, gi) => container.appendChild(makeBlock(g, gi)));
-  // rAF ensures layout has settled before reading scrollHeight
-  requestAnimationFrame(() => {
-    container.querySelectorAll('textarea').forEach(autoH);
-  });
-}
-
-// Render one visual block per group. A group with N paragraphs renders all N
-// paragraphs' sentences sequentially with a divider between them.
-function makeBlock(g, gi) {
-  const isMulti = g.paraIdxs.length > 1;
-  const isLast  = (gi === groups.length - 1);
-
-  // ── Aggregate glossary hits across all paragraphs in this group (deduped)
-  const seen  = new Set();
-  const terms = [];
-  for (const pIdx of g.paraIdxs) {
-    for (const t of findTerms(paras[pIdx].zhFull)) {
-      const key = t.zh + '\x01' + t.en;
-      if (!seen.has(key)) { seen.add(key); terms.push(t); }
-    }
-  }
-  const termHtml = terms.length
-    ? terms.map(t =>
-        '<span class="pill">'
-      +   '<span class="pill-zh">' + esc(t.zh) + '</span>'
-      +   '<span class="pill-eq">=</span>'
-      +   esc(t.en)
-      + '</span>'
-      ).join('')
-    : '<span class="no-term">no glossary hits</span>';
-
-  // ── Sentence rows. Walk every paragraph in the group; insert a divider
-  //    before each paragraph after the first so users can still see the
-  //    original boundary. Each textarea is bound to its ORIGINAL paragraph
-  //    index via data-para so edits are attributed correctly even after merge.
-  let sentRows = '';
-  let rowNum   = 0;
-  g.paraIdxs.forEach((pIdx, idxInGroup) => {
-    const p = paras[pIdx];
-    if (idxInGroup > 0) {
-      sentRows += `<div class="para-divider">— Paragraph ${pIdx + 1} —</div>`;
-    }
-    const rowCount = Math.max(p.zhSentences.length, p.enSentences.length, 1);
-    for (let si = 0; si < rowCount; si++) {
-      rowNum++;
-      const zhVal = p.zhSentences[si] !== undefined ? p.zhSentences[si] : '';
-      const enVal = p.enSentences[si] !== undefined ? p.enSentences[si] : '';
-      sentRows += `<div class="sent-row">
-        <div class="sent-num">${rowNum}</div>
-        <div class="sent-zh">${zhVal ? renderZh(zhVal) : ''}</div>
-        <div class="sent-en"><textarea
-          data-para="${pIdx}" data-sent="${si}"
-          oninput="autoH(this);syncCombined(${gi})">${esc(enVal)}</textarea></div>
-      </div>`;
-    }
-  });
-
-  // ── Combined view (works for both single and merged groups). Sentence-level
-  //    textareas always exist in the DOM (just hidden behind combined view) and
-  //    keep their data-para attribution, so syncSentences distributes re-split
-  //    sentences back into the correct ORIGINAL paragraphs by DOM order.
-  const zhSentencesAll = g.paraIdxs.flatMap(pIdx => paras[pIdx].zhSentences);
-  const zhCombined = zhSentencesAll.length > 1
-    ? zhSentencesAll.map((s, si) =>
-        (si > 0 ? '<span class="sent-sep"> </span>' : '') + renderZh(s)
-      ).join('')
-    : renderZh(zhSentencesAll[0] || '');
-  const enJoined = g.paraIdxs.map(pIdx => paras[pIdx].enFull).filter(Boolean).join(' ');
-  const combinedHtml = `
-    <div class="combined-view" id="body-comb-${gi}">
-      <div class="combined-body">
-        <div class="combined-zh">${zhCombined}</div>
-        <div class="combined-en">
-          <textarea data-combined="1"
-            oninput="autoH(this);syncSentences(${gi})">${esc(enJoined)}</textarea>
-        </div>
-      </div>
-    </div>`;
-
-  // ── Header: label + pills + buttons
-  const labelText = isMulti
-    ? 'Paragraphs ' + g.paraIdxs.map(i => i + 1).join(' + ')
-    : 'Paragraph ' + (g.paraIdxs[0] + 1);
-  const unmergeBtn = isMulti
-    ? `<button class="btn-merge" onclick="unmergeGroup(${gi})"
-         title="Split this merged group back into individual paragraphs">↑ Unmerge</button>`
-    : '';
-  const mergeBtn = `<button class="btn-merge" onclick="mergeWithNext(${gi})" ${isLast ? 'disabled' : ''}
-       title="Merge with next block (view-only — does not change the copied output)">⬇ Merge next</button>`;
-  const toggleBtn = `<button class="btn-sm" id="toggle-${gi}" onclick="toggleBlock(${gi})">Merge view ▾</button>`;
-
-  const div = document.createElement('div');
-  div.className = 'para-block' + (isMulti ? ' is-merged' : '');
-  div.id = 'block-' + gi;
-  div.innerHTML = `
-    <div class="block-hdr">
-      <span class="block-label">${labelText}</span>
-      <div class="block-pills">${termHtml}</div>
-      ${unmergeBtn}
-      ${mergeBtn}
-      ${toggleBtn}
-    </div>
-    <div class="block-body" id="body-sent-${gi}">${sentRows}</div>
-    ${combinedHtml}`;
-
-  return div;
-}
-
-// ── Toggle a group between sentence-level rows and a single combined textarea.
-//    Works for both single-paragraph and merged groups; in merged groups the
-//    combined textarea spans all paragraphs and on edit-commit the resulting
-//    sentences flow back into the correct ORIGINAL paragraphs by DOM order
-//    (each sent-row textarea preserves its data-para attribution).
-function toggleBlock(gi) {
-  const g = groups[gi];
-  if (!g) return;
-  g.combined = !g.combined;
-
-  const sentView = document.getElementById('body-sent-' + gi);
-  const combView = document.getElementById('body-comb-' + gi);
-  const btn      = document.getElementById('toggle-' + gi);
-
-  if (g.combined) {
-    const sentTas = sentView.querySelectorAll('textarea');
-    const joined  = Array.from(sentTas).map(ta => ta.value).filter(Boolean).join(' ');
-    const combTa  = combView.querySelector('textarea');
-    combTa.value  = joined;
-    sentView.style.display = 'none';
-    combView.style.display = 'block';
-    btn.textContent = 'Split view ▴';
-    btn.classList.add('active');
-    autoH(combTa);
-  } else {
-    const combTa  = combView.querySelector('textarea');
-    const reSplit = splitEnSentences(combTa.value);
-    const sentTas = sentView.querySelectorAll('textarea');
-    sentTas.forEach((ta, si) => {
-      ta.value = reSplit[si] !== undefined ? reSplit[si] : '';
-    });
-    sentView.style.display = 'block';
-    combView.style.display = 'none';
-    btn.textContent = 'Merge view ▾';
-    btn.classList.remove('active');
-    sentTas.forEach(autoH);
-  }
-}
-
-// Sync combined textarea when a sentence textarea changes (single-para groups).
-function syncCombined(gi) {
-  const combTa = document.querySelector('#body-comb-' + gi + ' textarea');
-  if (!combTa) return; // multi-para groups have no combined view
-  const sentTas = document.querySelectorAll('#body-sent-' + gi + ' textarea');
-  combTa.value = Array.from(sentTas).map(ta => ta.value).filter(Boolean).join(' ');
-  autoH(combTa);
-}
-
-// Re-split combined EN into sentence rows when combined textarea changes.
-function syncSentences(gi) {
-  const combTa  = document.querySelector('#body-comb-' + gi + ' textarea');
-  if (!combTa) return;
-  const reSplit = splitEnSentences(combTa.value);
-  const sentTas = document.querySelectorAll('#body-sent-' + gi + ' textarea');
-  sentTas.forEach((ta, si) => {
-    ta.value = reSplit[si] !== undefined ? reSplit[si] : '';
-    autoH(ta);
-  });
-}
-
-// ── Collect final EN for ORIGINAL paragraph index `pIdx`, regardless of which
-//    group currently displays it. Sentence-level textareas are always present
-//    in the DOM (even when hidden behind combined view) and are kept in sync
-//    by syncSentences, so they are the single source of truth.
-function getParaEN(pIdx) {
-  const tas = document.querySelectorAll(
-    'textarea[data-para="' + pIdx + '"][data-sent]'
-  );
-  return Array.from(tas).map(ta => ta.value).filter(Boolean).join(' ');
-}
-
-// ── Preview modal ────────────────────────────────────────────────────────────
-// Always renders the ORIGINAL paragraph structure with the EXACT \n separators
-// from the user's draft. Merge / unmerge are pure view-layer operations and
-// have NO effect here.
-function showPreview() {
-  if (!paras.length) { alert('Please build the table first.'); return; }
-
-  const nlCount = sep => (sep.match(/\\n/g) || []).length;
-
-  let zhHtml = '';
-  let enHtml = '';
-  paras.forEach((p, i) => {
-    zhHtml += renderZh(p.zhFull);
-    // EN side may contain user-typed color codes [RRGGBB]…[-] AND literal \n.
-    // Pipeline: esc -> nlToBr -> colorize so all three get rendered live.
-    enHtml += colorize(nlToBr(esc(getParaEN(i))));
-    if (i < paras.length - 1) {
-      zhHtml += '<br>'.repeat(nlCount(zhSeps[i]));
-      enHtml += '<br>'.repeat(nlCount(enSeps[i]));
-    }
-  });
-  document.getElementById('pvZh').innerHTML = zhHtml;
-  document.getElementById('pvEn').innerHTML = enHtml;
-
-  document.getElementById('overlay').classList.add('on');
-}
-
-function closePreview() {
-  document.getElementById('overlay').classList.remove('on');
-}
-
-document.getElementById('overlay').addEventListener('click', e => {
-  if (e.target === document.getElementById('overlay')) closePreview();
-});
-
-// ── Copy: rebuild the result using the ORIGINAL paragraph list and the EXACT
-//         \n separators captured from the user's draft. Merge / unmerge are
-//         purely visual and never touch this output. Nothing is auto-inserted.
-async function doCopy() {
-  let result = '';
-  paras.forEach((_, i) => {
-    result += getParaEN(i);
-    if (i < paras.length - 1) result += enSeps[i];
-  });
-
-  try {
-    await navigator.clipboard.writeText(result);
-  } catch {
-    const ta = document.createElement('textarea');
-    ta.value = result;
-    ta.style.cssText = 'position:fixed;opacity:0;top:0;left:0';
-    document.body.appendChild(ta);
-    ta.focus(); ta.select();
-    document.execCommand('copy');
-    document.body.removeChild(ta);
-  }
-  const toast = document.getElementById('toast');
-  toast.classList.add('on');
-  setTimeout(() => toast.classList.remove('on'), 3000);
-}
-
-function confirmAndCopy() { doCopy(); closePreview(); }
-</script>
-</body>
-</html>"""
+C0 = "#0D0D0D"
+C1 = "#161616"
+C2 = "#222222"
+C3 = "#333333"
+CG = "#D4AF37"
+CT = "#E6C27A"
+CW = "#E0E0E0"
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# HTTP request handler
-# ─────────────────────────────────────────────────────────────────────────────
-class Handler(http.server.BaseHTTPRequestHandler):
+class App:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("宣传图制作工作台 V2.2")
+        self.root.geometry("1400x850")
+        self.root.configure(bg=C0)
+        self.app_dir = self._ap()
+        self.queue = []
+        self.cur = None
+        self.final = None
+        self.fc = {}
+        self.sfonts = self._sf()
+        self.fld = {}
+        self._rp = None
+        self._ri = None
+        self._tn = None
+        self.ti = None
+        self.pi = None
+        self.sc = 1.0
+        self.vx = self.vy = 0
+        self.dsx = self.dsy = self.dbx = self.dby = 0
+        self.psx = self.psy = self.bvx = self.bvy = 0
+        self.tki = None
+        self.cid = None
+        self._f1 = True
+        self._rj = None
+        self.drag_mode = None
+        self.handle_size = 14
+        self.resize_handle = None
 
-    def log_message(self, fmt, *args):
-        pass
+        st = ttk.Style()
+        st.theme_use('clam')
+        st.configure("TCombobox", fieldbackground=C3, background=C2,
+                     foreground=CG, arrowcolor=CG, bordercolor=C2)
+        st.map("TCombobox", fieldbackground=[("readonly", C3)],
+               selectbackground=[("readonly", CG)], selectforeground=[("readonly", "black")],
+               foreground=[("readonly", CG)])
+        for k, v in [('background', C3), ('foreground', CG),
+                     ('selectBackground', CG), ('selectForeground', 'black')]:
+            self.root.option_add(f'*TCombobox*Listbox.{k}', v)
 
-    def _send_json(self, code: int, data: dict):
-        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        self._ui()
+        self._st()
+        self._dnd()
 
-    def do_GET(self):
-        if self.path == "/":
-            body = HTML.encode("utf-8")
-            self.send_response(200)
-            self.send_header("Content-Type", "text/html; charset=utf-8")
-            self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            self.wfile.write(body)
-        elif self.path == "/api/glossary":
-            terms, msg = load_glossary()
-            if terms:
-                self._send_json(200, {"terms": terms, "message": msg})
-            else:
-                self._send_json(200, {"terms": [], "error": msg})
+    @staticmethod
+    def _ap():
+        if getattr(sys, 'frozen', False):
+            exe_dir = os.path.dirname(sys.executable)
+            internal_dir = os.path.join(exe_dir, "_internal")
+            if os.path.isdir(internal_dir):
+                return internal_dir
+            return exe_dir
+        return os.path.dirname(os.path.abspath(__file__))
+
+    def _ui(self):
+        L = tk.Frame(self.root, bg=C1, width=420)
+        L.pack(side=tk.LEFT, fill=tk.Y, padx=10, pady=10)
+        L.pack_propagate(False)
+        tk.Label(L, text="⚜️ 核心工作台", fg=CG, bg=C1,
+                 font=("Microsoft YaHei UI", 18, "bold")).pack(pady=(15, 10))
+
+        b1 = tk.LabelFrame(L, text=" 模板与录入 ", bg=C2, fg=CG,
+                           font=("Microsoft YaHei UI", 11, "bold"), bd=1)
+        b1.pack(fill=tk.X, padx=10, pady=5)
+        self.cmb = ttk.Combobox(b1, state="readonly", font=("Arial", 12, "bold"))
+        self.cmb.pack(fill=tk.X, padx=15, pady=(15, 10))
+        self.cmb.bind("<<ComboboxSelected>>", self._tc)
+        tk.Button(b1, text="[ 点击多选 / 拖入图片 ]\n建立批量排队", command=self._sel,
+                  bg="#2B2B2B", fg=CT, activebackground=CG, activeforeground="black",
+                  font=("Microsoft YaHei UI", 10), height=2, relief="groove"
+                  ).pack(fill=tk.X, padx=15, pady=(5, 10))
+        self.lq = tk.Label(b1, text="[队列空闲]", fg="#888", bg=C2,
+                           font=("Microsoft YaHei UI", 9))
+        self.lq.pack(pady=(0, 10))
+
+        b2 = tk.LabelFrame(L, text=" 空间参数 ", bg=C2, fg=CG,
+                           font=("Microsoft YaHei UI", 10), bd=1)
+        b2.pack(fill=tk.X, padx=10, pady=5)
+        fp = tk.Frame(b2, bg=C2)
+        fp.pack(pady=10)
+
+        def mks(p, t, lo, hi, c):
+            tk.Label(p, text=t, bg=C2, fg=CW,
+                     font=("Microsoft YaHei", 9)).grid(row=0, column=c * 2, padx=(5, 0))
+            s = tk.Spinbox(p, from_=lo, to=hi, width=5, bg=C3, fg=CG,
+                           insertbackground=CG, buttonbackground=C2)
+            s.grid(row=0, column=c * 2 + 1, padx=2)
+            return s
+
+        self.ssz = mks(fp, "宽:", 10, 8000, 0)
+        self.sx = mks(fp, "X:", -4000, 4000, 1)
+        self.sy = mks(fp, "Y:", -4000, 4000, 2)
+        self.ssz.config(command=self._full)
+        self.ssz.bind("<Return>", lambda e: self._full())
+        self.sx.config(command=self._fast)
+        self.sx.bind("<Return>", lambda e: self._fast())
+        self.sy.config(command=self._fast)
+        self.sy.bind("<Return>", lambda e: self._fast())
+
+        b3 = tk.LabelFrame(L, text=" 🌟 光效 ", bg=C2, fg=CG,
+                           font=("Microsoft YaHei UI", 10), bd=1)
+        b3.pack(fill=tk.X, padx=10, pady=5)
+
+        def mksc(par, txt, lo, hi, val):
+            f = tk.Frame(par, bg=C2)
+            f.pack(fill=tk.X, padx=10, pady=4)
+            tk.Label(f, text=txt, bg=C2, fg=CW,
+                     font=("Microsoft YaHei", 9)).pack(side=tk.LEFT)
+            s = tk.Scale(f, from_=lo, to=hi, orient=tk.HORIZONTAL, bg=C2, fg=CG,
+                         bd=0, highlightthickness=0, troughcolor=C3,
+                         activebackground=CG, command=lambda v: self._fast())
+            s.pack(side=tk.LEFT, fill=tk.X, expand=True, padx=10)
+            s.set(val)
+            return s
+
+        self.sli = mksc(b3, "光线强度:", 0, 100, 80)
+        self.sfl = mksc(b3, "横光偏移:", -200, 200, 23)
+
+        # E6 专用：主景横光辉位置（与昵称「左右/上下」独立）
+        self.fglow = tk.Frame(b3, bg=C2)
+
+        def mkg(p, t, lo, hi):
+            tk.Label(p, text=t, bg=C2, fg=CW,
+                     font=("Microsoft YaHei", 9)).pack(side=tk.LEFT)
+            s = tk.Spinbox(p, from_=lo, to=hi, width=6, bg=C3, fg=CG,
+                           insertbackground=CG, buttonbackground=C2,
+                           command=self._fast)
+            s.pack(side=tk.LEFT, padx=8)
+            s.bind("<Return>", lambda e: self._fast())
+            return s
+
+        gf = tk.Frame(self.fglow, bg=C2)
+        gf.pack(fill=tk.X, padx=10, pady=4)
+        self.sgx = mkg(gf, "横光左右:", -2000, 2000)
+        self.sgy = mkg(gf, "横光上下:", -500, 2500)
+
+        self.btxt = tk.LabelFrame(L, text=" 文字编辑 ", bg=C2, fg=CG,
+                                  font=("Microsoft YaHei UI", 10), bd=1)
+        self.btxt.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+
+        bf = tk.Frame(L, bg=C1)
+        bf.pack(fill=tk.X, padx=10, pady=15, side=tk.BOTTOM)
+        tk.Button(bf, text="⟳ 刷新", command=self._full, bg="#222", fg=CW,
+                  relief="groove").pack(fill=tk.X, pady=(0, 10))
+        self.bsv = tk.Button(bf, text="✦ 渲染输出 ✦", command=self._save, bg=CG,
+                             fg="black", activebackground="#FFE47A", activeforeground="black",
+                             font=("Microsoft YaHei UI", 13, "bold"), height=2,
+                             state="disabled", cursor="hand2")
+        self.bsv.pack(fill=tk.X)
+
+        R = tk.LabelFrame(self.root,
+                          text=" 🖥️ [滚轮缩放视图] [Ctrl+滚轮细调大小] [拖边角缩放] [左键拖位置] [右键平移] ",
+                          bg=C0, fg=CG, font=("Microsoft YaHei UI", 11, "bold"), bd=1)
+        R.pack(side=tk.RIGHT, fill=tk.BOTH, expand=True, padx=(0, 10), pady=10)
+        self.cv = tk.Canvas(R, bg="#080808", highlightthickness=0, cursor="tcross")
+        self.cv.pack(fill=tk.BOTH, expand=True)
+        self.cv.create_text(400, 300, text="等待图像…", fill="#444",
+                            font=("Microsoft YaHei", 16))
+        for ev, fn in [("<MouseWheel>", self._zm), ("<Button-4>", self._zm),
+                       ("<Button-5>", self._zm), ("<Control-MouseWheel>", self._czm),
+                       ("<Control-Button-4>", self._czm), ("<Control-Button-5>", self._czm),
+                       ("<ButtonPress-1>", self._ds), ("<B1-Motion>", self._dm),
+                       ("<ButtonRelease-1>", self._de),
+                       ("<ButtonPress-3>", self._ps), ("<B3-Motion>", self._pm),
+                       ("<ButtonPress-2>", self._ps), ("<B2-Motion>", self._pm),
+                       ("<Control-ButtonPress-1>", self._ps), ("<Control-B1-Motion>", self._pm)]:
+            self.cv.bind(ev, fn)
+
+    def _dnd(self):
+        try:
+            self.root.drop_target_register(DND_FILES)
+            self.root.dnd_bind('<<Drop>>',
+                               lambda e: self._aq(self.root.tk.splitlist(e.data)))
+        except:
+            pass
+
+    def _sel(self):
+        p = filedialog.askopenfilenames(
+            title="选择照片", filetypes=[("Images", "*.png *.jpg *.jpeg *.webp")])
+        if p:
+            self._aq(p)
+
+    def _aq(self, paths):
+        v = [p for p in paths
+             if str(p).lower().endswith(('.png', '.jpg', '.jpeg', '.webp'))]
+        if not v:
+            return
+        self.queue.extend(v)
+        if not self.cur:
+            self._nx()
         else:
-            self.send_error(404)
+            self._uq()
 
+    def _nx(self):
+        if not self.queue:
+            self.cur = None
+            self.lq.config(text="✅ 完成", fg="#2ECC71")
+            self.bsv.config(state="disabled", text="✦ 输出 ✦")
+            return
+        self.cur = self.queue.pop(0)
+        self._uq()
+        self._full()
 
-# ─────────────────────────────────────────────────────────────────────────────
-# Entry point
-# ─────────────────────────────────────────────────────────────────────────────
-class _Server(http.server.HTTPServer):
-    allow_reuse_address = True
+    def _uq(self):
+        nm = os.path.basename(self.cur)
+        r = len(self.queue)
+        if r > 0:
+            self.lq.config(text=f"▶ {nm} | ⏳{r}张", fg=CT)
+            self.bsv.config(text=f"✦ 保存并下一张({r}) ✦")
+        else:
+            self.lq.config(text=f"▶ {nm} | 🏁最后", fg=CG)
+            self.bsv.config(text="✦ 保存终图 ✦")
+
+    def _save(self):
+        if not self.final or not self.cur:
+            return
+        try:
+            d = os.path.dirname(self.cur)
+            n = os.path.splitext(os.path.basename(self.cur))[0]
+            tpl = self.cmb.get().lower()
+            pfx = "E7出图" if "e7" in tpl else "E6出图"
+            self.final.save(
+                os.path.join(d, f"{pfx}-{n}.png"),
+                format="PNG",
+                optimize=False,
+                compress_level=0
+            )
+            self._nx()
+            if not self.queue and not self.cur:
+                messagebox.showinfo("收工", "🎉 全部完成！")
+        except Exception as e:
+            messagebox.showerror("异常", str(e))
+
+    def _st(self):
+        vl = []
+        try:
+            for f in os.listdir(self.app_dir):
+                lo = f.lower()
+                if "template_e6" in lo and lo.endswith(('.png', '.jpg')):
+                    vl.append(f)
+                    TEMPLATE_CONFIGS[f] = TEMPLATE_CONFIGS["template_E6.png"]
+                elif "template_e7" in lo and lo.endswith(('.png', '.jpg')):
+                    vl.append(f)
+                    TEMPLATE_CONFIGS[f] = TEMPLATE_CONFIGS["template_E7.png"]
+        except:
+            pass
+        if vl:
+            self.cmb['values'] = vl
+            self.cmb.current(0)
+            self._tc()
+        else:
+            messagebox.showwarning("警告", "没找到模板！")
+
+    def _tc(self, ev=None):
+        cfg = TEMPLATE_CONFIGS.get(self.cmb.get())
+        if not cfg:
+            return
+        for s, k in [(self.ssz, "size"), (self.sx, "x"), (self.sy, "y")]:
+            s.delete(0, 'end')
+            s.insert(0, cfg["photo"][k])
+        gv = cfg.get("glow", {"x": 0, "y": 514})
+        self.sgx.delete(0, 'end')
+        self.sgx.insert(0, str(gv.get("x", 0)))
+        self.sgy.delete(0, 'end')
+        self.sgy.insert(0, str(gv.get("y", 514)))
+        if cfg.get("style") == "E6_Classic":
+            self.fglow.pack(fill=tk.X, padx=0, pady=0)
+        else:
+            self.fglow.pack_forget()
+        self.vx = self.vy = 0
+        for w in self.btxt.winfo_children():
+            w.destroy()
+        self.fld.clear()
+        for fk, fv in cfg["fields"].items():
+            g = tk.Frame(self.btxt, bg=C2)
+            g.pack(fill=tk.X, padx=10, pady=(8, 0))
+            tk.Label(g, text=fv["label"], fg=CT, bg=C2,
+                     font=("Microsoft YaHei UI", 9, "bold")).pack(anchor="w")
+            ent = tk.Entry(g, font=("Trebuchet MS", 12), justify="center",
+                           bg=C3, fg=CG, insertbackground=CG, bd=0)
+            ent.pack(fill=tk.X, ipady=4, pady=2)
+            ent.bind("<KeyRelease>", lambda e: self._fast())
+            fc = tk.Frame(g, bg=C2)
+            fc.pack(fill=tk.X, pady=2)
+
+            def mk(p, t, a, b):
+                tk.Label(p, text=t, bg=C2, fg=CW,
+                         font=("Microsoft YaHei", 8)).pack(side=tk.LEFT, padx=(5, 0))
+                s = tk.Spinbox(p, from_=a, to=b, width=4, bg=C3, fg=CG,
+                               buttonbackground=C2, command=self._fast)
+                s.pack(side=tk.LEFT, padx=2)
+                s.bind("<Return>", lambda e: self._fast())
+                return s
+
+            ss = mk(fc, "字号:", 10, 400)
+            ss.delete(0, 'end')
+            ss.insert(0, fv["size"])
+            sxx = mk(fc, "左右:", -1000, 1000)
+            sxx.delete(0, 'end')
+            sxx.insert(0, fv["x"])
+            syy = mk(fc, "上下:", -500, 2000)
+            syy.delete(0, 'end')
+            syy.insert(0, fv["y"])
+            self.fld[fk] = {"e": ent, "ss": ss, "sx": sxx, "sy": syy,
+                            "c": fv["color"], "s": fv["stroke"]}
+        if self.cur:
+            self._full()
+
+            # ═══ 画布交互 ═══
+
+    def _zm(self, e):
+        if not self.final or e.state & 0x0004:
+            return
+        self.sc *= 1.15 if (e.delta > 0 or e.num == 4) else 1 / 1.15
+        self._disp()
+
+    def _czm(self, e):
+        if not self.final:
+            return
+        try:
+            c = int(self.ssz.get())
+            fine = max(1, min(8, int(round(c * 0.01))))
+            coarse = max(5, min(30, int(round(c * 0.03))))
+            step = coarse if e.state & 0x0001 else fine
+            d = getattr(e, 'delta', 0)
+            if e.num == 4 or d > 0:
+                n = c + step
+            elif e.num == 5 or d < 0:
+                n = c - step
+            else:
+                return
+            self.ssz.delete(0, 'end')
+            self.ssz.insert(0, str(max(10, min(n, 8000))))
+            self._full()
+        except:
+            pass
+
+    def _ds(self, e):
+        if not self.final:
+            return
+        self.drag_mode = "move"
+        self.dsx = e.x
+        self.dsy = e.y
+        try:
+            self.dbx = int(self.sx.get())
+            self.dby = int(self.sy.get())
+            self.resize_handle = self._hit_resize_handle(e.x, e.y)
+            if self.resize_handle:
+                self.drag_mode = "resize"
+                self.dbw = int(self.ssz.get())
+        except:
+            pass
+
+    def _dm(self, e):
+        if not self.final:
+            return
+        if self.drag_mode == "resize":
+            self._drag_resize(e)
+            return
+        self.sx.delete(0, 'end')
+        self.sx.insert(0, int(self.dbx + (e.x - self.dsx) / self.sc))
+        self.sy.delete(0, 'end')
+        self.sy.insert(0, int(self.dby + (e.y - self.dsy) / self.sc))
+        self._fast()
+
+    def _ps(self, e):
+        if not self.final:
+            return
+        self.psx = e.x
+        self.psy = e.y
+        self.bvx = self.vx
+        self.bvy = self.vy
+
+    def _de(self, e):
+        self.drag_mode = None
+        self.resize_handle = None
+
+    def _pm(self, e):
+        if not self.final or not self.cid:
+            return
+        self.vx = self.bvx + (e.x - self.psx)
+        self.vy = self.bvy + (e.y - self.psy)
+        self._disp()
+
+    def _photo_bounds(self):
+        if not self.final or not self.pi:
+            return None
+        w, h = self.final.size
+        nw = max(10, int(w * self.sc))
+        nh = max(10, int(h * self.sc))
+        cx = self.cv.winfo_width() / 2 + self.vx
+        cy = self.cv.winfo_height() / 2 + self.vy
+        bx = cx - nw / 2 + int(self.sx.get()) * self.sc
+        by = cy - nh / 2 + int(self.sy.get()) * self.sc
+        bw = self.pi.size[0] * self.sc
+        bh = self.pi.size[1] * self.sc
+        return bx, by, bw, bh
+
+    def _hit_resize_handle(self, x, y):
+        bounds = self._photo_bounds()
+        if not bounds:
+            return None
+        bx, by, bw, bh = bounds
+        hs = self.handle_size
+        mx = bx + bw / 2
+        my = by + bh / 2
+        hit_boxes = {
+            "nw": (bx - hs, by - hs, bx + hs, by + hs),
+            "n": (mx - hs, by - hs, mx + hs, by + hs),
+            "ne": (bx + bw - hs, by - hs, bx + bw + hs, by + hs),
+            "e": (bx + bw - hs, my - hs, bx + bw + hs, my + hs),
+            "se": (bx + bw - hs, by + bh - hs, bx + bw + hs, by + bh + hs),
+            "s": (mx - hs, by + bh - hs, mx + hs, by + bh + hs),
+            "sw": (bx - hs, by + bh - hs, bx + hs, by + bh + hs),
+            "w": (bx - hs, my - hs, bx + hs, my + hs),
+        }
+        for name, (x1, y1, x2, y2) in hit_boxes.items():
+            if x1 <= x <= x2 and y1 <= y <= y2:
+                return name
+        return None
+
+    def _drag_resize(self, e):
+        bounds = self._photo_bounds()
+        if not bounds or not self._ri:
+            return
+        bx, by, bw, bh = bounds
+        ow, oh = self._ri.size
+        if ow <= 0 or oh <= 0 or self.sc == 0 or not self.resize_handle:
+            return
+        ratio = oh / float(ow)
+        right = bx + bw
+        bottom = by + bh
+        width_candidates = []
+        if "e" in self.resize_handle:
+            width_candidates.append((e.x - bx) / self.sc)
+        if "w" in self.resize_handle:
+            width_candidates.append((right - e.x) / self.sc)
+        if "n" in self.resize_handle:
+            width_candidates.append(((bottom - e.y) / self.sc) / ratio)
+        if "s" in self.resize_handle:
+            width_candidates.append(((e.y - by) / self.sc) / ratio)
+        if not width_candidates:
+            return
+        new_width = max(10, min(8000, int(round(max(width_candidates)))))
+        old_width = max(1, self.dbw)
+        old_height = max(1, int(round(old_width * ratio)))
+        new_height = max(1, int(round(new_width * ratio)))
+        new_x = self.dbx
+        new_y = self.dby
+        if "w" in self.resize_handle:
+            new_x = self.dbx + (old_width - new_width)
+        if "n" in self.resize_handle:
+            new_y = self.dby + (old_height - new_height)
+        self.ssz.delete(0, 'end')
+        self.ssz.insert(0, str(new_width))
+        self.sx.delete(0, 'end')
+        self.sx.insert(0, str(new_x))
+        self.sy.delete(0, 'end')
+        self.sy.insert(0, str(new_y))
+        self._full()
+
+        # ═══ 字体 ═══
+
+    def _sf(self):
+        sys_name = platform.system().lower()
+        if sys_name == "windows":
+            fd = "C:\\Windows\\Fonts"
+            names = ["seguiemj.ttf", "seguisym.ttf", "impact.ttf", "arialbd.ttf",
+                     "msyhbd.ttc", "tahomabd.ttf", "tahoma.ttf", "arial.ttf",
+                     "msyh.ttc", "simsun.ttc"]
+        elif sys_name == "darwin":
+            fd = "/System/Library/Fonts"
+            names = [
+                "PingFang.ttc", "Helvetica.ttc", "HelveticaNeue.ttc",
+                "Arial.ttf", "Arial Bold.ttf", "Hiragino Sans GB.ttc",
+                "STHeiti Medium.ttc", "Apple Color Emoji.ttc"
+            ]
+        else:
+            fd = "/usr/share/fonts"
+            names = [
+                "NotoSansCJK-Regular.ttc", "NotoSansCJK-Bold.ttc",
+                "DejaVuSans.ttf", "LiberationSans-Regular.ttf"
+            ]
+        pri = []
+        for n in names:
+            full = os.path.join(fd, n)
+            pri.append(full if os.path.exists(full) else n)
+        try:
+            extra_dirs = [fd]
+            if sys_name == "darwin":
+                extra_dirs.extend([
+                    "/Library/Fonts",
+                    os.path.expanduser("~/Library/Fonts")
+                ])
+            elif sys_name == "linux":
+                extra_dirs.extend([
+                    "/usr/local/share/fonts",
+                    os.path.expanduser("~/.fonts")
+                ])
+            ex = set(os.path.basename(p).lower() for p in pri)
+            ext = []
+            for d in extra_dirs:
+                if not os.path.isdir(d):
+                    continue
+                for f in os.listdir(d):
+                    lo = f.lower()
+                    if lo.endswith(('.ttf', '.ttc', '.otf')) and lo not in ex:
+                        ext.append(os.path.join(d, f))
+            return pri + ext
+        except:
+            return pri
+
+    def _gf(self, char, size):
+        ck = f"{char}_{size}"
+        if ck in self.fc:
+            return self.fc[ck]
+        fpk = f"__fp_{ord(char)}"
+        if fpk in self.fc:
+            try:
+                f = ImageFont.truetype(self.fc[fpk], size)
+                self.fc[ck] = (f, char)
+                return f, char
+            except:
+                del self.fc[fpk]
+        for fp in self.sfonts:
+            try:
+                f = ImageFont.truetype(fp, size)
+                if f.getlength(char) <= 0:
+                    continue
+                if not self._fok(fp, char):
+                    continue
+                self.fc[ck] = (f, char)
+                self.fc[fpk] = fp
+                return f, char
+            except:
+                continue
+        return ImageFont.load_default(), char
+
+    def _fok(self, fp, char):
+        k = f"__ok_{fp}_{ord(char)}"
+        if k in self.fc:
+            return self.fc[k]
+        ok = False
+        try:
+            tf = ImageFont.truetype(fp, 20)
+            m1 = tf.getmask(char)
+            m2 = tf.getmask('\ufffe')
+            if m1.size != m2.size:
+                ok = m1.getbbox() is not None
+            else:
+                ok = (m1.tobytes() != m2.tobytes()) and (m1.getbbox() is not None)
+        except:
+            pass
+        self.fc[k] = ok
+        return ok
+
+        # ═══ 文字渲染引擎 ═══
+
+    def _dtxt(self, tgt, text, tw, th, sz, ox, yp, mc, sc_, sty):
+
+        # 极限 5 倍超采样抗锯齿 (SSAA)
+        SSA = 5
+        sz_s = sz * SSA
+
+        cd = []
+        totw_s = 0
+        for ch in text:
+            if ch.isspace():
+                w_s = sz_s * 0.4
+                cd.append((" ", None, w_s))
+                totw_s += w_s
+                continue
+            fn, fc = self._gf(ch, sz_s)
+            try:
+                w_s = fn.getlength(fc)
+            except:
+                w_s = sz_s * 0.8
+            cd.append((fc, fn, w_s))
+            totw_s += w_s
+
+        pad_s = int(sz_s * 2.5)
+        cw_s = int(totw_s + pad_s * 2)
+        cvh_s = int(sz_s * 4.5)
+        tx_s = pad_s
+        ty_s = sz_s
+        bw_s = max(1, int(sz_s * 0.045))
+
+        mt = Image.new("L", (cw_s, cvh_s), 0)
+        dt = ImageDraw.Draw(mt)
+        sw_s = max(2, int(sz_s * 0.07))
+        mo = Image.new("L", (cw_s, cvh_s), 0)
+        do = ImageDraw.Draw(mo)
+        gw_s = max(6, int(sz_s * 0.22))
+        mg = Image.new("L", (cw_s, cvh_s), 0)
+        dg_ = ImageDraw.Draw(mg)
+
+        # 极薄厚底设置 (使用超采样尺度)
+        dep_s = max(1, int(sz_s * 0.025))
+
+        ra = 0
+        for _, fn, _ in cd:
+            if fn:
+                ra = fn.getmetrics()[0]
+                break
+
+        cx_s = tx_s
+        for c, fn, w_s in cd:
+            if fn:
+                dy = ra - fn.getmetrics()[0]
+                dt.text((cx_s, ty_s + dy), c, font=fn, fill=255,
+                        stroke_width=bw_s, stroke_fill=255)
+                do.text((cx_s, ty_s + dy), c, font=fn, fill=255,
+                        stroke_width=sw_s + bw_s, stroke_fill=255)
+                dg_.text((cx_s, ty_s + dy), c, font=fn, fill=255,
+                         stroke_width=gw_s + bw_s, stroke_fill=255)
+            cx_s += w_s
+
+        gold = mc != "#FFFFFF"
+        up = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
+        is7 = sty == "E7_Italic"
+
+        if gold and not is7:
+            gr_s = max(3, int(sz_s * 0.18))
+            gb = mg.filter(ImageFilter.GaussianBlur(radius=gr_s))
+            gt = Image.new("RGBA", (cw_s, cvh_s), (255, 190, 60, 0))
+            ga = np.array(gb, dtype=np.float32) / 255.0
+            yt0 = max(0, ty_s - int(sz_s * 0.3))
+            yb0 = min(cvh_s - 1, ty_s + int(sz_s * 1.6))
+            vt = np.zeros(cvh_s, dtype=np.float32)
+            for y in range(cvh_s):
+                if y <= yt0:
+                    vt[y] = 0.02
+                elif y <= yb0:
+                    vt[y] = 0.02 + 0.98 * ((y - yt0) / max(1, yb0 - yt0))
+                else:
+                    vt[y] = 1.0
+            al = np.clip(ga * vt.reshape(-1, 1) * 0.8 * 255, 0, 255).astype(np.uint8)
+            gt.putalpha(Image.fromarray(al))
+            up.alpha_composite(gt)
+        elif not gold:
+            gr_s = max(3, int(sz_s * 0.18))
+            gb = mg.filter(ImageFilter.GaussianBlur(radius=gr_s))
+            gt = Image.new("RGBA", (cw_s, cvh_s), (180, 200, 255, 0))
+            gt.putalpha(gb.point(lambda p: min(255, int(p * 0.35))))
+            up.alpha_composite(gt)
+
+            # 👇 --- 修改点 7：为 E6 和 E7 重启统一的顶光阴影系统 --- 👇
+        m_full = mt.copy()
+        for i in range(1, dep_s + 1):
+            shifted = Image.new("L", (cw_s, cvh_s), 0)
+            shifted.paste(mt, (0, i))
+            m_full = ImageChops.lighter(m_full, shifted)
+
+        olw_s = max(1, int(sz_s * 0.025))
+        expanded = m_full.filter(ImageFilter.MaxFilter(olw_s * 2 + 1))
+
+        shifted_expanded = Image.new("L", (cw_s, cvh_s), 0)
+        shifted_expanded.paste(expanded, (0, olw_s + 1))
+
+        ring = ImageChops.subtract(shifted_expanded, m_full)
+        ring_soft = ring.filter(ImageFilter.GaussianBlur(2.5))
+
+        # 为金字和白字分别配制最合适的阴影颜色和透明度
+        if gold:
+            ring_soft = ring_soft.point(lambda p: int(p * 0.65))  # 金字用65%透明度
+            shadow_color = (20, 10, 0, 255)  # 暖暗褐色
+        else:
+            ring_soft = ring_soft.point(lambda p: int(p * 0.80))  # 白字需要更高透明度(80%)分离背景
+            shadow_color = (15, 15, 20, 255)  # 冷暗灰偏青色
+
+        ol_layer = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
+        ol_layer.paste(Image.new("RGBA", (cw_s, cvh_s), shadow_color), mask=ring_soft)
+        up.alpha_composite(ol_layer)
+        # 👆 ----------------------------------------------------------- 👆
+
+        # ③ 斜面厚度特效
+        bev_dep_s = max(2, dep_s // 2) if is7 else dep_s
+        for i in range(bev_dep_s, 0, -1):
+            t = i / max(1, bev_dep_s)
+            if gold:
+                r = int(230 * t + 185 * (1 - t))
+                g = int(180 * t + 145 * (1 - t))
+                b = int(45 * t + 15 * (1 - t))
+            else:
+                v = int(90 * t + 55 * (1 - t))
+                r, g, b = v, v, int(v * 1.1)
+            up.paste(Image.new("RGBA", (cw_s, cvh_s), (r, g, b, 255)),
+                     (0, i), mask=mt)
+
+            # ④ 渐变补色
+        if gold:
+            stops = [
+                (0.00, (255, 255, 245)),
+                (0.25, (255, 235, 120)),
+                (0.60, (220, 160, 20)),
+                (1.00, (110, 60, 0)),
+            ]
+        else:
+            stops = [
+                (0.00, (255, 255, 255)), (0.25, (238, 240, 248)),
+                (0.45, (175, 180, 200)), (0.55, (148, 152, 172)),
+                (0.75, (215, 220, 235)), (1.00, (248, 250, 255)),
+            ]
+
+        grd = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
+        gd = ImageDraw.Draw(grd)
+
+        bbox = mt.getbbox()
+        if bbox:
+            yt_s = bbox[1]
+            yb_s = bbox[3]
+        else:
+            yt_s = ty_s - int(sz_s * 0.08)
+            yb_s = ty_s + int(sz_s * 1.08)
+
+        sp_s = max(1, yb_s - yt_s)
+        for y in range(yt_s, yb_s + 1):
+            t = max(0.0, min(1.0, (y - yt_s) / sp_s))
+            lo, hi = stops[0], stops[-1]
+            for j in range(len(stops) - 1):
+                if stops[j][0] <= t <= stops[j + 1][0]:
+                    lo, hi = stops[j], stops[j + 1]
+                    break
+            f = (t - lo[0]) / max(0.0001, hi[0] - lo[0])
+            f = max(0.0, min(1.0, f))
+            f = f * f * (3 - 2 * f)
+            rgb = tuple(int(lo[1][c] + (hi[1][c] - lo[1][c]) * f) for c in range(3))
+            gd.line([(0, y), (cw_s, y)], fill=(*rgb, 255))
+
+        fc2 = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
+        fc2.paste(grd, mask=mt)
+        up.alpha_composite(fc2)
+
+        # ⑤ 高光点缀
+        si = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
+        sd = ImageDraw.Draw(si)
+        if gold:
+            cy2_s = ty_s + int(sz_s * 0.18)
+            cr_s = int(sz_s * 0.22)
+            for y in range(cy2_s - cr_s, cy2_s + cr_s):
+                d = abs(y - cy2_s) / max(1, cr_s)
+                a = int(140 * max(0, 1 - d ** 1.4))
+                if a > 0:
+                    sd.line([(0, y), (cw_s, y)], fill=(255, 255, 240, a))
+        else:
+            cy2_s = ty_s + int(sz_s * 0.2)
+            cr_s = int(sz_s * 0.18)
+            for y in range(cy2_s - cr_s, cy2_s + cr_s):
+                d = abs(y - cy2_s) / max(1, cr_s)
+                a = int(120 * max(0, 1 - d ** 1.5))
+                if a > 0:
+                    sd.line([(0, y), (cw_s, y)], fill=(255, 255, 255, a))
+        sf = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
+        sf.paste(si, mask=mt)
+        up.alpha_composite(sf)
+
+        # ⑥ 顶部微射反光
+        if gold:
+            eh = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
+            ed = ImageDraw.Draw(eh)
+            rim_s = max(2, int(sz_s * 0.1))
+            for y in range(yt_s, yt_s + rim_s):
+                a = int(130 * (1 - (y - yt_s) / max(1, rim_s)))
+                ed.line([(0, y), (cw_s, y)], fill=(255, 255, 248, a))
+            ef = Image.new("RGBA", (cw_s, cvh_s), (0, 0, 0, 0))
+            ef.paste(eh, mask=mt)
+            up.alpha_composite(ef)
+
+            # ⑧ 斜体变形 (完美抗锯齿变形，阴影也会一起自然横斜！)
+        if is7:
+            stamp_s = up.transform((cw_s, cvh_s), Image.AFFINE,
+                                   (1, 0.22, -0.22 * (cvh_s / 2), 0, 1, 0),
+                                   resample=Image.Resampling.BICUBIC)
+        else:
+            stamp_s = up
+
+            # --- 降采样（消除所有锯齿并缩回到目标尺寸） ---
+        target_cw = int(cw_s / SSA)
+        target_cvh = int(cvh_s / SSA)
+        stamp = stamp_s.resize((target_cw, target_cvh), Image.Resampling.LANCZOS)
+
+        # 等比还原物理坐标系统
+        totw = totw_s / SSA
+        tx_ = tx_s / SSA
+        ty_ = ty_s / SSA
+
+        # ⑨ 主景横光辉（仅E6）（保持独立背景层）
+        if gold and not is7:
+            foff = int(self.sfl.get())
+            bwf, bhf = 520, 260
+            xg = np.linspace(-1, 1, bwf)
+            yg = np.linspace(-1, 1, bhf)
+            xx, yy = np.meshgrid(xg, yg)
+            core = np.exp(-(xx ** 2 / 0.01 + yy ** 2 / 0.008))
+            vs = np.maximum(0.0005, 0.014 * (1 - np.abs(xx) ** 1.6 * 0.88))
+            streak = np.exp(-(xx ** 2 / 3.5)) * np.exp(-(yy ** 2 / vs))
+            mid = np.exp(-(xx ** 2 / 0.25 + yy ** 2 / 0.018))
+            amb = np.exp(-(xx ** 2 / 0.08 + yy ** 2 / 0.035))
+            li = np.clip(core + streak * 0.65 + mid * 0.28 + amb * 0.18,
+                         0, 1).astype(np.float32)
+            rgba = np.zeros((bhf, bwf, 4), dtype=np.uint8)
+            rgba[..., 0] = np.minimum(255, 255 * li).astype(np.uint8)
+            rgba[..., 1] = np.minimum(255, 225 * li).astype(np.uint8)
+            rgba[..., 2] = np.minimum(255, 100 * li).astype(np.uint8)
+            rgba[..., 3] = np.minimum(255, 120 * li).astype(np.uint8)
+            fo = Image.fromarray(rgba, "RGBA")
+            ow2 = min(tw, int(totw * 5))
+            oh2 = int(sz * 3)
+            fo = fo.resize((ow2, oh2), Image.Resampling.BICUBIC)
+            try:
+                gx = int(self.sgx.get())
+                gy = int(self.sgy.get())
+            except Exception:
+                gx, gy = 0, 514
+            cxd = int(tw / 2 + gx) - ow2 // 2
+            cyd = gy + foff - oh2 // 2
+            bl = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
+            bl.paste(fo, (cxd, cyd))
+            tgt.alpha_composite(bl)
+
+        tgt.alpha_composite(stamp,
+                            dest=(int((tw - totw) / 2 + ox - tx_), int(yp - ty_)))
+
+        # ═══ 渲染管线 ═══
+
+    def _full(self):
+        if not self.cur:
+            return
+        try:
+            self.root.update_idletasks()
+            tn = self.cmb.get()
+            rw = int(self.ssz.get())
+            if self._tn != tn:
+                self.ti = Image.open(os.path.join(self.app_dir, tn)).convert("RGBA")
+                self._tn = tn
+            if self._rp != self.cur:
+                self._ri = Image.open(self.cur).convert("RGBA")
+                self._rp = self.cur
+            ow, oh = self._ri.size
+            r = rw / float(ow) if ow > 0 else 1
+            self.pi = self._ri.resize((rw, max(1, int(oh * r))),
+                                      Image.Resampling.LANCZOS)
+            if self._f1:
+                self.sc = 0.6 if self.ti.size[0] > 800 else 1.0
+                self._f1 = False
+            self._do_render()
+            self.bsv.config(state="normal")
+        except:
+            pass
+
+    def _fast(self):
+        if self._rj:
+            self.root.after_cancel(self._rj)
+        self._rj = self.root.after(30, self._do_render)
+
+    def _do_render(self):
+        self._rj = None
+        if not self.ti or not self.pi:
+            return
+        try:
+            px = int(self.sx.get())
+            py = int(self.sy.get())
+            tn = self.cmb.get()
+            ts = TEMPLATE_CONFIGS.get(
+                next((k for k in TEMPLATE_CONFIGS if k == tn), None), {}
+            ).get("style", "E6_Classic")
+            tw, th = self.ti.size
+
+            pl = Image.new("RGBA", (tw, th), (0, 0, 0, 0))
+            pl.paste(self.pi, (px, py))
+
+            lv = int(self.sli.get())
+            if lv > 0:
+                ins = lv / 100.0
+                rv, gv, bv, pa = pl.split()
+                rgb = Image.merge("RGB", (rv, gv, bv))
+                gt = Image.new("RGB", (tw, th), (255, 185, 50))
+                cg = Image.blend(rgb, ImageChops.multiply(rgb, gt),
+                                 0.35 * ins).convert("RGBA")
+
+                lw2, lh2 = 160, 160
+                md = (lw2 ** 2 + lh2 ** 2) ** 0.5
+                ms = ((lw2 / 2) ** 2 + lh2 ** 2) ** 0.5
+                yy, xx = np.mgrid[0:lh2, 0:lw2]
+                xx_f = xx.astype(np.float64)
+                yy_f = yy.astype(np.float64)
+
+                dL = np.sqrt(xx_f ** 2 + yy_f ** 2)
+                pL = np.clip(1 - dL / (md * 0.85), 0, 1) ** 1.6
+                dR = np.sqrt((lw2 - xx_f) ** 2 + yy_f ** 2)
+                pR = np.clip(1 - dR / (md * 0.85), 0, 1) ** 1.6
+                tp = np.clip(pL + pR, 0, 1)
+                la = np.zeros((lh2, lw2, 4), dtype=np.uint8)
+                la[..., 0] = 255
+                la[..., 1] = 235
+                la[..., 2] = 150
+                la[..., 3] = np.minimum(255, (190 * tp * ins)).astype(np.uint8)
+                lb = Image.fromarray(la, "RGBA")
+
+                ds = np.sqrt((lw2 / 2 - xx_f) ** 2 + (lh2 - yy_f) ** 2)
+                sr = np.clip(1 - ds / (ms * 0.9), 0, 1)
+                sa = np.zeros((lh2, lw2, 4), dtype=np.uint8)
+                sa[..., 0] = 25
+                sa[..., 1] = 12
+                sa[..., 3] = np.minimum(255, (145 * sr ** 1.2 * ins)).astype(np.uint8)
+                sb = Image.fromarray(sa, "RGBA")
+
+                lm = lb.resize((tw, th), Image.Resampling.BICUBIC)
+                sm = sb.resize((tw, th), Image.Resampling.BICUBIC)
+                lit = Image.alpha_composite(Image.alpha_composite(cg, sm), lm)
+                mem = Image.merge("RGBA", (*lit.split()[:3], pa))
+            else:
+                mem = pl
+
+            mem = Image.alpha_composite(mem, self.ti)
+
+            for _, ct in self.fld.items():
+                tv = ct["e"].get().strip()
+                if not tv:
+                    continue
+                self._dtxt(mem, tv, tw, th, int(ct["ss"].get()),
+                           int(ct["sx"].get()), int(ct["sy"].get()),
+                           ct["c"], ct["s"], ts)
+
+            self.final = mem.copy()
+            self._disp()
+        except:
+            pass
+
+    def _disp(self):
+        if not self.final:
+            return
+        self.cv.delete("all")
+        w, h = self.final.size
+        nw = max(10, int(w * self.sc))
+        nh = max(10, int(h * self.sc))
+        self.tki = ImageTk.PhotoImage(
+            self.final.resize((nw, nh), Image.Resampling.LANCZOS))
+        cx = self.cv.winfo_width() / 2 + self.vx
+        cy = self.cv.winfo_height() / 2 + self.vy
+        self.cid = self.cv.create_image(cx, cy, anchor=tk.CENTER, image=self.tki)
+        try:
+            if self.pi:
+                bx = cx - nw / 2 + int(self.sx.get()) * self.sc
+                by = cy - nh / 2 + int(self.sy.get()) * self.sc
+                self.cv.create_rectangle(
+                    bx, by,
+                    bx + self.pi.size[0] * self.sc,
+                    by + self.pi.size[1] * self.sc,
+                    outline="#00FFCC", width=1, dash=(5, 3))
+                hs = self.handle_size
+                left = bx
+                top = by
+                right = bx + self.pi.size[0] * self.sc
+                bottom = by + self.pi.size[1] * self.sc
+                mx = (left + right) / 2
+                my = (top + bottom) / 2
+                for hx, hy in [
+                    (left, top), (mx, top), (right, top),
+                    (right, my), (right, bottom), (mx, bottom),
+                    (left, bottom), (left, my)
+                ]:
+                    self.cv.create_rectangle(
+                        hx - hs / 2, hy - hs / 2,
+                        hx + hs / 2, hy + hs / 2,
+                        fill="#00FFCC", outline="#003B33", width=1)
+        except:
+            pass
+        self.cv.create_line(self.cv.winfo_width() / 2, 0,
+                            self.cv.winfo_width() / 2, self.cv.winfo_height(),
+                            fill="#7A5C12", dash=(6, 4), width=1)
+        self.cv.create_line(0, self.cv.winfo_height() / 2,
+                            self.cv.winfo_width(), self.cv.winfo_height() / 2,
+                            fill="#7A5C12", dash=(6, 4), width=1)
 
 
 if __name__ == "__main__":
-    # Kill any process still holding the port
-    subprocess.run(f"lsof -ti:{PORT} | xargs kill -9 2>/dev/null; true",
-                   shell=True, check=False)
-    time.sleep(0.3)
-
-    server = _Server(("127.0.0.1", PORT), Handler)
-    print(f"Crowdin Checker  →  http://localhost:{PORT}")
-    print(f"Glossary: {os.path.join(SCRIPT_DIR, GLOSSARY_FILE)}")
-    print("Press Ctrl+C to stop.\n")
-
-    def _open_browser():
-        time.sleep(0.7)
-        webbrowser.open(f"http://localhost:{PORT}")
-
-    threading.Thread(target=_open_browser, daemon=True).start()
-
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        print("\nServer stopped.")
+    root = TkinterDnD.Tk()
+    App(root)
+    root.mainloop()

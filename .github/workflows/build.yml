@@ -1,39 +1,35 @@
-name: build-exe
+name: 打包 Windows EXE
 
 on:
-  workflow_dispatch:
   push:
     branches: [ main ]
 
 jobs:
-  build:
-    runs-on: windows-2022
+  build-windows:
+    runs-on: windows-latest
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
+      - name: 检出代码
+        uses: actions/checkout@v4
 
-      - name: Set up Python 3.8
-        uses: actions/setup-python@v6
+      - name: 安装 Python 3.11
+        uses: actions/setup-python@v5
         with:
-          python-version: '3.8.18'
-          cache: 'pip'
+          python-version: '3.11'
 
-      - name: Check Python version
-        run: python --version
-
-      - name: Install dependencies
+      - name: 安装依赖库
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
           pip install pyinstaller
+          pip install -r requirements.txt
 
-      - name: Build exe
+      - name: 打包成 EXE
         run: |
-          pyinstaller main.py --onefile --windowed
+          pyinstaller --onefile --windowed --name="作图" main.py
 
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
+      - name: 上传 EXE 文件
+        uses: actions/upload-artifact@v4
         with:
-          name: exe
+          name: windows-exe
           path: dist/*.exe
+          retention-days: 7
