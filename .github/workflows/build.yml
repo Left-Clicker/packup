@@ -25,7 +25,7 @@ jobs:
 
       - name: 打包成 EXE
         run: |
-          pyinstaller --onefile --windowed --name="作图" main.py
+          pyinstaller --onefile --windowed --name="脚本" main.py
 
       - name: 上传 EXE 文件
         uses: actions/upload-artifact@v4
