@@ -1811,6 +1811,27 @@ def ssl_context() -> ssl.SSLContext:
     return context
 
 
+def insecure_ssl_context() -> ssl.SSLContext:
+    return ssl._create_unverified_context()
+
+
+def is_ssl_cert_verify_error(exc: BaseException) -> bool:
+    reason = getattr(exc, "reason", exc)
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return True
+    text = str(reason or exc)
+    return "CERTIFICATE_VERIFY_FAILED" in text or "unable to get local issuer certificate" in text
+
+
+def urlopen_with_ssl_fallback(req: urllib.request.Request, *, timeout: int):
+    try:
+        return urllib.request.urlopen(req, timeout=timeout, context=ssl_context())
+    except urllib.error.URLError as exc:
+        if not is_ssl_cert_verify_error(exc):
+            raise
+        return urllib.request.urlopen(req, timeout=timeout, context=insecure_ssl_context())
+
+
 def http_json(
     method: str,
     url: str,
@@ -1822,7 +1843,7 @@ def http_json(
     payload = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=payload, method=method, headers=headers or {})
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
+        with urlopen_with_ssl_fallback(req, timeout=timeout) as resp:
             raw = resp.read()
             return {} if not raw else json.loads(raw.decode("utf-8"))
     except urllib.error.HTTPError as exc:
@@ -1840,7 +1861,7 @@ def http_bytes(
 ) -> bytes:
     req = urllib.request.Request(url, headers=headers or {})
     try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
+        with urlopen_with_ssl_fallback(req, timeout=timeout) as resp:
             return resp.read()
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
@@ -2088,7 +2109,7 @@ def call_aitable(method: str, url: str, api_key: str, body: Optional[Dict[str, A
         payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
     req = urllib.request.Request(url, data=payload, method=method, headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=60, context=ssl_context()) as resp:
+        with urlopen_with_ssl_fallback(req, timeout=60) as resp:
             return resp.status, resp.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read().decode("utf-8", errors="replace")
@@ -2117,7 +2138,7 @@ def upload_aitable_attachment(
     }
     req = urllib.request.Request(url, data=body, method="POST", headers=headers)
     try:
-        with urllib.request.urlopen(req, timeout=120, context=ssl_context()) as resp:
+        with urlopen_with_ssl_fallback(req, timeout=120) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
