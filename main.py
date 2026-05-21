@@ -464,6 +464,14 @@ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
              display:flex;align-items:center;gap:8px}}
 .card-title span{{color:#f0f6fc;font-size:13px;text-transform:none;
                    letter-spacing:0;font-weight:600}}
+.card-title .spacer{{flex:1}}
+.config-toggle{{border:1px solid var(--border);border-radius:999px;background:#0d1117;
+  color:var(--text);font:inherit;font-size:12px;font-weight:700;padding:5px 10px;
+  cursor:pointer;display:inline-flex;align-items:center;gap:6px;text-transform:none;letter-spacing:0}}
+.config-dot{{width:8px;height:8px;border-radius:50%;background:var(--red);display:inline-block}}
+.config-dot.ok{{background:var(--green)}}
+.config-card.collapsed .config-body{{display:none}}
+.config-card.collapsed{{padding-bottom:14px}}
 
 .g2{{display:grid;grid-template-columns:1fr 1fr;gap:14px}}
 .g3{{display:grid;grid-template-columns:1fr 1fr 1fr;gap:14px}}
@@ -489,6 +497,19 @@ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
 .rich-editor:focus{{border-color:var(--blue)}}
 .rich-editor:empty:before{{
   content:"在这里输入或粘贴要翻译的内容";color:var(--dim);pointer-events:none}}
+.field input.locked{{background:#090d13;color:var(--muted);border-color:#21262d;cursor:not-allowed}}
+.input-tabs{{display:flex;gap:10px;margin-bottom:12px}}
+.tab-btn{{flex:1;padding:9px 12px;border-radius:8px;border:1px solid var(--border);
+  background:#0d1117;color:var(--muted);font:inherit;font-size:13px;font-weight:700;
+  cursor:pointer;transition:.15s}}
+.tab-btn.on{{border-color:var(--blue);color:#c9d1d9;background:#111827}}
+.mode-pane{{display:none}}
+.mode-pane.on{{display:block}}
+.file-meta{{display:flex;gap:10px;align-items:center;justify-content:center;flex-wrap:wrap;margin-top:10px;
+  position:relative;z-index:3}}
+.mini-btn{{border:1px solid var(--border);border-radius:999px;background:#21262d;color:var(--text);
+  font:inherit;font-size:12px;font-weight:700;padding:5px 10px;cursor:pointer;position:relative;z-index:4}}
+.mini-btn:hover{{background:#30363d}}
 .ddl-row{{display:grid;grid-template-columns:minmax(0,1fr) 108px 44px;gap:10px;align-items:end}}
 .ddl-date-wrap{{position:relative;display:flex;align-items:stretch}}
 .ddl-date-native{{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}}
@@ -519,14 +540,15 @@ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
        text-align:center;cursor:pointer;transition:.18s;position:relative;background:#0a0d13}}
 .drop:hover,.drop.over{{border-color:var(--blue);background:#0c1525}}
 .drop input[type=file]{{position:absolute;inset:0;opacity:0;cursor:pointer;
-                         width:100%;height:100%}}
-.drop-icon{{font-size:36px;margin-bottom:8px}}
-.drop-txt{{font-size:13px;color:var(--muted)}}
-.drop-name{{font-size:13px;font-weight:600;color:#f0f6fc;margin-top:8px;word-break:break-all}}
+                         width:100%;height:100%;z-index:1}}
+.drop-icon{{font-size:36px;margin-bottom:8px;position:relative;z-index:2}}
+.drop-txt{{font-size:13px;color:var(--muted);position:relative;z-index:2}}
+.drop-name{{font-size:13px;font-weight:600;color:#f0f6fc;margin-top:8px;word-break:break-all;
+  position:relative;z-index:2}}
 .drop-ok{{display:inline-flex;align-items:center;gap:5px;background:#122d20;
            color:#3fb950;padding:4px 11px;border-radius:999px;font-size:12px;
            font-weight:700;margin-top:6px}}
-.drop-size{{font-size:11px;color:var(--muted);margin-top:3px}}
+.drop-size{{font-size:11px;color:var(--muted);margin-top:3px;position:relative;z-index:2}}
 .file-hidden{{display:none}}
 
 /* submit */
@@ -579,8 +601,9 @@ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
 <div class="wrap">
 
   <!-- 设置 -->
-  <div class="card">
-    <div class="card-title">⚙ <span>凭证设置</span></div>
+  <div class="card config-card" id="configCard">
+    <div class="card-title">⚙ <span>凭证设置</span><span class="spacer"></span><button type="button" class="config-toggle" onclick="openConfig()"><span class="config-dot" id="configDot"></span><span id="configBadge">待配置</span></button></div>
+    <div class="config-body" id="configBody">
     <div class="g2" style="margin-bottom:12px">
       <div class="field">
         <label>使用人 <span class="req">*</span></label>
@@ -590,12 +613,12 @@ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
         </select>
       </div>
       <div class="field">
-        <label>Crowdin API Token</label>
+        <label>Crowdin API Token <span class="req">*</span></label>
         <input id="crowdin_token" type="password" placeholder="上传附件时需要">
       </div>
     </div>
     <div class="field" style="margin-bottom:12px">
-      <label>APITable API Key</label>
+      <label>APITable API Key <span class="req">*</span></label>
       <input id="apitable_api_key" type="password" placeholder="Bearer Key">
     </div>
     <!-- Crowdin 上传设置 -->
@@ -623,17 +646,18 @@ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
       <label class="chk"><input id="save_aitable" type="checkbox" checked>保存 APITable Key</label>
       <button type="button" class="btn btn-ghost" onclick="saveSettings()">💾 保存设置</button>
     </div>
+    </div>
   </div>
 
   <!-- 新建任务表单 -->
-  <div class="card">
+  <div class="card" id="taskCard">
     <div class="card-title">📝 <span>新建翻译任务</span></div>
 
     <!-- 翻译需求名称 -->
     <div class="field" style="margin-bottom:14px">
       <label>翻译需求名称 <span class="req">*</span></label>
       <input id="f_title" type="text"
-        placeholder="格式：当日日期 + 翻译需求名字 + 需求人，如：20260520 图鉴更新 仿生人">
+        placeholder="选择附件时自动填充文件名；文本录入时，需要创建名字">
     </div>
 
     <div class="task-meta" style="margin-bottom:14px">
@@ -674,6 +698,12 @@ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
       </div>
     </div>
 
+    <!-- 备注 -->
+    <div class="field" style="margin-bottom:14px">
+      <label>备注（不放具体链接）</label>
+      <textarea id="f_note" placeholder="可选"></textarea>
+    </div>
+
     <!-- 是否用运营组 Crowdin -->
     <div class="field" style="margin-bottom:14px">
       <label>是否用运营组专用 Crowdin <span class="req">*</span></label>
@@ -689,34 +719,35 @@ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
       <input id="f_link" type="text" placeholder="请填写实际 Crowdin 链接">
     </div>
 
-    <!-- 文件上传区（「是」时显示，「否」时隐藏） -->
+    <!-- 附件 / 文本录入（二选一） -->
     <div id="uploadSection" style="margin-bottom:14px;display:none">
-      <div class="field" style="margin-bottom:10px">
-        <label>📎 上传附件到 Crowdin <span id="folderLabel" style="color:var(--teal);font-weight:700">English Team</span></label>
-        <div class="drop" id="drop">
-          <input type="file" id="fileInput" onclick="this.value=''" onchange="onFile(this)">
-          <div class="drop-icon">📁</div>
-          <div class="drop-txt">点击选择 / 拖拽文件到这里</div>
-          <div id="dropName" style="display:none" class="drop-name"></div>
-          <div id="dropOk"   style="display:none" class="drop-ok">✓ 已选择</div>
-          <div id="dropSize" class="drop-size"></div>
+      <div class="input-tabs">
+        <button type="button" class="tab-btn on" id="tabFile" onclick="setInputMode('file')">附件</button>
+        <button type="button" class="tab-btn" id="tabText" onclick="setInputMode('text')">文本录入</button>
+      </div>
+      <div class="mode-pane on" id="filePane">
+        <div class="field" style="margin-bottom:10px">
+          <label>📎 上传附件到 Crowdin <span id="folderLabel" style="color:var(--teal);font-weight:700">English Team</span></label>
+          <div class="drop" id="drop">
+            <input type="file" id="fileInput" onclick="this.value=''" onchange="onFile(this)">
+            <div class="drop-icon">📁</div>
+            <div class="drop-txt">点击选择 / 拖拽文件到这里</div>
+            <div id="dropName" style="display:none" class="drop-name"></div>
+            <div class="file-meta">
+              <div id="dropOk" style="display:none" class="drop-ok">✓ 已选择</div>
+              <button type="button" id="removeFileBtn" class="mini-btn" style="display:none" onclick="removeAttachment()">去除附件</button>
+            </div>
+            <div id="dropSize" class="drop-size"></div>
+          </div>
         </div>
       </div>
-    </div>
-
-    <!-- 纯文本内容输入区（自动生成 docx 上传） -->
-    <div id="richTextSection" style="margin-bottom:14px;display:none">
-      <div class="field">
-        <label>✏️ 纯文本内容（支持粘贴带格式文本，提交时自动生成 .docx 上传）</label>
-        <div class="hint">如果不选择文件，可以在这里直接输入或粘贴内容，提交时会自动保存为 .docx 文件并上传到 Crowdin。文件名 = 翻译需求名称.docx</div>
-        <div id="richEditor" contenteditable="true" class="rich-editor"></div>
+      <div class="mode-pane" id="textPane">
+        <div class="field">
+          <label>✏️ 文本录入（提交时自动生成 .docx 上传）</label>
+          <div class="hint">文本录入时需要手动填写翻译需求名称。文件名 = 翻译需求名称.docx</div>
+          <div id="richEditor" contenteditable="true" class="rich-editor"></div>
+        </div>
       </div>
-    </div>
-
-    <!-- 备注 -->
-    <div class="field" style="margin-bottom:18px">
-      <label>备注（不放具体链接）</label>
-      <textarea id="f_note" placeholder="可选"></textarea>
     </div>
 
     <!-- 提交 -->
@@ -760,6 +791,11 @@ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
         1,
     )
     html_tmpl = html_tmpl.replace(
+        'byId("f_title").placeholder = `格式：${ds} 翻译需求名字 需求人`;',
+        'byId("f_title").placeholder = "选择附件时自动填充文件名；文本录入时，需要创建名字";',
+        1,
+    )
+    html_tmpl = html_tmpl.replace(
         '<option>S</option><option>A</option><option>B</option><option>C</option>',
         '<option>S</option><option>A</option><option selected>B</option><option>C</option>',
     )
@@ -788,7 +824,7 @@ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
     )
     html_tmpl = html_tmpl.replace(
         '    applyConfig(cfg);\n    // 静默检查连接',
-        '    applyConfig(cfg);\n    const userEl = byId(\"current_user\");\n    if (userEl) userEl.addEventListener(\"change\", syncRequesterFromUser);\n    // 静默检查连接',
+        '    applyConfig(cfg);\n    updateConfigState(isConfigReady());\n    const userEl = byId(\"current_user\");\n    if (userEl) userEl.addEventListener(\"change\", syncRequesterFromUser);\n    // 静默检查连接',
         1,
     )
     html_tmpl = html_tmpl.replace(
@@ -831,6 +867,282 @@ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
         '  [\"f_title\",\"f_link\",\"f_note\",\"f_ddl_date\"].forEach(id => {\n    const el = byId(id); if (el) el.value=\"\";\n  });\n  updateDdlDateLabel();\n  byId(\"f_ddl_hour\").value = \"\";\n  syncRequesterFromUser();\n  byId(\"f_priority\").value = \"B\";\n',
         1,
     )
+    extra_js = r'''
+let inputMode = "file";
+let titleLockedByAttachment = false;
+
+function isConfigReady() {
+  return !!(v("current_user") && v("crowdin_token").trim() && v("apitable_api_key").trim());
+}
+
+function openConfig() {
+  const card = byId("configCard");
+  if (card) card.classList.remove("collapsed");
+}
+
+function updateConfigState(collapseWhenReady=false) {
+  const ready = isConfigReady();
+  const dot = byId("configDot");
+  const badge = byId("configBadge");
+  const card = byId("configCard");
+  if (dot) dot.classList.toggle("ok", ready);
+  if (badge) badge.textContent = ready ? "已配置" : "待配置";
+  if (card && ready && collapseWhenReady) card.classList.add("collapsed");
+  if (card && !ready) card.classList.remove("collapsed");
+  return ready;
+}
+
+function requireConfig() {
+  if (isConfigReady()) return true;
+  openConfig();
+  updateConfigState(false);
+  alert("请先填写使用人、Crowdin API Token 和 APITable API Key，并点击保存设置。");
+  return false;
+}
+
+function saveSettings() {
+  if (!v("current_user")) { alert("请先选择使用人"); byId("current_user").focus(); return Promise.resolve(false); }
+  if (!v("crowdin_token").trim()) { alert("请填写 Crowdin API Token"); byId("crowdin_token").focus(); return Promise.resolve(false); }
+  if (!v("apitable_api_key").trim()) { alert("请填写 APITable API Key"); byId("apitable_api_key").focus(); return Promise.resolve(false); }
+  return api("/api/state", {
+    current_user:       v("current_user"),
+    crowdin_token:      v("crowdin_token"),
+    apitable_api_key:   v("apitable_api_key"),
+    crowdin_folder:     v("crowdin_folder") || "English Team",
+    extra_path_keyword: v("extra_path_keyword"),
+    extra_keyword:      v("extra_keyword"),
+    save_crowdin:       true,
+    save_aitable:       true,
+  }).then(() => {
+    byId("save_crowdin").checked = true;
+    byId("save_aitable").checked = true;
+    updateConfigState(true);
+    alert("设置已保存");
+    return true;
+  });
+}
+
+function setTitleLocked(locked) {
+  titleLockedByAttachment = locked;
+  const titleEl = byId("f_title");
+  if (!titleEl) return;
+  titleEl.readOnly = locked;
+  titleEl.classList.toggle("locked", locked);
+}
+
+function setTitleFromFile(name) {
+  const titleEl = byId("f_title");
+  if (!titleEl) return;
+  titleEl.value = name.replace(/\.[^.]+$/, "");
+  setTitleLocked(true);
+}
+
+function clearRichText() {
+  const re = byId("richEditor");
+  if (re) re.innerHTML = "";
+}
+
+function hasRichText() {
+  const re = byId("richEditor");
+  const html = re ? re.innerHTML.trim() : "";
+  return !!(html && html !== "<br>" && html !== "<div><br></div>");
+}
+
+function removeAttachment(clearTitle=true) {
+  fileBytes = null;
+  fileName = "";
+  const input = byId("fileInput");
+  if (input) input.value = "";
+  byId("dropName").style.display = "none";
+  byId("dropOk").style.display = "none";
+  byId("removeFileBtn").style.display = "none";
+  byId("dropSize").textContent = "";
+  setTitleLocked(false);
+  if (clearTitle) byId("f_title").value = "";
+}
+
+function setInputMode(mode) {
+  if (mode === inputMode) return true;
+  if (mode === "text" && fileBytes) {
+    alert("已选择的附件不会被上传，将切换为文本录入并清空附件；翻译需求名称会解锁并重置。");
+    removeAttachment(true);
+  }
+  if (mode === "file" && hasRichText()) {
+    alert("已填写的文本不会被上传，将切换为附件上传。选择附件后会自动填入文件名并锁定需求名称。");
+    clearRichText();
+  }
+  inputMode = mode;
+  byId("tabFile").classList.toggle("on", mode === "file");
+  byId("tabText").classList.toggle("on", mode === "text");
+  byId("filePane").classList.toggle("on", mode === "file");
+  byId("textPane").classList.toggle("on", mode === "text");
+  if (mode === "text") setTitleLocked(false);
+  if (mode === "file" && fileName) setTitleFromFile(fileName);
+  return true;
+}
+
+function setCrowdin(yes) {
+  if (!requireConfig()) return;
+  useCrowdin = yes;
+  byId("togYes").classList.toggle("on", yes);
+  byId("togNo").classList.toggle("on", !yes);
+  if (yes) {
+    byId("uploadSection").style.display = "block";
+    byId("linkRow").style.display = "none";
+    byId("f_link").value = CROWDIN_DEFAULT;
+    setInputMode(inputMode || "file");
+    updateFolderLabel();
+  } else {
+    byId("uploadSection").style.display = "none";
+    byId("linkRow").style.display = "block";
+    byId("f_link").value = "";
+    byId("f_link").readOnly = false;
+    removeAttachment(true);
+    clearRichText();
+  }
+}
+
+function handleFile(f) {
+  if (hasRichText()) {
+    alert("文本录入内容不会被上传，将切换为附件上传并清空文本。");
+    clearRichText();
+  }
+  inputMode = "file";
+  byId("tabFile").classList.add("on");
+  byId("tabText").classList.remove("on");
+  byId("filePane").classList.add("on");
+  byId("textPane").classList.remove("on");
+  fileName = f.name;
+  const r = new FileReader();
+  r.onload = e => {
+    fileBytes = Array.from(new Uint8Array(e.target.result));
+    byId("dropName").textContent = f.name;
+    byId("dropName").style.display = "block";
+    byId("dropOk").style.display = "inline-flex";
+    byId("removeFileBtn").style.display = "inline-flex";
+    byId("dropSize").textContent = fmtB(f.size);
+  };
+  r.readAsArrayBuffer(f);
+  setTitleFromFile(f.name);
+}
+
+async function doSubmit() {
+  if (!requireConfig()) return;
+  if (!v("f_title").trim()) { alert("请填写翻译需求名称"); byId("f_title").focus(); return; }
+  syncRequesterFromUser();
+  if (!v("current_user")) { alert("请选择使用人"); return; }
+  if (useCrowdin === null) { alert("请选择「是否用运营组专用 Crowdin」"); return; }
+  if (!useCrowdin && !v("f_link").trim()) { alert("选「否」时请填写实际 Crowdin 链接"); return; }
+
+  const richHtml = hasRichText() ? byId("richEditor").innerHTML.trim() : "";
+  if (useCrowdin && inputMode === "file" && (!fileBytes || !fileName)) { alert("请选择要上传的附件"); return; }
+  if (useCrowdin && inputMode === "text" && !richHtml) { alert("请在文本录入页签填写内容"); return; }
+
+  await api("/api/state", {
+    current_user:       v("current_user"),
+    crowdin_token:      v("crowdin_token"),
+    apitable_api_key:   v("apitable_api_key"),
+    crowdin_folder:     v("crowdin_folder") || "English Team",
+    extra_path_keyword: v("extra_path_keyword"),
+    extra_keyword:      v("extra_keyword"),
+    save_crowdin:       true,
+    save_aitable:       true,
+  });
+
+  const fields = {};
+  fields["\u7ffb\u8bd1\u9700\u6c42\uff08\u5f53\u65e5\u65e5\u671f+\u7ffb\u8bd1\u9700\u6c42\u540d\u5b57+\u9700\u6c42\u4eba\uff09"] = v("f_title").trim();
+  fields["\u9700\u6c42\u4eba"] = v("current_user") || v("f_req");
+  if (v("f_priority")) fields["\u4f18\u5148\u7ea7"] = v("f_priority");
+  const ddlValue = buildDdlValue();
+  if (ddlValue) fields["\u9700\u6c42ddl\uff08\u5c3d\u91cf\u63d0\u524d1-3\u5c0f\u65f6\uff09"] = new Date(ddlValue).getTime();
+  fields["\u662f\u5426\u7528\u8fd0\u8425\u7ec4\u4e13\u7528crowdin"] = useCrowdin ? "\u662f" : "\u5426";
+  if (v("f_link").trim()) fields["\u586b\u5199\u5b9e\u9645\u4efb\u52a1\u94fe\u63a5\uff0c\u9ed8\u8ba4crowdin\u94fe\u63a5"] = v("f_link").trim();
+  if (v("f_note").trim()) fields["\u5907\u6ce8(\u4e0d\u653e\u5177\u4f53\u94fe\u63a5)"] = v("f_note").trim();
+
+  byId("progressCard").style.display = "block";
+  byId("progressCard").scrollIntoView({behavior:"smooth"});
+  setSt("run","⏳ 提交中…");
+  byId("logbox").textContent = "";
+  byId("resCard").style.display = "none";
+  byId("submitBtn").disabled = true;
+
+  let finalFilename = "";
+  let submitRichHtml = null;
+  let submitFileBytes = null;
+  if (useCrowdin && inputMode === "text") {
+    finalFilename = v("f_title").trim() + ".docx";
+    submitRichHtml = richHtml;
+    submitFileBytes = null;
+  } else if (useCrowdin && inputMode === "file") {
+    const ext = fileName.includes(".") ? "." + fileName.split(".").pop() : "";
+    finalFilename = v("f_title").trim() + ext;
+    submitFileBytes = fileBytes;
+  }
+
+  try {
+    const res = await api("/api/submit", {
+      apitable_api_key:   v("apitable_api_key"),
+      crowdin_token:      v("crowdin_token"),
+      use_crowdin:        useCrowdin,
+      upload_folder:      v("crowdin_folder") || "English Team",
+      crowdin_language:   "en-US",
+      extra_path_keyword: v("extra_path_keyword"),
+      extra_keyword:      v("extra_keyword"),
+      fields:             fields,
+      filename:           finalFilename,
+      file_bytes:         submitFileBytes,
+      rich_html:          submitRichHtml,
+    });
+    if (res.error) throw new Error(res.error);
+    jobId = res.job_id;
+    if (poll) clearInterval(poll);
+    poll = setInterval(pollStatus, 1000);
+  } catch(e) {
+    setSt("err","❌ " + e.message);
+    byId("submitBtn").disabled = false;
+  }
+}
+
+function resetForm() {
+  ["f_title","f_link","f_note","f_ddl_date"].forEach(id => {
+    const el = byId(id); if (el) el.value="";
+  });
+  updateDdlDateLabel();
+  byId("f_ddl_hour").value = "";
+  syncRequesterFromUser();
+  byId("f_priority").value = "B";
+  useCrowdin = null;
+  inputMode = "";
+  byId("togYes").classList.remove("on");
+  byId("togNo").classList.remove("on");
+  byId("f_link").readOnly = false;
+  byId("uploadSection").style.display = "none";
+  byId("linkRow").style.display = "none";
+  removeAttachment(true);
+  clearRichText();
+  setInputMode("file");
+  byId("progressCard").style.display = "none";
+  byId("submitBtn").disabled = false;
+}
+
+window.addEventListener("load", () => {
+  ["current_user","crowdin_token","apitable_api_key"].forEach(id => {
+    const el = byId(id);
+    if (el) el.addEventListener("input", () => updateConfigState(false));
+    if (el) el.addEventListener("change", () => updateConfigState(false));
+  });
+  const task = byId("taskCard");
+  if (task) task.addEventListener("click", e => {
+    if (!isConfigReady()) {
+      e.preventDefault();
+      e.stopPropagation();
+      requireConfig();
+    }
+  }, true);
+  updateConfigState(isConfigReady());
+});
+'''
+    html_tmpl = html_tmpl.replace("</script>", extra_js + "\n</script>", 1)
     return html_tmpl
 
 FINAL_HTML = build_html()
