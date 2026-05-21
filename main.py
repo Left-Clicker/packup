@@ -10,7 +10,7 @@ import mimetypes
 import os
 import re
 import ssl
-import subprocess
+import socket
 import sys
 import threading
 import time
@@ -128,8 +128,18 @@ def save_state(data: Dict[str, Any]) -> None:
     s["save_aitable"] = save_apitable
     if not save_crowdin:  s["crowdin_token"]    = ""
     if not save_apitable: s["apitable_api_key"] = ""
-    try: STATE_FILE.write_text(json.dumps(s, ensure_ascii=False, indent=2), "utf-8")
-    except Exception: pass
+    STATE_FILE.write_text(json.dumps(s, ensure_ascii=False, indent=2), "utf-8")
+
+def choose_port(preferred: int = PORT) -> int:
+    for candidate in (preferred, 0):
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            try:
+                sock.bind((HOST, candidate))
+            except OSError:
+                continue
+            return int(sock.getsockname()[1])
+    raise RuntimeError("无法找到可用本地端口")
 
 # ── HTTP 工具 ─────────────────────────────────────────────────────────────────
 def http_json(method: str, url: str, headers: Optional[Dict]=None,
@@ -184,6 +194,9 @@ def aitable_patch_record(key: str, record_id: str, fields: Dict[str, Any]) -> No
 def crowdin_hdr(token: str) -> Dict[str,str]:
     return {"Authorization": f"Bearer {token}"}
 
+def crowdin_storage_filename_header(filename: str) -> str:
+    return urllib.parse.quote(filename or "file", safe="")
+
 def crowdin_get_all(token: str, path: str, params: Optional[Dict]=None) -> List[Any]:
     results: List[Any] = []
     limit, offset = 500, 0
@@ -215,7 +228,11 @@ def crowdin_find_folder(token: str, project_id: str, name: str) -> Optional[str]
 def crowdin_upload_storage(token: str, filename: str, data: bytes) -> str:
     ct = mimetypes.guess_type(filename)[0] or "application/octet-stream"
     url = f"{CROWDIN_BASE_API}/storages"
-    hdrs = {**crowdin_hdr(token), "Crowdin-API-FileName": filename, "Content-Type": ct}
+    hdrs = {
+        **crowdin_hdr(token),
+        "Crowdin-API-FileName": crowdin_storage_filename_header(filename),
+        "Content-Type": ct,
+    }
     req = urllib.request.Request(url, data=data, method="POST", headers=hdrs)
     try:
         with urllib.request.urlopen(req, timeout=120, context=ssl_ctx()) as r:
@@ -540,7 +557,7 @@ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
        text-align:center;cursor:pointer;transition:.18s;position:relative;background:#0a0d13}}
 .drop:hover,.drop.over{{border-color:var(--blue);background:#0c1525}}
 .drop input[type=file]{{position:absolute;inset:0;opacity:0;cursor:pointer;
-                         width:100%;height:100%;z-index:1}}
+                         width:100%;height:100%;z-index:1;pointer-events:none}}
 .drop-icon{{font-size:36px;margin-bottom:8px;position:relative;z-index:2}}
 .drop-txt{{font-size:13px;color:var(--muted);position:relative;z-index:2}}
 .drop-name{{font-size:13px;font-weight:600;color:#f0f6fc;margin-top:8px;word-break:break-all;
@@ -735,7 +752,7 @@ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
             <div id="dropName" style="display:none" class="drop-name"></div>
             <div class="file-meta">
               <div id="dropOk" style="display:none" class="drop-ok">✓ 已选择</div>
-              <button type="button" id="removeFileBtn" class="mini-btn" style="display:none" onclick="removeAttachment()">去除附件</button>
+              <button type="button" id="removeFileBtn" class="mini-btn" style="display:none" onclick="event.stopPropagation(); removeAttachment()">去除附件</button>
             </div>
             <div id="dropSize" class="drop-size"></div>
           </div>
@@ -871,6 +888,15 @@ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
 let inputMode = "file";
 let titleLockedByAttachment = false;
 
+async function api(path, body) {
+  const opts = {headers:{"Content-Type":"application/json"}};
+  if (body !== undefined) { opts.method = "POST"; opts.body = JSON.stringify(body); }
+  const r = await fetch(path, opts);
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok || data.error) throw new Error(data.error || `请求失败：HTTP ${r.status}`);
+  return data;
+}
+
 function isConfigReady() {
   return !!(v("current_user") && v("crowdin_token").trim() && v("apitable_api_key").trim());
 }
@@ -959,6 +985,11 @@ function removeAttachment(clearTitle=true) {
   byId("dropSize").textContent = "";
   setTitleLocked(false);
   if (clearTitle) byId("f_title").value = "";
+}
+
+function openFileChooser() {
+  const input = byId("fileInput");
+  if (input) input.click();
 }
 
 function setInputMode(mode) {
@@ -1139,6 +1170,19 @@ window.addEventListener("load", () => {
       requireConfig();
     }
   }, true);
+  const drop = byId("drop");
+  if (drop) {
+    drop.addEventListener("click", e => {
+      if (e.target && e.target.closest && e.target.closest("#removeFileBtn")) return;
+      openFileChooser();
+    });
+    drop.addEventListener("keydown", e => {
+      if (e.key === "Enter" || e.key === " ") {
+        e.preventDefault();
+        openFileChooser();
+      }
+    });
+  }
   updateConfigState(isConfigReady());
 });
 '''
@@ -1194,7 +1238,14 @@ class Handler(BaseHTTPRequestHandler):
         touch_client()
 
         if p == "/api/state":
-            STATE.update(body); save_state(STATE)
+            next_state = dict(STATE)
+            next_state.update(body)
+            try:
+                save_state(next_state)
+            except Exception as exc:
+                self.send_json({"error": f"保存本地配置失败: {exc}"}, 500); return
+            STATE.clear()
+            STATE.update(next_state)
             self.send_json({"ok":True}); return
 
         if p == "/api/ping":
@@ -1227,12 +1278,10 @@ class _Srv(ThreadingHTTPServer):
 def main() -> None:
     global STATE, LAST_CLIENT_SEEN
     STATE = load_state()
-    subprocess.run(f"lsof -ti:{PORT} | xargs kill -9 2>/dev/null; true",
-                   shell=True, check=False)
-    time.sleep(0.3)
-    server = _Srv((HOST, PORT), Handler)
+    port = choose_port(PORT)
+    server = _Srv((HOST, port), Handler)
     LAST_CLIENT_SEEN = time.time()
-    url = f"http://localhost:{PORT}"
+    url = f"http://localhost:{port}"
     print(f"翻译任务提交工具  →  {url}")
     threading.Thread(target=client_watchdog, args=(server,), daemon=True).start()
     threading.Thread(target=lambda: (time.sleep(0.8), webbrowser.open(url)), daemon=True).start()
