@@ -93,7 +93,7 @@ STATE: Dict[str, Any] = {
     "form": dict(DEFAULT_FORM),
     "jobs": {},
 }
-AUTO_EXIT_IDLE_SECONDS = 180.0
+AUTO_EXIT_IDLE_SECONDS: Optional[float] = None
 LAST_CLIENT_PING = 0.0
 HAS_CLIENT_PING = False
 SERVER_REF: Optional[ThreadingHTTPServer] = None
@@ -118,6 +118,8 @@ def request_shutdown() -> None:
 
 
 def watchdog_auto_exit() -> None:
+    if AUTO_EXIT_IDLE_SECONDS is None:
+        return
     while True:
         time.sleep(1.0)
         if SHUTDOWN_STARTED:
