@@ -41,7 +41,7 @@ CROWDIN_UPLOAD_FOLDER = "English Team"
 APITABLE_BASE         = "https://apitable.yottastudios.com/fusion/v1"
 APITABLE_DATASHEET_ID = "dst54Y1Wzwdm5sDeQ7"
 APITABLE_VIEW_ID      = "viw8QB941rgSg"
-APITABLE_DEFAULT_KEY  = "uskgfHaQsbdknSvFgfCXBAy"
+APITABLE_DEFAULT_KEY  = ""
 
 # APITable 字段名
 F_TITLE    = "翻译需求（当日日期+翻译需求名字+需求人）"
