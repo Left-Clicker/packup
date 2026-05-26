@@ -93,7 +93,7 @@ STATE: Dict[str, Any] = {
     "form": dict(DEFAULT_FORM),
     "jobs": {},
 }
-AUTO_EXIT_IDLE_SECONDS = 4.0
+AUTO_EXIT_IDLE_SECONDS: Optional[float] = None
 LAST_CLIENT_PING = 0.0
 HAS_CLIENT_PING = False
 SERVER_REF: Optional[ThreadingHTTPServer] = None
@@ -118,6 +118,8 @@ def request_shutdown() -> None:
 
 
 def watchdog_auto_exit() -> None:
+    if AUTO_EXIT_IDLE_SECONDS is None:
+        return
     while True:
         time.sleep(1.0)
         if SHUTDOWN_STARTED:
@@ -1660,14 +1662,6 @@ INDEX_HTML = r"""<!doctype html>
       fetch("/api/ping", { method: "POST", keepalive: true }).catch(() => {});
     }
 
-    function notifyClose() {
-      if (navigator.sendBeacon) {
-        navigator.sendBeacon("/api/shutdown", "");
-      } else {
-        fetch("/api/shutdown", { method: "POST", keepalive: true }).catch(() => {});
-      }
-    }
-
     byId("runBtn").addEventListener("click", startSync);
     byId("saveBtn").addEventListener("click", async () => {
       try {
@@ -1721,8 +1715,12 @@ INDEX_HTML = r"""<!doctype html>
     });
     sendHeartbeat();
     setInterval(sendHeartbeat, 3000);
-    window.addEventListener("pagehide", notifyClose);
-    window.addEventListener("beforeunload", notifyClose);
+    window.addEventListener("focus", sendHeartbeat);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) {
+        sendHeartbeat();
+      }
+    });
     loadState();
   </script>
 </body>
