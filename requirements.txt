@@ -1,5 +1,7 @@
 certifi
 pandas
+openpyxl
+et_xmlfile
 argostranslate
 chardet
 langdetect

@@ -25,7 +25,19 @@ jobs:
 
       - name: 打包成 EXE
         run: |
-          pyinstaller --onefile --windowed --name="脚本" main.py
+          pyinstaller `
+            --clean `
+            --onefile `
+            --windowed `
+            --name="DocTranslator" `
+            --hidden-import openpyxl `
+            --hidden-import et_xmlfile `
+            --collect-all openpyxl `
+            --collect-all et_xmlfile `
+            --collect-all argostranslate `
+            --collect-all ctranslate2 `
+            --collect-all sentencepiece `
+            main.py
 
       - name: 上传 EXE 文件
         uses: actions/upload-artifact@v4
