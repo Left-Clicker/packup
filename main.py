@@ -72,6 +72,7 @@ DEFAULT_FORM = {
     "apitable_comment_column": "完成版附件",
     "current_user": "仿生人",
     "sync_note": "",
+    "ssl_verify": True,
 }
 
 
@@ -1025,6 +1026,7 @@ INDEX_HTML = r"""<!doctype html>
             <div class="block-12 global-card slim">
               <div class="global-actions">
                 <label class="inline-check"><input id="save_apitable_api_key" type="checkbox"> 保存 API Key</label>
+                <label class="inline-check"><input id="ssl_verify" type="checkbox" checked> SSL 证书验证（企业网络报错时取消勾选）</label>
               </div>
             </div>
           </div>
@@ -1284,7 +1286,8 @@ INDEX_HTML = r"""<!doctype html>
         extra_keyword: byId("extra_keyword").value.trim(),
         apitable_search_column: byId("apitable_search_column").value.trim(),
         apitable_comment_column: byId("apitable_comment_column").value.trim(),
-        sync_note: byId("sync_note").value
+        sync_note: byId("sync_note").value,
+        ssl_verify: byId("ssl_verify").checked
       };
     }
 
@@ -1805,7 +1808,15 @@ def get_resource_path(item: Dict[str, Any]) -> str:
     return ""
 
 
+_ssl_verify: bool = True
+
+
 def ssl_context() -> ssl.SSLContext:
+    if not _ssl_verify:
+        context = ssl.create_default_context()
+        context.check_hostname = False
+        context.verify_mode = ssl.CERT_NONE
+        return context
     context = ssl.create_default_context()
     if certifi is not None:
         context.load_verify_locations(cafile=certifi.where())
@@ -2754,8 +2765,10 @@ def append_job_log(job: Dict[str, Any], text: str) -> None:
 
 
 def run_sync_job(job: Dict[str, Any]) -> None:
+    global _ssl_verify
     payload = job["payload"]
     job["status"] = "running"
+    _ssl_verify = bool(payload.get("ssl_verify", True))
     try:
         crowdin_token = payload["crowdin_token"].strip()
         apitable_api_key = payload["apitable_api_key"].strip()
