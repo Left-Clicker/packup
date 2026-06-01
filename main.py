@@ -94,7 +94,7 @@ STATE: Dict[str, Any] = {
     "form": dict(DEFAULT_FORM),
     "jobs": {},
 }
-AUTO_EXIT_IDLE_SECONDS: Optional[float] = 12.0
+AUTO_EXIT_IDLE_SECONDS: Optional[float] = 120.0
 LAST_CLIENT_PING = 0.0
 HAS_CLIENT_PING = False
 SERVER_REF: Optional[ThreadingHTTPServer] = None
@@ -1606,15 +1606,25 @@ INDEX_HTML = r"""<!doctype html>
       return resp.json();
     }
 
+    function getSelectedRecordCrowdinFlag() {
+      if (!selectedBatchRecordId || !batchTablePayload) return "";
+      const row = (batchTablePayload.rows || []).find((r) => r.recordId === selectedBatchRecordId);
+      return row ? String((row.cells || {})["是否用运营组专用crowdin"] || "") : "";
+    }
+
     async function startSync() {
       setRunning(true);
       byId("statusBox").className = "status running";
       byId("statusBox").innerHTML = "<div class='status-title'>正在提交任务</div><div class='hint'>请稍候…</div>";
       try {
+        const payload = Object.assign(getFormPayload(), {
+          selected_record_id: selectedBatchRecordId,
+          crowdin_flag: getSelectedRecordCrowdinFlag()
+        });
         const resp = await fetch("/api/start-sync", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(getFormPayload())
+          body: JSON.stringify(payload)
         });
         const data = await resp.json();
         if (!data.ok) {
@@ -1639,7 +1649,9 @@ INDEX_HTML = r"""<!doctype html>
           return;
         }
         setRunning(false);
-        if (job.status === "error") {
+        if (job.status === "success") {
+          await loadBatchTable();
+        } else if (job.status === "error") {
           if ((job.error_code || "") === "crowdin_not_found") {
             alert("未搜到对应文件，请检查文件名、路径关键词或附加关键词。");
           } else {
@@ -2788,45 +2800,56 @@ def run_sync_job(job: Dict[str, Any]) -> None:
             or "完成版附件"
         )
 
-        append_job_log(job, "1/6 正在定位 Crowdin 项目…")
-        project = find_crowdin_project(crowdin_token)
-        project_id = get_resource_id(project)
+        crowdin_flag_raw = str(payload.get("crowdin_flag") or "").strip().lower()
+        use_crowdin = crowdin_flag_raw in ("是", "true", "yes", "1", "使用")
 
-        append_job_log(job, "2/6 正在读取 Crowdin 文件清单…")
-        files = crowdin_api_get_all(crowdin_token, f"/projects/{project_id}/files", params={"recursion": "true"})
+        matched_file_path = ""
+        raw_translation = b""
+        attachment_name = ""
+        translation_text = ""
 
-        append_job_log(job, "3/6 正在匹配目标文件…")
-        try:
-            matched_file = pick_crowdin_file(
-                files,
-                file_name=file_name,
-                crowdin_folder=crowdin_folder,
-                extra_path_keyword=extra_path_keyword,
-                extra_keyword=extra_keyword,
-            )
-        except LookupError as exc:
-            job["error_code"] = "crowdin_not_found"
-            raise RuntimeError(str(exc)) from exc
-        matched_file_path = get_resource_path(matched_file) or get_resource_name(matched_file)
-        append_job_log(job, f"已匹配文件: {matched_file_path}")
+        if use_crowdin:
+            append_job_log(job, "1/6 正在定位 Crowdin 项目…")
+            project = find_crowdin_project(crowdin_token)
+            project_id = get_resource_id(project)
 
-        append_job_log(job, "4/6 正在导出 en-US 翻译…")
-        export_result = export_crowdin_translation(crowdin_token, project_id, get_resource_id(matched_file))
-        data = export_result.get("data") or {}
-        download_url = str(data.get("url") or "").strip()
-        if not download_url:
-            raise RuntimeError(f"Crowdin 未返回下载链接: {json.dumps(export_result, ensure_ascii=False)[:500]}")
-        raw_translation = http_bytes(download_url)
-        attachment_name = os.path.basename(matched_file_path.replace("\\", "/")) or f"{file_name}.bin"
-        if zipfile.is_zipfile(io.BytesIO(raw_translation)):
-            append_job_log(job, "Crowdin 返回的是压缩包类型，正在提取可读文本…")
+            append_job_log(job, "2/6 正在读取 Crowdin 文件清单…")
+            files = crowdin_api_get_all(crowdin_token, f"/projects/{project_id}/files", params={"recursion": "true"})
+
+            append_job_log(job, "3/6 正在匹配目标文件…")
+            try:
+                matched_file = pick_crowdin_file(
+                    files,
+                    file_name=file_name,
+                    crowdin_folder=crowdin_folder,
+                    extra_path_keyword=extra_path_keyword,
+                    extra_keyword=extra_keyword,
+                )
+            except LookupError as exc:
+                job["error_code"] = "crowdin_not_found"
+                raise RuntimeError(str(exc)) from exc
+            matched_file_path = get_resource_path(matched_file) or get_resource_name(matched_file)
+            append_job_log(job, f"已匹配文件: {matched_file_path}")
+
+            append_job_log(job, "4/6 正在导出 en-US 翻译…")
+            export_result = export_crowdin_translation(crowdin_token, project_id, get_resource_id(matched_file))
+            data = export_result.get("data") or {}
+            download_url = str(data.get("url") or "").strip()
+            if not download_url:
+                raise RuntimeError(f"Crowdin 未返回下载链接: {json.dumps(export_result, ensure_ascii=False)[:500]}")
+            raw_translation = http_bytes(download_url)
+            attachment_name = os.path.basename(matched_file_path.replace("\\", "/")) or f"{file_name}.bin"
+            if zipfile.is_zipfile(io.BytesIO(raw_translation)):
+                append_job_log(job, "Crowdin 返回的是压缩包类型，正在提取可读文本…")
+            else:
+                append_job_log(job, "Crowdin 返回的是文本类型，正在整理内容…")
+            try:
+                translation_text = extract_translation_text(raw_translation, matched_file_path).strip()
+            except Exception as exc:
+                translation_text = ""
+                append_job_log(job, f"未提取到可读预览，将继续上传原文件: {exc}")
         else:
-            append_job_log(job, "Crowdin 返回的是文本类型，正在整理内容…")
-        try:
-            translation_text = extract_translation_text(raw_translation, matched_file_path).strip()
-        except Exception as exc:
-            translation_text = ""
-            append_job_log(job, f"未提取到可读预览，将继续上传原文件: {exc}")
+            append_job_log(job, "1-4/6 非运营组 Crowdin，跳过文件下载，直接写入 APITable…")
 
         append_job_log(job, "5/6 正在读取 APITable 视图数据…")
         base_url = get_apitable_base_url()
@@ -2869,29 +2892,30 @@ def run_sync_job(job: Dict[str, Any]) -> None:
                 append_job_log(job, f"检查者校验: {json.dumps(checker_write_debug['verification'], ensure_ascii=False)}")
             time.sleep(1)
 
-        append_job_log(job, "正在上传附件并写入 APITable…")
-        existing_attachments = []
-        existing_value = (record.get("fields") or {}).get(comment_column)
-        if isinstance(existing_value, list):
-            existing_attachments = [item for item in existing_value if isinstance(item, dict)]
-        uploaded_attachments = upload_aitable_attachment(
-            apitable_api_key,
-            base_origin,
-            datasheet_id,
-            attachment_name,
-            raw_translation,
-        )
-        if not uploaded_attachments:
-            raise RuntimeError("APITable 附件上传后没有返回可写入的附件对象")
-        update_record_comment(
-            apitable_api_key,
-            base_url,
-            datasheet_id,
-            view_id,
-            record_id,
-            comment_column,
-            existing_attachments + uploaded_attachments,
-        )
+        if use_crowdin:
+            append_job_log(job, "正在上传附件并写入 APITable…")
+            existing_attachments = []
+            existing_value = (record.get("fields") or {}).get(comment_column)
+            if isinstance(existing_value, list):
+                existing_attachments = [item for item in existing_value if isinstance(item, dict)]
+            uploaded_attachments = upload_aitable_attachment(
+                apitable_api_key,
+                base_origin,
+                datasheet_id,
+                attachment_name,
+                raw_translation,
+            )
+            if not uploaded_attachments:
+                raise RuntimeError("APITable 附件上传后没有返回可写入的附件对象")
+            update_record_comment(
+                apitable_api_key,
+                base_url,
+                datasheet_id,
+                view_id,
+                record_id,
+                comment_column,
+                existing_attachments + uploaded_attachments,
+            )
         extra_sync_fields = {}
         if SYNC_FIELD_CHECKED in field_names:
             extra_sync_fields[SYNC_FIELD_CHECKED] = True
@@ -2922,16 +2946,16 @@ def run_sync_job(job: Dict[str, Any]) -> None:
                 append_job_log(job, f"检查信息校验: {json.dumps(sync_write_debug['verification'], ensure_ascii=False)}")
 
         job["status"] = "success"
-        job["message"] = "同步完成，完成版附件已更新"
+        job["message"] = "同步完成，完成版附件已更新" if use_crowdin else "写入完成（非运营组 Crowdin，已跳过附件）"
         job["result"] = {
             "matched_file_path": matched_file_path,
             "record_id": record_id,
             "search_column": search_column,
             "comment_column": comment_column,
-            "translation_text": translation_text or f"[附件已上传] {attachment_name}",
+            "translation_text": translation_text or (f"[附件已上传] {attachment_name}" if use_crowdin else "[无附件] 已直接写入检查信息"),
             "attachment_name": attachment_name,
         }
-        append_job_log(job, "同步完成，完成版附件已更新。")
+        append_job_log(job, job["message"])
     except Exception as exc:
         job["status"] = "error"
         job["message"] = str(exc)
