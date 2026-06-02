@@ -1,0 +1,5 @@
+[2026-06-02 12:32:35] start executable=/Users/mac/PycharmProjects/PythonProject/.venv/bin/python
+[2026-06-02 12:32:35] cleanup old services
+[2026-06-02 12:32:35] loading state from /Users/mac/Documents/GitHub/packup/crowdin_tool_state.json
+[2026-06-02 12:32:35] creating server on 127.0.0.1:8773
+[2026-06-02 12:32:35] server ready url=http://localhost:8773

@@ -695,6 +695,9 @@ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
 .chk{{display:flex;align-items:center;gap:7px;font-size:12px;color:var(--muted);
       cursor:pointer;margin-top:6px}}
 .chk input{{width:14px;height:14px;accent-color:var(--blue);cursor:pointer}}
+.input-action-row{{display:grid;grid-template-columns:minmax(0,1fr) auto;gap:10px;align-items:center}}
+.btn-inline{{height:38px;padding:0 14px;white-space:nowrap}}
+@media(max-width:600px){{.input-action-row{{grid-template-columns:1fr}}.btn-inline{{width:100%}}}}
 
 .spin{{display:inline-block;animation:spin .7s linear infinite}}
 @keyframes spin{{to{{transform:rotate(360deg)}}}}
@@ -730,7 +733,10 @@ body{{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;
     </div>
     <div class="field" style="margin-bottom:12px">
       <label>APITable API Key <span class="req">*</span></label>
-      <input id="apitable_api_key" type="password" placeholder="Bearer Key">
+      <div class="input-action-row">
+        <input id="apitable_api_key" type="password" placeholder="Bearer Key">
+        <button type="button" class="btn btn-ghost btn-inline" onclick="readApitablePeople()">读取 APITable</button>
+      </div>
     </div>
     <!-- Crowdin 上传设置 -->
     <div class="g3" style="margin-bottom:12px">
@@ -1003,9 +1009,10 @@ function ensureSelectOption(id, value) {
   sel.value = value;
 }
 
-async function loadRequesters() {
+async function loadRequesters(apiKey) {
   try {
-    const r = await api("/api/requesters");
+    const key = apiKey || v("apitable_api_key");
+    const r = await api("/api/requesters", key ? {apitable_api_key: key} : undefined);
     const savedUser = v("current_user");
     const names = Array.isArray(r.requesters) ? r.requesters.slice() : [];
     if (savedUser && !names.includes(savedUser)) names.unshift(savedUser);
@@ -1028,6 +1035,42 @@ async function loadRequesters() {
     });
   } catch(e) {
     console.warn("加载需求人列表失败:", e);
+  }
+}
+
+async function readApitablePeople() {
+  const key = v("apitable_api_key").trim();
+  if (!key) {
+    alert("请先填写 APITable API Key");
+    byId("apitable_api_key").focus();
+    return false;
+  }
+  const btn = event && event.currentTarget ? event.currentTarget : null;
+  const oldText = btn ? btn.textContent : "";
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = "读取中...";
+  }
+  try {
+    await loadRequesters(key);
+    const count = byId("current_user") ? Math.max(0, byId("current_user").options.length - 1) : 0;
+    setConn(count > 0);
+    if (count > 0) {
+      alert(`已读取 ${count} 个名字`);
+      updateConfigState(false);
+      return true;
+    }
+    alert("没有从 APITable 读到人员名单，请确认 Key 和表格权限。");
+    return false;
+  } catch(e) {
+    setConn(false);
+    alert("读取 APITable 失败：" + (e.message || e));
+    return false;
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = oldText;
+    }
   }
 }
 
@@ -1075,7 +1118,7 @@ function saveSettings() {
     updateConfigState(true);
     alert("✅ 设置已保存，正在验证 APITable 连接…");
     checkConn(v("apitable_api_key"));
-    loadRequesters();
+    loadRequesters(v("apitable_api_key"));
     return true;
   }).catch(e => {
     alert("❌ 保存设置失败：" + (e.message || e));
@@ -1408,6 +1451,11 @@ class Handler(BaseHTTPRequestHandler):
         if p == "/api/ping":
             key = str(body.get("apitable_api_key","")).strip()
             self.send_json({"ok": aitable_ping(key)}); return
+
+        if p == "/api/requesters":
+            key = str(body.get("apitable_api_key","")).strip() or STATE.get("apitable_api_key", "")
+            names = aitable_fetch_requesters(key) if key else []
+            self.send_json({"ok": True, "requesters": names}); return
 
         if p == "/api/shutdown":
             self.send_json({"ok": True})
