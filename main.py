@@ -163,7 +163,19 @@ def _ai_login(account: str = None, password: str = None):
     if login_data.get("error_code") not in ("0", 0):
         raise RuntimeError(f"OA 登录失败: {login_data.get('error_msg')}")
 
-    s, _, callback_url, _ = _http_get("oa-core.xinyoudi.com", oa_oauth_path, cookies=oa_c)
+    s, _, callback_url, cb_body = _http_get("oa-core.xinyoudi.com", oa_oauth_path, cookies=oa_c)
+    if not callback_url or "auth/callback" not in callback_url:
+        # 服务端可能把 callback URL 放在 body 里（JSON 或 HTML/JS 重定向）
+        for pattern in (
+            r'"(?:redirect|callback|url|redirectUrl|redirect_url)"\s*:\s*"([^"]+auth/callback[^"]*)"',
+            r"(?:window\.location|location\.href)\s*[=:]\s*['\"]([^'\"]+auth/callback[^'\"]*)['\"]",
+            r'content=["\'][^"\']*url=([^"\']+auth/callback[^"\']*)["\']',
+            r'(https?://[^\s"\'<>]+auth/callback[^\s"\'<>]*)',
+        ):
+            m = re.search(pattern, cb_body)
+            if m:
+                callback_url = m.group(1)
+                break
     if not callback_url or "auth/callback" not in callback_url:
         raise RuntimeError(f"未拿到 callback URL: {callback_url}")
 
