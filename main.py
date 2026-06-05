@@ -1,3120 +1,2781 @@
 #!/usr/bin/env python3
-"""Crowdin 文件翻译同步到 APITable 留言列的本地网页工具。"""
+"""
+Crowdin Translation Checker
+Paste Chinese + English draft → 3-column table with glossary terms → copy back to Crowdin.
+Glossary auto-loaded from "Mafia War's Glossary.csv" in the same directory.
+"""
 
-from __future__ import annotations
-
-import io
+import csv
+import ast
+import base64
+import http.client
+import http.server
 import json
-import mimetypes
+import math
 import os
 import re
-import socket
 import ssl
 import subprocess
 import sys
 import threading
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
+import urllib.request as _urllib_request
 import uuid
 import webbrowser
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
 import zipfile
+import xml.etree.ElementTree as ET
+
+PORT = 8765
+CLIENT_STALE_SECONDS = 45
+SHUTDOWN_GRACE_SECONDS = 1.5
+# When packaged with PyInstaller (--onefile), __file__ points to a temporary
+# extraction directory, not where the user actually placed the binary. Use the
+# executable's directory in that case so the glossary CSV can sit next to the
+# binary and be edited without rebuilding.
+if getattr(sys, "frozen", False):
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+
+AICHAT_CREDS_FILE = os.path.join(SCRIPT_DIR, "aichat_creds.json")
+_AI_SESSION_FILE = os.path.join(SCRIPT_DIR, "aichat_session.json")
+
+# ── AIChat 内联实现 ────────────────────────────────────────────────────────────
+HOST = "aichat.xinyoudi.com"
+_ctx = ssl._create_unverified_context()
+
+_RSA_PUBLIC_KEY = """-----BEGIN PUBLIC KEY-----
+MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAw9aTnFauSMuxMRKdIM6P
+d8sfbvMUdtWewwGxbpwOhdETfpn2xE1AcAlNl53b/+EC+S3z7liaD+YnbbNbT+2w
+I9k17Ey4nsi259ZU8WAi8064kkSAwSXQwBEX4tLPzTzD+VaK+f0q1+JwscaMqlOs
+no6MwauirmcLdCDXszOeaIqLOdqo1JD9BTt2j6v74AEmxKLLm2G43lCaU5k6PWIC
+RncHHPdqfadhvLC+hY2gS5aVWa+tsv7GCldLblnyFR6LnaYHNkQQ2DYoP2wwYZxH
+k5t3g/gTuHZgH49qA3gaxYOL7kA+mxE/Xzku9FSA+P5hRYigiV7rHqZaFfiZB26o
+QwIDAQAB
+-----END PUBLIC KEY-----"""
 
 
-HOST = "127.0.0.1"
-PORT = 8772
-BASE_API_URL = "https://api.crowdin.com/api/v2"
-CROWDIN_PROJECT_SLUG = "operational-localization"
-CROWDIN_TARGET_LANGUAGE = "en-US"
-APITABLE_BASE_ORIGIN = "https://apitable.yottastudios.com"
-APITABLE_DATASHEET_ID = "dst54Y1Wzwdm5sDeQ7"
-APITABLE_READ_VIEW_ID = "viw8QB941rgSg"
-APITABLE_WRITE_VIEW_ID = "viwJ88IVxdxo"
-SCRIPT_DIR = Path(__file__).resolve().parent
-APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "CrowdinAPITableCommentTool"
-PACKAGED_STATE_FILE = APP_SUPPORT_DIR / "crowdin_apitable_comment_tool_state.json"
-LEGACY_STATE_FILE = SCRIPT_DIR / "crowdin_apitable_comment_tool_state.json"
-BATCH_FIELD_ASSIGN_LOCALIZER = "分配本地化（那三个人仅特殊情况才选择）"
-BATCH_FIELD_REQUESTER = "分配需求者"
-BATCH_FIELD_MESSAGE = "给本地化留言"
-BATCH_FIELD_SEND_FLAG = "是否发送信息给本地化"
-BATCH_FIELD_CHECK_LEAD = "检查提前量（min）"
-SYNC_FIELD_SEARCH_KEY = "翻译需求（当日日期+翻译需求名字+需求人）"
-READ_FIELD_REQUESTER = "需求人"
-READ_FIELD_DEADLINE = "需求ddl（尽量提前1-3小时）"
-READ_FIELD_PRIORITY = "优先级"
-READ_FIELD_CROWDIN_FLAG = "是否用运营组专用crowdin"
-READ_FIELD_TASK_LINK = "填写实际任务链接"
-SYNC_FIELD_CHECKER = "检查者"
-SYNC_FIELD_CHECKED = "是否检查完"
-SYNC_FIELD_NOTE = "留言（会在检查完的消息里添加）"
-
-try:
-    import certifi
-except Exception:
-    certifi = None
+def _http_get(host, path, cookies=None):
+    conn = http.client.HTTPSConnection(host, context=_ctx, timeout=15)
+    hdrs = {}
+    if cookies:
+        hdrs["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    conn.request("GET", path, headers=hdrs)
+    resp = conn.getresponse()
+    body = resp.read().decode("utf-8", errors="ignore")
+    new_cookies = {}
+    for h, v in resp.getheaders():
+        if h.lower() == "set-cookie":
+            k = v.split("=")[0].strip()
+            vv = v.split("=")[1].split(";")[0]
+            new_cookies[k] = vv
+    location = next((v for h, v in resp.getheaders() if h.lower() == "location"), None)
+    conn.close()
+    return resp.status, new_cookies, location, body
 
 
-DEFAULT_FORM = {
-    "crowdin_token": "",
-    "save_crowdin_token": True,
-    "apitable_api_key": "",
-    "save_apitable_api_key": True,
-    "file_name": "",
-    "crowdin_folder": "",
-    "extra_path_keyword": "",
-    "extra_keyword": "",
-    "apitable_search_column": "翻译需求（当日日期+翻译需求名字+需求人）",
-    "apitable_comment_column": "完成版附件",
-    "current_user": "仿生人",
-    "sync_note": "",
-}
+def _http_post_json(host, path, payload, cookies=None):
+    conn = http.client.HTTPSConnection(host, context=_ctx, timeout=15)
+    body = json.dumps(payload).encode()
+    hdrs = {"Content-Type": "application/json"}
+    if cookies:
+        hdrs["Cookie"] = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    conn.request("POST", path, body=body, headers=hdrs)
+    resp = conn.getresponse()
+    result = resp.read().decode("utf-8", errors="ignore")
+    new_cookies = {}
+    for h, v in resp.getheaders():
+        if h.lower() == "set-cookie":
+            k = v.split("=")[0].strip()
+            vv = v.split("=")[1].split(";")[0]
+            new_cookies[k] = vv
+    location = next((v for h, v in resp.getheaders() if h.lower() == "location"), None)
+    conn.close()
+    return resp.status, new_cookies, location, result
 
 
-def resolve_state_file() -> Path:
-    if getattr(sys, "frozen", False):
-        APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
-        if not PACKAGED_STATE_FILE.exists() and LEGACY_STATE_FILE.exists():
-            try:
-                PACKAGED_STATE_FILE.write_text(LEGACY_STATE_FILE.read_text(encoding="utf-8"), encoding="utf-8")
-            except Exception:
-                pass
-        return PACKAGED_STATE_FILE
-    return LEGACY_STATE_FILE
-
-
-STATE_FILE = resolve_state_file()
-
-STATE: Dict[str, Any] = {
-    "form": dict(DEFAULT_FORM),
-    "jobs": {},
-}
-AUTO_EXIT_IDLE_SECONDS: Optional[float] = None
-LAST_CLIENT_PING = 0.0
-HAS_CLIENT_PING = False
-SERVER_REF: Optional[ThreadingHTTPServer] = None
-SHUTDOWN_STARTED = False
-
-
-def mark_client_ping() -> None:
-    global LAST_CLIENT_PING, HAS_CLIENT_PING
-    LAST_CLIENT_PING = time.time()
-    HAS_CLIENT_PING = True
-
-
-def request_shutdown() -> None:
-    global SHUTDOWN_STARTED
-    if SHUTDOWN_STARTED:
-        return
-    SHUTDOWN_STARTED = True
-    server = SERVER_REF
-    if not server:
-        return
-    threading.Thread(target=server.shutdown, daemon=True).start()
-
-
-def watchdog_auto_exit() -> None:
-    if AUTO_EXIT_IDLE_SECONDS is None:
-        return
-    while True:
-        time.sleep(1.0)
-        if SHUTDOWN_STARTED:
-            return
-        if HAS_CLIENT_PING and time.time() - LAST_CLIENT_PING > AUTO_EXIT_IDLE_SECONDS:
-            request_shutdown()
-            return
-
-
-def port_is_open(host: str, port: int) -> bool:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.settimeout(0.5)
+def _encrypt_password(password: str) -> str:
     try:
-        return sock.connect_ex((host, port)) == 0
-    finally:
-        sock.close()
+        from Crypto.PublicKey import RSA
+        from Crypto.Cipher import PKCS1_v1_5
+    except ImportError:
+        raise RuntimeError("请安装 pycryptodome：pip install pycryptodome")
+    payload = json.dumps({"password": password, "time": math.floor(time.time())})
+    key = RSA.import_key(_RSA_PUBLIC_KEY)
+    cipher = PKCS1_v1_5.new(key)
+    return base64.b64encode(cipher.encrypt(payload.encode())).decode()
 
 
-def ask_existing_instance_to_shutdown(host: str, port: int) -> None:
+def _ai_load_creds():
+    if not os.path.exists(AICHAT_CREDS_FILE):
+        raise RuntimeError(f"找不到凭据文件 {AICHAT_CREDS_FILE}")
+    with open(AICHAT_CREDS_FILE) as f:
+        data = json.load(f)
+    if "account" not in data or "password" not in data:
+        raise RuntimeError(f"{AICHAT_CREDS_FILE} 缺少 account 或 password 字段")
+    return data["account"], data["password"]
+
+
+def _ai_save_session(aichat_session: str, xsrf_token: str):
+    with open(_AI_SESSION_FILE, "w") as f:
+        json.dump({"aichat_session": aichat_session, "xsrf_token": xsrf_token,
+                   "saved_at": time.time()}, f)
     try:
-        req = urllib.request.Request(f"http://{host}:{port}/api/shutdown", method="POST")
-        urllib.request.urlopen(req, timeout=0.8).read()
+        os.chmod(_AI_SESSION_FILE, 0o600)
     except Exception:
-        return
-    for _ in range(20):
-        if not port_is_open(host, port):
-            return
-        time.sleep(0.1)
+        pass
 
 
-def kill_stale_listener(port: int) -> None:
+def _ai_load_session():
+    if not os.path.exists(_AI_SESSION_FILE):
+        return None, None
     try:
-        result = subprocess.run(
-            ["lsof", "-tiTCP:%d" % port, "-sTCP:LISTEN"],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=1.0,
-        )
+        with open(_AI_SESSION_FILE) as f:
+            data = json.load(f)
+        return data.get("aichat_session", ""), data.get("xsrf_token", "")
     except Exception:
-        return
-    for raw_pid in result.stdout.splitlines():
-        try:
-            pid = int(raw_pid.strip())
-        except ValueError:
-            continue
-        if pid == os.getpid():
-            continue
-        try:
-            os.kill(pid, 15)
-        except Exception:
-            pass
-    for _ in range(20):
-        if not port_is_open(HOST, port):
-            return
-        time.sleep(0.1)
-
-
-def create_server_with_fallback(host: str, preferred_port: int) -> Tuple[ThreadingHTTPServer, int]:
-    ask_existing_instance_to_shutdown(host, preferred_port)
-    if port_is_open(host, preferred_port):
-        kill_stale_listener(preferred_port)
-    last_error: Optional[Exception] = None
-    for offset in range(20):
-        port = preferred_port + offset
-        try:
-            return ThreadingHTTPServer((host, port), Handler), port
-        except OSError as exc:
-            last_error = exc
-            if exc.errno in (48, 98):
-                continue
-            raise
-    raise RuntimeError(f"无法启动本地服务，端口 {preferred_port}-{preferred_port + 19} 都不可用：{last_error}")
-
-INDEX_HTML = r"""<!doctype html>
-<html lang="zh-CN">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Crowdin → APITable 留言同步工具</title>
-  <style>
-    :root {
-      --bg: #f4ede4;
-      --bg-deep: #ece1d3;
-      --panel: rgba(255, 251, 246, 0.86);
-      --line: rgba(108, 90, 73, 0.16);
-      --text: #1f1a17;
-      --muted: #72675d;
-      --primary: #145f59;
-      --primary-strong: #0e4c48;
-      --accent: #b86b35;
-      --ok-soft: #e8f5ee;
-      --danger-soft: #fbe9e6;
-      --warning-soft: #fff4dc;
-      --shadow-lg: 0 24px 60px rgba(67, 49, 29, 0.12);
-      --shadow-md: 0 14px 32px rgba(67, 49, 29, 0.08);
-      --shadow-sm: 0 8px 18px rgba(67, 49, 29, 0.05);
-      --radius-xl: 28px;
-      --radius-lg: 22px;
-      --radius-md: 16px;
-      --radius-sm: 12px;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      min-height: 100vh;
-      font-family: "Avenir Next", "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
-      color: var(--text);
-      background:
-        radial-gradient(920px 460px at 0% 0%, rgba(184, 107, 53, 0.18), transparent 56%),
-        radial-gradient(780px 420px at 100% 0%, rgba(20, 95, 89, 0.16), transparent 52%),
-        linear-gradient(180deg, #f7f1e9 0%, var(--bg) 58%, var(--bg-deep) 100%);
-      padding: 30px 18px 44px;
-    }
-    .wrap {
-      max-width: 1460px;
-      margin: 0 auto;
-    }
-    .topbar {
-      display: grid;
-      grid-template-columns: minmax(0, 1fr) minmax(240px, 320px);
-      gap: 18px;
-      margin-bottom: 20px;
-    }
-    .hero-card,
-    .meta-card,
-    .surface,
-    .workspace-shell,
-    .feedback-shell {
-      background: var(--panel);
-      border: 1px solid rgba(255, 255, 255, 0.42);
-      box-shadow: var(--shadow-lg);
-      backdrop-filter: blur(14px);
-    }
-    .hero-card {
-      border-radius: var(--radius-xl);
-      padding: 28px 30px;
-      position: relative;
-      overflow: hidden;
-    }
-    .hero-card::after {
-      content: "";
-      position: absolute;
-      width: 260px;
-      height: 260px;
-      right: -40px;
-      bottom: -90px;
-      border-radius: 50%;
-      background: radial-gradient(circle, rgba(20, 95, 89, 0.14), transparent 70%);
-    }
-    .hero-heading {
-      margin: 0;
-      font-size: 37px;
-      line-height: 1.08;
-      letter-spacing: -0.02em;
-      font-weight: 760;
-      max-width: 720px;
-    }
-    .hero-sub {
-      margin-top: 14px;
-      max-width: 780px;
-      color: var(--muted);
-      font-size: 14px;
-      line-height: 1.82;
-    }
-    .hero-notes {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 10px;
-      margin-top: 18px;
-    }
-    .note-chip,
-    .badge,
-    .record-filter-tab {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      padding: 9px 13px;
-      border: 1px solid var(--line);
-      border-radius: 999px;
-      background: rgba(255, 255, 255, 0.66);
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 650;
-      letter-spacing: 0.01em;
-    }
-    .meta-card {
-      border-radius: var(--radius-xl);
-      padding: 22px;
-      display: flex;
-      flex-direction: column;
-      gap: 14px;
-      align-items: flex-start;
-      justify-content: space-between;
-    }
-    .meta-kicker {
-      font-size: 12px;
-      color: var(--accent);
-      text-transform: uppercase;
-      letter-spacing: 0.12em;
-      font-weight: 700;
-    }
-    .meta-title {
-      font-size: 14px;
-      line-height: 1.75;
-      color: var(--muted);
-    }
-    .meta-panel {
-      border-radius: var(--radius-lg);
-      border: 1px solid var(--line);
-      background: rgba(255, 255, 255, 0.74);
-      padding: 14px 16px;
-    }
-    .meta-panel .k,
-    .subsurface-title,
-    .card-label,
-    .meta-box .k {
-      font-size: 11px;
-      color: var(--muted);
-      text-transform: uppercase;
-      letter-spacing: 0.1em;
-      font-weight: 700;
-      margin-bottom: 6px;
-    }
-    .meta-panel .v {
-      font-size: 14px;
-      line-height: 1.7;
-      color: var(--text);
-      word-break: break-word;
-    }
-    .dashboard {
-      display: grid;
-      grid-template-columns: minmax(320px, 390px) minmax(0, 1fr);
-      grid-template-areas: "workspace context";
-      gap: 20px;
-      align-items: start;
-    }
-    main {
-      display: grid;
-      gap: 20px;
-      align-self: start;
-      grid-area: workspace;
-      min-width: 0;
-    }
-    .surface,
-    .workspace-shell,
-    .feedback-shell {
-      border-radius: 30px;
-      padding: 22px;
-    }
-    .surface {
-      min-height: calc(100vh - 240px);
-      grid-area: context;
-      min-width: 0;
-    }
-    .surface-title,
-    .workspace-title,
-    .feedback-title {
-      margin: 0;
-      font-size: 22px;
-      font-weight: 750;
-      letter-spacing: -0.02em;
-    }
-    .surface-copy,
-    .workspace-copy,
-    .feedback-copy {
-      margin-top: 8px;
-      color: var(--muted);
-      font-size: 13px;
-      line-height: 1.76;
-    }
-    .global-stack,
-    .context-stack,
-    .workspace-stack {
-      display: grid;
-      gap: 16px;
-    }
-    .context-stack {
-      grid-template-rows: auto minmax(0, 1fr);
-    }
-    .global-stack {
-      grid-template-rows: auto minmax(520px, 1fr) auto auto;
-    }
-    .subsurface,
-    .soft-panel,
-    .console-card {
-      background: linear-gradient(180deg, rgba(255,255,255,0.76), rgba(249,243,236,0.92));
-      border: 1px solid rgba(108, 90, 73, 0.12);
-      border-radius: 24px;
-      padding: 16px;
-      box-shadow: var(--shadow-sm);
-      min-width: 0;
-      overflow: hidden;
-    }
-    .subsurface.tight { padding: 14px; }
-    .subsurface.compact {
-      padding: 12px;
-      border-radius: 18px;
-    }
-    .subsurface.task-panel {
-      padding: 14px;
-      min-height: 420px;
-      display: grid;
-      grid-template-rows: auto auto minmax(0, 1fr);
-    }
-    .global-controls,
-    .mini-grid,
-    .row,
-    .inner-grid,
-    .result-meta {
-      display: grid;
-      grid-template-columns: repeat(12, minmax(0, 1fr));
-      gap: 12px;
-    }
-    .global-controls .block-5 { grid-column: span 5; }
-    .global-controls .block-7 { grid-column: span 7; }
-    .global-controls .block-12 { grid-column: span 12; }
-    .global-controls.compact-config {
-      grid-template-columns: 120px minmax(150px, 1fr) 176px;
-      gap: 8px;
-      align-items: end;
-    }
-    .global-controls.compact-config .block-5,
-    .global-controls.compact-config .block-7,
-    .global-controls.compact-config .block-12 {
-      grid-column: auto;
-    }
-    .mini-grid .span-12 { grid-column: span 12; }
-    .field {
-      grid-column: span 6;
-      display: flex;
-      flex-direction: column;
-      gap: 7px;
-    }
-    .field.full { grid-column: span 12; }
-    .global-card,
-    .meta-box {
-      background: rgba(255, 255, 255, 0.74);
-      border: 1px solid var(--line);
-      border-radius: 18px;
-      padding: 14px;
-      box-shadow: var(--shadow-sm);
-      min-width: 0;
-      overflow: hidden;
-    }
-    .global-card.compact { padding: 15px 16px; }
-    .global-card.slim {
-      padding: 8px 10px;
-      border-radius: 14px;
-      box-shadow: none;
-    }
-    .global-card.slim input,
-    .global-card.slim select {
-      min-height: 36px;
-      padding-top: 7px;
-      padding-bottom: 7px;
-    }
-    .compact-config .global-actions {
-      flex-wrap: nowrap;
-      min-height: 55px;
-      justify-content: center;
-      gap: 8px;
-    }
-    .compact-config .global-actions button {
-      min-width: 94px;
-      padding: 9px 10px;
-      white-space: nowrap;
-    }
-    .compact-config .inline-check {
-      white-space: nowrap;
-      font-size: 11px;
-    }
-    .focus-grid {
-      display: grid;
-      grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.2fr);
-      gap: 8px;
-    }
-    .global-value,
-    .meta-box .v {
-      font-size: 14px;
-      line-height: 1.7;
-      color: var(--text);
-      word-break: break-word;
-    }
-    #translationPreview {
-      max-height: 320px;
-      overflow-y: auto;
-      white-space: pre-wrap;
-      font-family: ui-monospace, "SF Mono", Menlo, monospace;
-      font-size: 12px;
-      line-height: 1.65;
-      padding: 8px 0;
-    }
-    .global-value.compact-value {
-      font-size: 12px;
-      line-height: 1.45;
-      max-height: 36px;
-      overflow: hidden;
-    }
-    label {
-      font-size: 13px;
-      color: var(--text);
-      font-weight: 650;
-      letter-spacing: 0.01em;
-    }
-    input, textarea, select {
-      width: 100%;
-      border: 1px solid var(--line);
-      border-radius: var(--radius-sm);
-      padding: 12px 13px;
-      font: inherit;
-      color: var(--text);
-      background: rgba(255, 255, 255, 0.92);
-      outline: none;
-      transition: border-color 0.16s ease, box-shadow 0.16s ease, background 0.16s ease;
-    }
-    select {
-      appearance: none;
-      background-image:
-        linear-gradient(45deg, transparent 50%, var(--muted) 50%),
-        linear-gradient(135deg, var(--muted) 50%, transparent 50%);
-      background-position:
-        calc(100% - 18px) calc(50% - 3px),
-        calc(100% - 12px) calc(50% - 3px);
-      background-size: 6px 6px, 6px 6px;
-      background-repeat: no-repeat;
-      padding-right: 34px;
-    }
-    input:focus, textarea:focus, select:focus {
-      border-color: rgba(20, 95, 89, 0.48);
-      box-shadow: 0 0 0 4px rgba(20, 95, 89, 0.08);
-      background: #fff;
-    }
-    textarea {
-      min-height: 150px;
-      resize: vertical;
-      line-height: 1.6;
-      font-family: ui-monospace, "SF Mono", Menlo, monospace;
-      background: rgba(252, 250, 247, 0.98);
-    }
-    .compact-textarea {
-      min-height: 44px;
-      height: 44px;
-      max-height: 76px;
-      line-height: 1.5;
-      overflow-y: auto;
-      resize: none;
-    }
-    .hint {
-      color: var(--muted);
-      font-size: 12px;
-      line-height: 1.7;
-    }
-    .status.compact-status {
-      padding: 12px 14px;
-      border-radius: 16px;
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      flex-wrap: wrap;
-      gap: 12px;
-    }
-    .status.compact-status .status-title {
-      margin: 0;
-      white-space: nowrap;
-      flex: 0 0 auto;
-    }
-    .status.compact-status .hint {
-      line-height: 1.45;
-      text-align: left;
-      flex: 1 1 260px;
-      min-width: 0;
-      word-break: break-word;
-    }
-    .actions,
-    .global-actions,
-    .record-filter-bar,
-    .feedback-head,
-    .workspace-header {
-      display: flex;
-      gap: 10px;
-      flex-wrap: wrap;
-      align-items: center;
-    }
-    .feedback-head,
-    .workspace-header {
-      justify-content: space-between;
-    }
-    .workspace-config-trigger {
-      width: 100%;
-      justify-content: center;
-    }
-    button {
-      border: 1px solid transparent;
-      border-radius: 14px;
-      padding: 11px 16px;
-      font: inherit;
-      font-weight: 700;
-      letter-spacing: 0.01em;
-      cursor: pointer;
-      background: linear-gradient(135deg, var(--primary), var(--primary-strong));
-      color: #fff;
-      box-shadow: 0 12px 22px rgba(20, 95, 89, 0.18);
-      transition: transform 0.16s ease, box-shadow 0.16s ease, background 0.16s ease;
-    }
-    button:hover {
-      transform: translateY(-1px);
-      box-shadow: 0 16px 28px rgba(20, 95, 89, 0.22);
-    }
-    button.secondary,
-    .record-filter-tab {
-      background: rgba(255, 255, 255, 0.76);
-      color: var(--text);
-      border-color: var(--line);
-      box-shadow: none;
-    }
-    button.secondary:hover {
-      background: rgba(255, 255, 255, 0.96);
-      box-shadow: var(--shadow-sm);
-    }
-    button[disabled] { opacity: 0.6; cursor: wait; }
-    .record-filter-tab.active,
-    .workspace-tab.active {
-      background: linear-gradient(135deg, rgba(20,95,89,0.98), rgba(13,79,74,0.98));
-      color: #f7fffd;
-      border-color: transparent;
-      box-shadow: 0 12px 26px rgba(20, 95, 89, 0.16);
-    }
-    .inline-check {
-      display: inline-flex;
-      align-items: center;
-      gap: 8px;
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 600;
-    }
-    .inline-check input {
-      width: auto;
-      accent-color: var(--primary);
-    }
-    .status {
-      border-radius: 18px;
-      padding: 16px;
-      border: 1px solid var(--line);
-      background: rgba(255, 255, 255, 0.74);
-      box-shadow: var(--shadow-sm);
-    }
-    .status.running {
-      background: var(--warning-soft);
-      border-color: rgba(184, 107, 53, 0.24);
-    }
-    .status.success {
-      background: var(--ok-soft);
-      border-color: rgba(22, 106, 69, 0.22);
-    }
-    .status.error {
-      background: var(--danger-soft);
-      border-color: rgba(169, 54, 40, 0.18);
-    }
-    .status-title {
-      font-weight: 760;
-      margin-bottom: 10px;
-    }
-    .record-list {
-      display: grid;
-      gap: 12px;
-      max-height: none;
-      overflow: auto;
-      padding-right: 4px;
-      align-content: start;
-    }
-    .record-card-item {
-      border: 1px solid rgba(108, 90, 73, 0.14);
-      border-radius: 22px;
-      background: linear-gradient(180deg, rgba(255,255,255,0.96), rgba(249,243,236,0.96));
-      padding: 16px;
-      cursor: pointer;
-      box-shadow: var(--shadow-sm);
-      transition: transform 0.18s ease, box-shadow 0.18s ease, border-color 0.18s ease;
-    }
-    .record-card-item:hover {
-      transform: translateY(-2px);
-      box-shadow: 0 18px 36px rgba(67, 49, 29, 0.10);
-    }
-    .record-card-item.selected {
-      border-color: rgba(20, 95, 89, 0.34);
-      background: linear-gradient(180deg, #eef8f6, #f9fffd);
-      box-shadow: 0 20px 42px rgba(20, 95, 89, 0.14);
-    }
-    .record-head {
-      display: flex;
-      justify-content: space-between;
-      gap: 12px;
-      align-items: start;
-      margin-bottom: 12px;
-    }
-    .record-id {
-      font-size: 12px;
-      color: var(--muted);
-      margin-bottom: 6px;
-    }
-    .record-title {
-      font-size: 17px;
-      font-weight: 750;
-      line-height: 1.45;
-      color: var(--text);
-      word-break: break-word;
-    }
-    .record-badges {
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
-      justify-content: flex-end;
-    }
-    .record-grid {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
-      gap: 10px;
-    }
-    .record-meta {
-      background: rgba(255,255,255,0.70);
-      border: 1px solid rgba(108, 90, 73, 0.10);
-      border-radius: 16px;
-      padding: 10px 12px;
-      min-height: 58px;
-      min-width: 0;
-      overflow: hidden;
-    }
-    .record-meta .meta-label {
-      font-size: 11px;
-      text-transform: uppercase;
-      letter-spacing: 0.1em;
-      color: var(--accent);
-      margin-bottom: 6px;
-      font-weight: 700;
-    }
-    .record-meta .meta-value {
-      font-size: 13px;
-      line-height: 1.6;
-      color: var(--text);
-      word-break: break-word;
-    }
-    .option-note {
-      display: none;
-    }
-    .workspace-nav {
-      display: grid;
-      grid-template-columns: 1fr;
-      gap: 10px;
-      width: 100%;
-    }
-    .workspace-tab {
-      width: 100%;
-      text-align: left;
-      display: grid;
-      gap: 4px;
-      border-radius: 18px;
-      padding: 14px 15px;
-    }
-    .workspace-tab.secondary {
-      color: var(--muted);
-      text-align: left;
-      min-height: 0;
-      box-shadow: none;
-    }
-    .workspace-tab .tab-label {
-      display: block;
-      font-size: 15px;
-      font-weight: 740;
-      margin-bottom: 4px;
-      color: inherit;
-      white-space: normal;
-    }
-    .workspace-tab .tab-copy {
-      display: block;
-      font-size: 12px;
-      line-height: 1.6;
-      color: inherit;
-      opacity: 0.92;
-      white-space: normal;
-    }
-    .workspace-shell .row,
-    .workspace-shell .inner-grid,
-    .workspace-shell .result-meta {
-      grid-template-columns: 1fr;
-    }
-    .workspace-shell .field,
-    .workspace-shell .field.full,
-    .workspace-shell .inner-grid > section,
-    .workspace-shell .result-meta > .meta-box {
-      grid-column: 1 / -1 !important;
-    }
-    .workspace-panel { display: none; }
-    .workspace-panel.active { display: block; }
-    .console-grid {
-      display: grid;
-      grid-template-columns: minmax(0, 0.38fr) minmax(0, 0.62fr);
-      gap: 16px;
-    }
-    .console-card.dark {
-      background: transparent;
-      border: 0;
-      padding: 0;
-      box-shadow: none;
-      overflow: visible;
-    }
-    .log {
-      background: linear-gradient(180deg, rgba(21, 31, 41, 0.98), rgba(15, 23, 32, 0.98));
-      color: #d9e4ef;
-      border-radius: 20px;
-      padding: 16px;
-      min-height: 400px;
-      max-height: 600px;
-      white-space: pre-wrap;
-      line-height: 1.65;
-      font-size: 12px;
-      font-family: ui-monospace, "SF Mono", Menlo, monospace;
-      overflow: auto;
-      border: 1px solid rgba(255, 255, 255, 0.06);
-    }
-    .meta-box { grid-column: span 4; }
-    .muted-block {
-      padding: 14px 15px;
-      border-radius: 18px;
-      background: rgba(249, 241, 232, 0.84);
-      border: 1px solid rgba(108, 90, 73, 0.10);
-      margin-top: 2px;
-    }
-    .record-card-item,
-    .status,
-    .workspace-shell,
-    .surface {
-      min-width: 0;
-      overflow: hidden;
-    }
-    .feedback-shell {
-      min-width: 0;
-      overflow: visible;
-    }
-    .surface-toolbar {
-      display: flex;
-      gap: 10px;
-      flex-wrap: wrap;
-      justify-content: flex-end;
-    }
-    .modal {
-      position: fixed;
-      inset: 0;
-      display: none;
-      align-items: center;
-      justify-content: center;
-      padding: 24px;
-      background: rgba(31, 26, 23, 0.38);
-      z-index: 20;
-    }
-    .modal.open { display: flex; }
-    .modal-panel {
-      width: min(780px, 100%);
-      max-height: min(86vh, 960px);
-      overflow: auto;
-      border-radius: 30px;
-      padding: 22px;
-      background: linear-gradient(180deg, rgba(255,255,255,0.97), rgba(249,243,236,0.96));
-      border: 1px solid rgba(255, 255, 255, 0.58);
-      box-shadow: var(--shadow-lg);
-    }
-    .modal-head {
-      display: flex;
-      align-items: flex-start;
-      justify-content: space-between;
-      gap: 14px;
-      margin-bottom: 16px;
-    }
-    .modal-copy {
-      margin-top: 8px;
-      color: var(--muted);
-      font-size: 13px;
-      line-height: 1.75;
-    }
-    .modal-close {
-      min-width: 84px;
-      box-shadow: none;
-    }
-    .modal-grid {
-      display: grid;
-      gap: 14px;
-    }
-    .modal-grid.two {
-      grid-template-columns: repeat(2, minmax(0, 1fr));
-    }
-    @media (max-width: 920px) {
-      .topbar,
-      .dashboard,
-      .console-grid {
-        grid-template-columns: 1fr;
-        grid-template-areas:
-          "workspace"
-          "context";
-      }
-      main,
-      .surface {
-        grid-area: auto;
-      }
-      .field,
-      .meta-box,
-      .global-controls .block-5,
-      .global-controls .block-7,
-      .global-controls .block-12 {
-        grid-column: span 12;
-      }
-      .global-controls.compact-config,
-      .focus-grid {
-        grid-template-columns: 1fr;
-      }
-      .global-controls.compact-config .block-5,
-      .global-controls.compact-config .block-7,
-      .global-controls.compact-config .block-12 {
-        grid-column: span 12;
-      }
-      .record-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-      .hero-heading { font-size: 29px; }
-      .modal-grid.two { grid-template-columns: 1fr; }
-    }
-    @media (max-width: 720px) {
-      body { padding: 18px 12px 28px; }
-      .record-grid,
-      .result-meta {
-        grid-template-columns: 1fr;
-      }
-      .meta-box { grid-column: span 12; }
-      .modal {
-        padding: 14px;
-      }
-      .modal-head {
-        flex-direction: column;
-      }
-    }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <div class="topbar">
-      <section class="hero-card">
-        <h1 class="hero-heading">Crowdin → APITable 留言同步工具<span style="font-size:18px;font-weight:600;color:var(--accent);margin-left:12px;vertical-align:middle;opacity:0.85;">V1.1</span></h1>
-        <div class="hero-sub">
-          把“选任务、分配本地化、同步完成版附件、回写检查信息”整理到同一个工作台里。右侧放大保留全局上下文和整表卡片，左侧收拢执行参数，减少来回切换造成的中断。
-        </div>
-        <div class="hero-notes">
-          <div class="note-chip">先读表并选中目标记录</div>
-          <div class="note-chip">两个工作区共享同一份上下文</div>
-          <div class="note-chip">同步后自动补检查与留言</div>
-        </div>
-      </section>
-
-      <aside class="meta-card">
-        <div>
-          <div class="meta-kicker">Workspace Context</div>
-          <div class="meta-title">固定视图、当前使用人和 APITable Key 都收进同一个入口里了，需要时再展开查看。</div>
-        </div>
-        <div class="workspace-nav">
-          <button type="button" id="loadTableBtnTop" class="secondary workspace-config-trigger">读取整张表</button>
-          <button type="button" id="openWorkspaceConfigBtn" class="secondary workspace-config-trigger">打开工作区设置</button>
-        </div>
-      </aside>
-    </div>
-
-    <div id="workspaceConfigModal" class="modal" aria-hidden="true">
-      <div class="modal-panel">
-        <div class="modal-head">
-          <div>
-            <h2 class="surface-title">工作区设置</h2>
-            <div class="modal-copy">这里集中放固定读写视图和共享参数。平时默认收起，不占用主工作区。</div>
-          </div>
-          <button type="button" id="closeWorkspaceConfigBtn" class="secondary modal-close">关闭</button>
-        </div>
-
-        <div class="modal-grid two">
-          <div class="meta-panel">
-            <div class="k">读取视图</div>
-            <div class="v">dst54Y1Wzwdm5sDeQ7 / viw8QB941rgSg</div>
-          </div>
-          <div class="meta-panel">
-            <div class="k">写入视图</div>
-            <div class="v">dst54Y1Wzwdm5sDeQ7 / viwJ88IVxdxo</div>
-          </div>
-        </div>
-
-        <div class="subsurface compact" style="margin-top: 14px;">
-          <div class="subsurface-title">共享条件</div>
-          <div class="global-controls compact-config">
-            <div class="block-5 global-card slim">
-              <div class="card-label">当前使用人</div>
-              <select id="current_user">
-                <option value="仿生人">仿生人</option>
-                <option value="石上">石上</option>
-                <option value="德古拉">德古拉</option>
-              </select>
-            </div>
-            <div class="block-7 global-card slim">
-              <div class="card-label">APITable API Key</div>
-              <input id="apitable_api_key" type="password" placeholder="输入 APITable API Key">
-            </div>
-            <div class="block-12 global-card slim">
-              <div class="global-actions">
-                <label class="inline-check"><input id="save_apitable_api_key" type="checkbox"> 保存 API Key</label>
-              </div>
-            </div>
-          </div>
-        </div>
-      </div>
-    </div>
-
-    <div class="dashboard">
-      <aside class="surface">
-        <div class="context-stack">
-          <div>
-            <h2 class="surface-title">全局上下文</h2>
-            <div class="surface-copy">这里保留整张表、当前选中行和搜索关键词，作为整个页面最主要的工作区域。左侧参数改动后，会直接作用到这里选中的记录。</div>
-          </div>
-
-          <div class="global-stack">
-            <div class="surface-toolbar">
-              <button type="button" id="loadTableBtnInline" class="secondary">读取整张表</button>
-              <button type="button" id="openWorkspaceConfigInlineBtn" class="secondary">查看工作区设置</button>
-            </div>
-
-            <div class="subsurface tight task-panel">
-              <div class="subsurface-title">任务卡片</div>
-              <div class="record-filter-bar">
-                <button type="button" id="recordFilterFalse" class="record-filter-tab active">未发送</button>
-                <button type="button" id="recordFilterTrue" class="record-filter-tab">已发送</button>
-              </div>
-              <div id="batchTableBody" class="record-list">
-                <div class="record-card-item">
-                  <div class="record-id">尚未读取表格</div>
-                  <div class="record-title">读取视图后，这里会按任务卡片展示数据。</div>
-                </div>
-              </div>
-            </div>
-
-            <div class="subsurface compact">
-              <div class="subsurface-title">当前焦点</div>
-              <div class="focus-grid">
-                <div class="global-card slim">
-                  <div class="card-label">当前选中行</div>
-                  <div id="selectedBatchRow" class="global-value compact-value">尚未选择。</div>
-                </div>
-                <div class="global-card slim">
-                  <div class="card-label">Crowdin 搜索关键词</div>
-                  <div id="selectedSearchKeyword" class="global-value compact-value">尚未选择。</div>
-                </div>
-              </div>
-            </div>
-
-            <div id="batchStatus" class="status compact-status">
-              <div class="status-title">等待读取整表</div>
-              <div class="hint">点“读取整张表”后，这里会显示字段选项和应用结果。</div>
-            </div>
-          </div>
-        </div>
-      </aside>
-
-      <main>
-        <section class="workspace-shell">
-          <div class="workspace-header">
-            <div>
-              <h2 class="workspace-title">执行工作区</h2>
-              <div class="workspace-copy">这里专门放执行参数。先在右侧选中目标任务，再回来切换这两个动作面板完成写入和同步。</div>
-            </div>
-            <div class="workspace-nav">
-              <button type="button" class="workspace-tab secondary active" data-panel="batchPanel">
-                <span class="tab-label">表格批量操作</span>
-                <span class="tab-copy">写入分配、留言、检查提前量与发送状态。</span>
-              </button>
-              <button type="button" class="workspace-tab secondary" data-panel="syncPanel">
-                <span class="tab-label">Crowdin 附件同步</span>
-                <span class="tab-copy">按翻译需求搜完成版并回填附件与检查信息。</span>
-              </button>
-            </div>
-          </div>
-
-          <section class="workspace-panel active" id="batchPanel">
-            <div class="soft-panel">
-              <div class="hint" style="margin-bottom: 14px;">
-                这里负责把当前填写的模板直接应用到左侧选中的那一行。前四项立即更新，最后的“是否发送信息给本地化”会延迟 3 秒再勾选。
-              </div>
-              <div class="actions" style="margin-bottom: 14px;">
-                <button id="applyBatchTemplateBtn">应用到选中行</button>
-              </div>
-              <div class="row">
-                <div class="field">
-                  <label>分配本地化</label>
-                  <select id="batch_assign_localizer"></select>
-                  <div id="batch_assign_localizer_note" class="option-note">读取整张表后显示选项。</div>
-                </div>
-                <div class="field">
-                  <label>分配需求者</label>
-                  <select id="batch_requester"></select>
-                  <div id="batch_requester_note" class="option-note">读取整张表后显示选项。</div>
-                </div>
-                <div class="field full">
-                  <label>给本地化留言</label>
-                  <textarea id="batch_message" class="compact-textarea" placeholder="填写要写入“给本地化留言”的内容"></textarea>
-                  <div id="batch_message_note" class="option-note">如果这一列已有常见内容，也会在这里提示。</div>
-                </div>
-                <div class="field">
-                  <label>检查提前量（min）</label>
-                  <select id="batch_check_lead"></select>
-                  <div id="batch_check_lead_note" class="option-note">读取整张表后显示选项，默认优先选择 30。</div>
-                </div>
-                <div class="field">
-                  <label class="inline-check"><input id="batch_send_flag" type="checkbox" checked> 是否发送信息给本地化</label>
-                  <div id="batch_send_flag_note" class="option-note">勾选动作会比前三列晚 3 秒执行。</div>
-                </div>
-              </div>
-            </div>
-          </section>
-
-          <section class="workspace-panel" id="syncPanel">
-            <div class="workspace-stack">
-              <div class="soft-panel">
-                <div class="hint" style="margin-bottom: 14px;">
-                  默认会直接使用左侧当前选中行里的翻译需求作为搜索关键词，你也可以在这里微调路径关键词和附加关键词。
-                </div>
-                <div class="inner-grid">
-                  <section class="subsurface tight" style="grid-column: span 6;">
-                    <div class="subsurface-title">Crowdin 凭证</div>
-                    <div class="row">
-                      <div class="field full">
-                        <label>Crowdin API Token</label>
-                        <input id="crowdin_token" type="password" placeholder="输入 Crowdin Personal Access Token">
-                      </div>
-                      <div class="field full">
-                        <label class="inline-check"><input id="save_crowdin_token" type="checkbox"> 保存 Crowdin Token 到本地</label>
-                      </div>
-                    </div>
-                  </section>
-
-                  <section class="subsurface tight" style="grid-column: span 6;">
-                    <div class="subsurface-title">匹配条件</div>
-                    <div class="row">
-                      <div class="field full">
-                        <label>文件名或主关键词</label>
-                        <input id="file_name" type="text" placeholder="例如 weapons.json 或 weapons">
-                      </div>
-                      <div class="field">
-                        <label>Crowdin 默认路径</label>
-                        <select id="crowdin_folder_select">
-                          <option value="">（不过滤，匹配所有路径）</option>
-                          <option value="English Team">English Team</option>
-                          <option value="[ALL]模块-赛事">[ALL]模块-赛事</option>
-                          <option value="[ALL]模块-用户">[ALL]模块-用户</option>
-                          <option value="Questionnaire">Questionnaire</option>
-                          <option value="[ALL]模块-版本">[ALL]模块-版本</option>
-                          <option value="__custom__">自定义…</option>
-                        </select>
-                        <input id="crowdin_folder" type="text" placeholder="输入自定义路径" style="display:none; margin-top:6px;">
-                      </div>
-                      <div class="field">
-                        <label>附加路径关键词</label>
-                        <input id="extra_path_keyword" type="text" placeholder="可选，例如 activity/mail">
-                      </div>
-                      <div class="field full">
-                        <label>附加文件关键词</label>
-                        <input id="extra_keyword" type="text" placeholder="可选，进一步缩小匹配范围">
-                      </div>
-                    </div>
-                  </section>
-
-                  <section class="subsurface tight" style="grid-column: 1 / -1;">
-                    <div class="subsurface-title">APITable 回写规则</div>
-                    <div class="row">
-                      <div class="field">
-                        <label>搜索列名</label>
-                        <input id="apitable_search_column" type="text" placeholder="默认：翻译需求（当日日期+翻译需求名字+需求人）">
-                      </div>
-                      <div class="field">
-                        <label>写入列名</label>
-                        <input id="apitable_comment_column" type="text" placeholder="默认：完成版附件">
-                      </div>
-                      <div class="field full">
-                        <label>检查完成留言</label>
-                        <textarea id="sync_note" placeholder="同步完成后，自动写入“留言（会在检查完的消息里添加）”"></textarea>
-                      </div>
-                    </div>
-                    <div class="muted-block">
-                      <div class="hint">
-                        命中目标行后，会自动上传完成版附件，并把当前使用人写入“检查者”、勾选“是否检查完”，再写入上面的检查完成留言。
-                      </div>
-                    </div>
-                    <div class="actions" style="margin-top: 14px;">
-                      <button id="runBtn">开始同步</button>
-                      <button id="saveBtn" class="secondary">仅保存本地配置</button>
-                    </div>
-                  </section>
-                </div>
-              </div>
-            </div>
-          </section>
-        </section>
-      </main>
-    </div>
-
-    <section class="feedback-shell">
-      <div class="feedback-head">
-        <div>
-          <h2 class="feedback-title">实时反馈</h2>
-          <div class="feedback-copy">同步任务启动后，这里会持续显示状态、日志和结果摘要，方便你边看过程边复制翻译内容。</div>
-        </div>
-        <div class="actions" style="margin: 0;">
-          <button id="copyBtn" class="secondary">复制翻译结果</button>
-        </div>
-      </div>
-      <div class="console-grid">
-        <div class="console-card">
-          <div id="statusBox" class="status">
-            <div class="status-title">等待执行</div>
-            <div class="hint">点击“开始同步”后，这里会显示执行状态。</div>
-          </div>
-          <div class="result-meta">
-            <div class="meta-box">
-              <div class="k">匹配文件</div>
-              <div id="matchedFile" class="v">-</div>
-            </div>
-            <div class="meta-box">
-              <div class="k">匹配记录</div>
-              <div id="matchedRecord" class="v">-</div>
-            </div>
-            <div class="meta-box">
-              <div class="k">翻译预览</div>
-              <div id="translationPreview" class="v">-</div>
-            </div>
-          </div>
-        </div>
-        <div class="console-card dark">
-          <div id="logBox" class="log">尚未开始。</div>
-        </div>
-      </div>
-    </section>
-
-  </div>
-
-  <script>
-    let currentJobId = "";
-    let pollTimer = null;
-    let lastTranslation = "";
-    let batchTablePayload = null;
-    let selectedBatchRecordId = "";
-    let batchRecordFilter = "false";
-
-    function byId(id) { return document.getElementById(id); }
-
-    function setWorkspaceConfigModal(open) {
-      const modal = byId("workspaceConfigModal");
-      if (!modal) return;
-      modal.classList.toggle("open", !!open);
-      modal.setAttribute("aria-hidden", open ? "false" : "true");
-      document.body.style.overflow = open ? "hidden" : "";
-    }
-
-    function getFormPayload() {
-      return {
-        crowdin_token: byId("crowdin_token").value.trim(),
-        save_crowdin_token: byId("save_crowdin_token").checked,
-        apitable_api_key: byId("apitable_api_key").value.trim(),
-        save_apitable_api_key: byId("save_apitable_api_key").checked,
-        current_user: byId("current_user").value.trim(),
-        file_name: byId("file_name").value.trim(),
-        crowdin_folder: (byId("crowdin_folder_select").value === "__custom__" ? byId("crowdin_folder").value.trim() : byId("crowdin_folder_select").value),
-        extra_path_keyword: byId("extra_path_keyword").value.trim(),
-        extra_keyword: byId("extra_keyword").value.trim(),
-        apitable_search_column: byId("apitable_search_column").value.trim(),
-        apitable_comment_column: byId("apitable_comment_column").value.trim(),
-        sync_note: byId("sync_note").value
-      };
-    }
-
-    function getBatchApplyPayload() {
-      return {
-        assign_localizer: readOptionLabel("batch_assign_localizer"),
-        requester: readOptionLabel("batch_requester"),
-        message: byId("batch_message").value,
-        check_lead: readOptionLabel("batch_check_lead"),
-        send_flag: byId("batch_send_flag").checked
-      };
-    }
-
-    function readOptionValue(id) {
-      const el = byId(id);
-      if (!el || !el.value) return "";
-      try {
-        return JSON.parse(el.value);
-      } catch (_) {
-        return el.value;
-      }
-    }
-
-    function readOptionLabel(id) {
-      const el = byId(id);
-      if (!el) return "";
-      const opt = el.options[el.selectedIndex];
-      if (!opt || !opt.value) return "";
-      return opt.dataset.label || opt.textContent || "";
-    }
-
-    function setFormValues(data) {
-      const form = Object.assign({}, data || {});
-      Object.keys(form).forEach((key) => {
-        const el = byId(key);
-        if (!el) return;
-        if (el.type === "checkbox") {
-          el.checked = !!form[key];
-        } else {
-          el.value = form[key] == null ? "" : String(form[key]);
-        }
-      });
-    }
-
-    function setRunning(running) {
-      byId("runBtn").disabled = running;
-      byId("saveBtn").disabled = running;
-    }
-
-    function updateStatus(job) {
-      const box = byId("statusBox");
-      const title = job.status === "running"
-        ? "正在执行"
-        : job.status === "success"
-          ? "执行完成"
-          : job.status === "error"
-            ? "执行失败"
-            : "等待执行";
-      box.className = "status " + (job.status || "");
-      box.innerHTML = "<div class='status-title'>" + title + "</div>"
-        + "<div class='hint'>" + escapeHtml(job.message || "暂无说明") + "</div>";
-
-      byId("logBox").textContent = (job.logs || []).join("\n") || "暂无日志。";
-      byId("matchedFile").textContent = job.result && job.result.matched_file_path ? job.result.matched_file_path : "-";
-      byId("matchedRecord").textContent = job.result && job.result.record_id ? (job.result.record_id + " / " + (job.result.search_column || "")) : "-";
-      lastTranslation = job.result && job.result.translation_text ? job.result.translation_text : "";
-      byId("translationPreview").textContent = lastTranslation || "-";
-    }
-
-    function escapeHtml(text) {
-      return String(text || "")
-        .replaceAll("&", "&amp;")
-        .replaceAll("<", "&lt;")
-        .replaceAll(">", "&gt;");
-    }
-
-    function isTruthySendFlag(value) {
-      const text = String(value == null ? "" : value).trim().toLowerCase();
-      return text === "true" || text === "yes" || text === "1" || text === "是";
-    }
-
-    function renderRecordFilterTabs(rows) {
-      const falseCount = (rows || []).filter((row) => !isTruthySendFlag((row.summary || {}).send_flag)).length;
-      const trueCount = (rows || []).filter((row) => isTruthySendFlag((row.summary || {}).send_flag)).length;
-      byId("recordFilterFalse").textContent = "未发送 " + falseCount;
-      byId("recordFilterTrue").textContent = "已发送 " + trueCount;
-      byId("recordFilterFalse").classList.toggle("active", batchRecordFilter === "false");
-      byId("recordFilterTrue").classList.toggle("active", batchRecordFilter === "true");
-    }
-
-    async function loadState() {
-      const resp = await fetch("/api/state");
-      const data = await resp.json();
-      setFormValues(data.form || {});
-      syncFolderFromValue((data.form || {}).crowdin_folder || "");
-      syncRequesterWithCurrentUser(false);
-      resizeBatchMessageArea();
-    }
-
-    function setBatchStatus(kind, title, message) {
-      const box = byId("batchStatus");
-      box.className = "status compact-status " + (kind || "");
-      box.innerHTML = "<div class='status-title'>" + escapeHtml(title) + "</div><div class='hint'>" + escapeHtml(message || "") + "</div>";
-    }
-
-    function resizeBatchMessageArea() {
-      const el = byId("batch_message");
-      if (!el) return;
-      el.style.height = "44px";
-      const nextHeight = Math.min(Math.max(el.scrollHeight, 44), 76);
-      el.style.height = nextHeight + "px";
-    }
-
-    function renderOptionSelect(selectId, noteId, options, placeholder) {
-      const select = byId(selectId);
-      const note = byId(noteId);
-      select.innerHTML = "";
-      const first = document.createElement("option");
-      first.value = "";
-      first.textContent = placeholder;
-      select.appendChild(first);
-      const seenLabels = new Set();
-      const filtered = (options || []).filter((item) => {
-        const label = String(item.label || "");
-        if (!label) return false;
-        if (/^opt[a-z0-9]+$/i.test(label)) return false;
-        if (seenLabels.has(label)) return false;
-        seenLabels.add(label);
-        return true;
-      });
-      filtered.forEach((item) => {
-        const opt = document.createElement("option");
-        opt.value = JSON.stringify(item.value);
-        opt.textContent = item.label || String(item.value || "");
-        opt.dataset.label = item.label || String(item.value || "");
-        select.appendChild(opt);
-      });
-      note.textContent = filtered.length
-        ? "候选项：" + filtered.slice(0, 8).map((item) => item.label).join(" / ")
-        : "未读取到明确选项，可先读取整表后再继续填写。";
-    }
-
-    function setSelectByRawValue(id, rawValue) {
-      const select = byId(id);
-      const text = rawValue == null ? "" : String(rawValue);
-      let target = Array.from(select.options).find((opt) => (opt.dataset.label || opt.textContent || "") === text);
-      if (!target && text) {
-        const opt = document.createElement("option");
-        opt.value = JSON.stringify(text);
-        opt.textContent = text;
-        opt.dataset.label = text;
-        select.appendChild(opt);
-        target = opt;
-      }
-      select.value = target ? target.value : "";
-    }
-
-    function collectEditorState() {
-      return {
-        batchValues: getBatchApplyPayload(),
-        selectedRecordId: selectedBatchRecordId
-      };
-    }
-
-    function restoreSelectedBatchRow() {
-      const body = byId("batchTableBody");
-      Array.from(body.querySelectorAll(".record-card-item")).forEach((item) => {
-        item.classList.toggle("selected", item.getAttribute("data-record-id") === selectedBatchRecordId);
-      });
-      byId("selectedBatchRow").textContent = selectedBatchRecordId || "尚未选择。";
-      if (!selectedBatchRecordId) {
-        byId("selectedSearchKeyword").textContent = "尚未选择。";
-      }
-    }
-
-    function syncRequesterWithCurrentUser(forceApply = true) {
-      const currentUser = byId("current_user").value.trim();
-      if (!currentUser) return;
-      if (!forceApply && byId("batch_requester").value) return;
-      setSelectByRawValue("batch_requester", currentUser);
-    }
-
-    function renderBatchTable(payload) {
-      batchTablePayload = payload;
-      const body = byId("batchTableBody");
-      const allRows = payload.rows || [];
-      renderRecordFilterTabs(allRows);
-      const rows = allRows.filter((row) => {
-        const isTrue = isTruthySendFlag((row.summary || {}).send_flag);
-        return batchRecordFilter === "true" ? isTrue : !isTrue;
-      });
-      if (!rows.length) {
-        body.innerHTML = "<div class='record-card-item'><div class='record-id'>当前分组没有记录</div><div class='record-title'>可以切换到另一个发送分组继续查看。</div></div>";
-        return;
-      }
-      body.innerHTML = rows.map((row) => {
-        const summary = row.summary || {};
-        return "<article class='record-card-item' data-record-id='" + escapeHtml(row.recordId) + "'>"
-          + "<div class='record-head'>"
-          +   "<div>"
-          +     "<div class='record-id'>" + escapeHtml(row.recordId) + "</div>"
-          +     "<div class='record-title'>" + escapeHtml(summary.title || "未命名翻译需求") + "</div>"
-          +   "</div>"
-          +   "<div class='record-badges'>"
-          +     (summary.priority ? "<span class='badge'>优先级 " + escapeHtml(summary.priority) + "</span>" : "")
-          +     (summary.crowdin_flag ? "<span class='badge'>Crowdin " + escapeHtml(summary.crowdin_flag) + "</span>" : "")
-          +     (summary.send_flag ? "<span class='badge'>发送 " + escapeHtml(summary.send_flag) + "</span>" : "")
-          +   "</div>"
-          + "</div>"
-          + "<div class='record-grid'>"
-          +   "<div class='record-meta'><div class='meta-label'>需求人</div><div class='meta-value'>" + escapeHtml(summary.requester || "-") + "</div></div>"
-          +   "<div class='record-meta'><div class='meta-label'>需求 DDL</div><div class='meta-value'>" + escapeHtml(summary.deadline || "-") + "</div></div>"
-          +   "<div class='record-meta'><div class='meta-label'>分配本地化</div><div class='meta-value'>" + escapeHtml(summary.localizer || "-") + "</div></div>"
-          +   "<div class='record-meta'><div class='meta-label'>分配需求者</div><div class='meta-value'>" + escapeHtml(summary.owner || "-") + "</div></div>"
-          +   "<div class='record-meta'><div class='meta-label'>检查提前量</div><div class='meta-value'>" + escapeHtml(summary.check_lead || "-") + "</div></div>"
-          +   "<div class='record-meta'><div class='meta-label'>任务链接</div><div class='meta-value'>" + escapeHtml(summary.task_link || "-") + "</div></div>"
-          + "</div>"
-          + "</article>";
-      }).join("");
-      Array.from(body.querySelectorAll(".record-card-item")).forEach((card) => {
-        card.addEventListener("click", () => {
-          Array.from(body.querySelectorAll(".record-card-item")).forEach((item) => item.classList.remove("selected"));
-          card.classList.add("selected");
-          selectedBatchRecordId = card.getAttribute("data-record-id") || "";
-          byId("selectedBatchRow").textContent = selectedBatchRecordId;
-          const row = allRows.find((item) => item.recordId === selectedBatchRecordId);
-          if (row && row.cells && row.cells["翻译需求（当日日期+翻译需求名字+需求人）"]) {
-            const keyword = row.cells["翻译需求（当日日期+翻译需求名字+需求人）"];
-            byId("file_name").value = keyword;
-            byId("selectedSearchKeyword").textContent = keyword;
-          }
-        });
-      });
-    }
-
-    async function loadBatchTable(preserveEditor = true) {
-      const snapshot = preserveEditor ? collectEditorState() : null;
-      setBatchStatus("running", "正在读取整张表", "请稍候…");
-      try {
-        const resp = await fetch("/api/batch-table/load", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ api_key: byId("apitable_api_key").value.trim() })
-        });
-        const data = await resp.json();
-        if (!data.ok) throw new Error(data.error || "读取失败");
-        const localizerMeta = data.table.meta["分配本地化（那三个人仅特殊情况才选择）"] || {};
-        const requesterMeta = data.table.meta["分配需求者"] || {};
-        const messageMeta = data.table.meta["给本地化留言"] || {};
-        const checkLeadMeta = data.table.meta["检查提前量（min）"] || {};
-        renderOptionSelect("batch_assign_localizer", "batch_assign_localizer_note", localizerMeta.options || [], "请选择分配本地化");
-        renderOptionSelect("batch_requester", "batch_requester_note", requesterMeta.options || [], "请选择分配需求者");
-        renderOptionSelect("batch_check_lead", "batch_check_lead_note", checkLeadMeta.options || [], "请选择检查提前量");
-        byId("batch_message_note").textContent = (messageMeta.options || []).slice(0, 6).map((item) => item.label).join(" / ") || "这一列暂无常见候选。";
-        renderBatchTable(data.table);
-        if (snapshot) {
-          const batchValues = snapshot.batchValues || {};
-          byId("batch_message").value = batchValues.message || "";
-          resizeBatchMessageArea();
-          byId("batch_send_flag").checked = batchValues.send_flag !== false;
-          setSelectByRawValue("batch_assign_localizer", batchValues.assign_localizer || "");
-          setSelectByRawValue("batch_requester", batchValues.requester || "");
-          setSelectByRawValue("batch_check_lead", batchValues.check_lead || "30");
-          selectedBatchRecordId = snapshot.selectedRecordId || "";
-          restoreSelectedBatchRow();
-        }
-        if (!byId("batch_check_lead").value) {
-          setSelectByRawValue("batch_check_lead", "30");
-        }
-        if (!byId("batch_send_flag").checked) {
-          byId("batch_send_flag").checked = true;
-        }
-        syncRequesterWithCurrentUser(false);
-        setBatchStatus("success", "整表读取完成", "现在可以选择行并直接应用到目标记录。");
-      } catch (err) {
-        setBatchStatus("error", "读取失败", err.message);
-        alert("读取整张表失败：" + err.message);
-      }
-    }
-
-    async function applyBatchTemplate() {
-      if (!selectedBatchRecordId) {
-        alert("请先从表格里选中一行。");
-        return;
-      }
-      setBatchStatus("running", "正在写入 APITable", "前三列会立即写入，最后一个勾选会延迟 3 秒。");
-      try {
-        const resp = await fetch("/api/batch-apply", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            api_key: byId("apitable_api_key").value.trim(),
-            record_id: selectedBatchRecordId,
-            template: getBatchApplyPayload()
-          })
-        });
-        const data = await resp.json();
-        if (!data.ok) throw new Error(data.error || "写入失败");
-        let detail = data.message || "内容已写入选中行。";
-        if (data.debug) {
-          detail += "\n\n调试信息：\n" + JSON.stringify(data.debug, null, 2);
-        }
-        setBatchStatus("success", "写入完成", detail);
-        await loadBatchTable();
-      } catch (err) {
-        setBatchStatus("error", "写入失败", err.message);
-        alert("写入失败：" + err.message);
-      }
-    }
-
-    async function saveConfig() {
-      const resp = await fetch("/api/save-config", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(getFormPayload())
-      });
-      return resp.json();
-    }
-
-    async function startSync() {
-      setRunning(true);
-      byId("statusBox").className = "status running";
-      byId("statusBox").innerHTML = "<div class='status-title'>正在提交任务</div><div class='hint'>请稍候…</div>";
-      try {
-        const resp = await fetch("/api/start-sync", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(getFormPayload())
-        });
-        const data = await resp.json();
-        if (!data.ok) {
-          throw new Error(data.error || "启动失败");
-        }
-        currentJobId = data.job_id;
-        pollJob();
-      } catch (err) {
-        setRunning(false);
-        alert("启动失败：" + err.message);
-      }
-    }
-
-    async function pollJob() {
-      if (!currentJobId) return;
-      try {
-        const resp = await fetch("/api/job/" + currentJobId);
-        const job = await resp.json();
-        updateStatus(job);
-        if (job.status === "running" || job.status === "pending") {
-          pollTimer = setTimeout(pollJob, 900);
-          return;
-        }
-        setRunning(false);
-        if (job.status === "error") {
-          if ((job.error_code || "") === "crowdin_not_found") {
-            alert("未搜到对应文件，请检查文件名、路径关键词或附加关键词。");
-          } else {
-            alert(job.message || "执行失败");
-          }
-        }
-      } catch (err) {
-        setRunning(false);
-        alert("读取进度失败：" + err.message);
-      }
-    }
-
-    async function copyTranslation() {
-      if (!lastTranslation) {
-        alert("当前没有可复制的翻译结果。");
-        return;
-      }
-      await navigator.clipboard.writeText(lastTranslation);
-      alert("翻译结果已复制。");
-    }
-
-    function sendHeartbeat() {
-      fetch("/api/ping", { method: "POST", keepalive: true }).catch(() => {});
-    }
-
-    const FOLDER_PRESETS = ["", "English Team", "[ALL]模块-赛事", "[ALL]模块-用户", "Questionnaire", "[ALL]模块-版本"];
-
-    function onFolderSelectChange() {
-      const sel = byId("crowdin_folder_select");
-      const inp = byId("crowdin_folder");
-      if (sel.value === "__custom__") {
-        inp.style.display = "";
-        inp.focus();
-      } else {
-        inp.style.display = "none";
-      }
-    }
-
-    function syncFolderFromValue(value) {
-      const sel = byId("crowdin_folder_select");
-      const inp = byId("crowdin_folder");
-      const v = value == null ? "" : String(value);
-      if (FOLDER_PRESETS.includes(v)) {
-        sel.value = v;
-        inp.value = v;
-        inp.style.display = "none";
-      } else {
-        sel.value = "__custom__";
-        inp.value = v;
-        inp.style.display = "";
-      }
-    }
-
-    byId("crowdin_folder_select").addEventListener("change", onFolderSelectChange);
-
-    byId("runBtn").addEventListener("click", startSync);
-    byId("saveBtn").addEventListener("click", async () => {
-      try {
-        const data = await saveConfig();
-        if (!data.ok) throw new Error(data.error || "保存失败");
-        alert("本地配置已保存。");
-      } catch (err) {
-        alert("保存失败：" + err.message);
-      }
-    });
-    byId("copyBtn").addEventListener("click", copyTranslation);
-    byId("loadTableBtnTop").addEventListener("click", loadBatchTable);
-    byId("loadTableBtnInline").addEventListener("click", loadBatchTable);
-    byId("applyBatchTemplateBtn").addEventListener("click", applyBatchTemplate);
-    byId("openWorkspaceConfigBtn").addEventListener("click", () => setWorkspaceConfigModal(true));
-    byId("openWorkspaceConfigInlineBtn").addEventListener("click", () => setWorkspaceConfigModal(true));
-    byId("closeWorkspaceConfigBtn").addEventListener("click", () => setWorkspaceConfigModal(false));
-    byId("workspaceConfigModal").addEventListener("click", (event) => {
-      if (event.target === byId("workspaceConfigModal")) {
-        setWorkspaceConfigModal(false);
-      }
-    });
-    byId("batch_message").addEventListener("input", resizeBatchMessageArea);
-    byId("recordFilterFalse").addEventListener("click", () => {
-      batchRecordFilter = "false";
-      if (batchTablePayload) renderBatchTable(batchTablePayload);
-    });
-    byId("recordFilterTrue").addEventListener("click", () => {
-      batchRecordFilter = "true";
-      if (batchTablePayload) renderBatchTable(batchTablePayload);
-    });
-    byId("current_user").addEventListener("change", () => {
-      syncRequesterWithCurrentUser(true);
-      saveConfig();
-    });
-    Array.from(document.querySelectorAll(".workspace-tab")).forEach((el) => {
-      el.addEventListener("click", () => {
-        const target = el.dataset.panel;
-        Array.from(document.querySelectorAll(".workspace-tab")).forEach((tab) => {
-          tab.classList.toggle("active", tab === el);
-        });
-        Array.from(document.querySelectorAll(".workspace-panel")).forEach((panel) => {
-          panel.classList.toggle("active", panel.id === target);
-        });
-      });
-    });
-    window.addEventListener("keydown", (event) => {
-      if (event.key === "Escape") {
-        setWorkspaceConfigModal(false);
-      }
-    });
-    sendHeartbeat();
-    setInterval(sendHeartbeat, 3000);
-    window.addEventListener("focus", sendHeartbeat);
-    document.addEventListener("visibilitychange", () => {
-      if (!document.hidden) {
-        sendHeartbeat();
-      }
-    });
-    loadState();
-  </script>
-</body>
-</html>
-"""
-
-
-def load_saved_form() -> Dict[str, Any]:
-    if not STATE_FILE.exists():
-        return dict(DEFAULT_FORM)
-    try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return dict(DEFAULT_FORM)
-    form = dict(DEFAULT_FORM)
-    if isinstance(data, dict):
-        for key in form:
-            if key in data:
-                form[key] = data[key]
-    return form
-
-def persist_form(form: Dict[str, Any]) -> None:
-    payload = dict(DEFAULT_FORM)
-    for key in payload:
-        if key in form:
-            payload[key] = form[key]
-    if not payload.get("save_crowdin_token"):
-        payload["crowdin_token"] = ""
-    if not payload.get("save_apitable_api_key"):
-        payload["apitable_api_key"] = ""
-    existing: Dict[str, Any] = {}
-    if STATE_FILE.exists():
-        try:
-            existing = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            if not isinstance(existing, dict):
-                existing = {}
-        except Exception:
-            existing = {}
-    existing.update(payload)
-    STATE_FILE.write_text(json.dumps(existing, ensure_ascii=False, indent=2), encoding="utf-8")
-    STATE["form"] = payload
-
-
-def unwrap_resource(item: Dict[str, Any]) -> Dict[str, Any]:
-    if not isinstance(item, dict):
-        return {}
-    data = item.get("data")
-    if isinstance(data, dict):
-        merged = dict(data)
-        attrs = data.get("attributes")
-        if isinstance(attrs, dict):
-            merged.update(attrs)
-        return merged
-    attrs = item.get("attributes")
-    if isinstance(attrs, dict):
-        merged = dict(item)
-        merged.update(attrs)
-        return merged
-    return item
-
-
-def get_resource_id(item: Dict[str, Any]) -> str:
-    value = unwrap_resource(item).get("id")
-    return "" if value in (None, "") else str(value)
-
-
-def get_resource_name(item: Dict[str, Any]) -> str:
-    resource = unwrap_resource(item)
-    for key in ("name", "title"):
-        value = resource.get(key)
-        if value not in (None, ""):
-            return str(value)
-    return ""
-
-
-def get_resource_path(item: Dict[str, Any]) -> str:
-    resource = unwrap_resource(item)
-    for key in ("path", "filePath", "fullPath"):
-        value = resource.get(key)
-        if value not in (None, ""):
-            return str(value)
-    return ""
-
-
-def ssl_context() -> ssl.SSLContext:
-    context = ssl.create_default_context()
-    if certifi is not None:
-        context.load_verify_locations(cafile=certifi.where())
-    return context
-
-
-def http_json(
-    method: str,
-    url: str,
-    *,
-    headers: Optional[Dict[str, str]] = None,
-    body: Optional[Dict[str, Any]] = None,
-    timeout: int = 60,
-) -> Dict[str, Any]:
-    payload = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(url, data=payload, method=method, headers=headers or {})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
-            raw = resp.read()
-            return {} if not raw else json.loads(raw.decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code} {exc.reason}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"网络请求失败: {exc}") from exc
-
-
-def http_bytes(
-    url: str,
-    *,
-    headers: Optional[Dict[str, str]] = None,
-    timeout: int = 120,
-) -> bytes:
-    req = urllib.request.Request(url, headers=headers or {})
-    try:
-        with urllib.request.urlopen(req, timeout=timeout, context=ssl_context()) as resp:
-            return resp.read()
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"HTTP {exc.code} {exc.reason}: {detail}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"网络请求失败: {exc}") from exc
-
-
-def crowdin_headers(token: str) -> Dict[str, str]:
-    return {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
+        return None, None
+
+
+def _ai_login(account: str = None, password: str = None):
+    if account is None or password is None:
+        account, password = _ai_load_creds()
+
+    s, aichat_c, oauth_url, _ = _http_get(HOST, "/auth/redirect")
+    if not oauth_url:
+        raise RuntimeError("获取 OAuth 地址失败")
+
+    parsed = urllib.parse.urlparse(oauth_url)
+    oa_oauth_path = parsed.path + "?" + parsed.query
+
+    s, oa_c, _, _ = _http_get("oa-core.xinyoudi.com", oa_oauth_path)
+
+    enc_pwd = _encrypt_password(password)
+    s, login_c, _, login_body = _http_post_json(
+        "oa-core.xinyoudi.com",
+        "/sfuser-api/sfhome/login",
+        {"email": f"{account}@yottastudios.com", "password": enc_pwd},
+        cookies=oa_c,
+    )
+    oa_c.update(login_c)
+    login_data = json.loads(login_body)
+    if login_data.get("error_code") not in ("0", 0):
+        raise RuntimeError(f"OA 登录失败: {login_data.get('error_msg')}")
+
+    s, _, callback_url, _ = _http_get("oa-core.xinyoudi.com", oa_oauth_path, cookies=oa_c)
+    if not callback_url or "auth/callback" not in callback_url:
+        raise RuntimeError(f"未拿到 callback URL: {callback_url}")
+
+    parsed_cb = urllib.parse.urlparse(callback_url)
+    cb_path = parsed_cb.path + "?" + parsed_cb.query
+    s, final_c, _, _ = _http_get(HOST, cb_path, cookies=aichat_c)
+    aichat_c.update(final_c)
+
+    aichat_session = aichat_c.get("aichat_session", "")
+    xsrf_token = aichat_c.get("XSRF-TOKEN", "")
+    if not aichat_session:
+        raise RuntimeError("登录后未获得 aichat_session")
+
+    _ai_save_session(aichat_session, xsrf_token)
+    return aichat_session, xsrf_token
+
+
+def _get_valid_session():
+    aichat_session, xsrf_token = _ai_load_session()
+    if aichat_session:
+        return aichat_session, xsrf_token
+    return _ai_login()
+
+
+def _do_ask(prompt, model_key, dialog_id, context_id, aichat_session, xsrf_token):
+    body = json.dumps({
+        "sys_lang": "zh-CN",
+        "version_info": 1780282191327,
+        "dialog_id": dialog_id,
+        "context_id": context_id,
+        "app_key": "chatgpt",
+        "model_key": model_key,
+        "content": prompt,
+        "use_tools": [],
+    }).encode()
+
+    cookie_str = f"aichat_session={aichat_session}; XSRF-TOKEN={xsrf_token}"
+    conn = http.client.HTTPSConnection(HOST, context=_ctx)
+    conn.request("POST", "/web-api/openai/chat/ask", body=body, headers={
         "Content-Type": "application/json",
-    }
+        "Cookie": cookie_str,
+        "X-XSRF-TOKEN": xsrf_token,
+    })
+    resp = conn.getresponse()
+    if resp.status != 200:
+        raise RuntimeError(f"HTTP {resp.status}: {resp.read().decode()}")
 
-
-def crowdin_api_get_all(token: str, path: str, *, params: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
-    items: List[Dict[str, Any]] = []
-    offset = 0
-    while True:
-        query = dict(params or {})
-        query["limit"] = 500
-        query["offset"] = offset
-        url = f"{BASE_API_URL}{path}?{urllib.parse.urlencode(query)}"
-        payload = http_json("GET", url, headers=crowdin_headers(token))
-        page_items = payload.get("data") or []
-        if not isinstance(page_items, list):
+    for h, v in resp.getheaders():
+        if h.lower() == "set-cookie" and "aichat_session" in v:
+            new_sess = v.split("=")[1].split(";")[0]
+            _ai_save_session(new_sess, xsrf_token)
             break
-        items.extend([unwrap_resource(item) for item in page_items if isinstance(item, dict)])
-        if len(page_items) < 500:
-            break
-        offset += 500
-    return items
 
-
-def find_crowdin_project(token: str) -> Dict[str, Any]:
-    for project in crowdin_api_get_all(token, "/projects"):
-        identifier = str(project.get("identifier") or "").strip()
-        name = str(project.get("name") or "").strip()
-        if identifier == CROWDIN_PROJECT_SLUG or name == CROWDIN_PROJECT_SLUG:
-            return project
-    raise RuntimeError(f"未找到 Crowdin 项目: {CROWDIN_PROJECT_SLUG}")
-
-
-def score_file_match(file_info: Dict[str, Any], file_name: str, extra_keyword: str) -> Optional[int]:
-    path_value = get_resource_path(file_info).replace("\\", "/")
-    name_value = get_resource_name(file_info)
-    file_query = file_name.strip().lower()
-    extra_query = extra_keyword.strip().lower()
-    if not file_query:
-        return None
-    basename = path_value.rsplit("/", 1)[-1].lower()
-    stem = basename.rsplit(".", 1)[0]
-    haystack = f"{path_value} {name_value}".lower()
-    if file_query not in haystack:
-        return None
-    if extra_query and extra_query not in haystack:
-        return None
-    if basename == file_query:
-        return 400
-    if stem == file_query:
-        return 350
-    if name_value.lower() == file_query:
-        return 320
-    if basename.startswith(file_query):
-        return 260
-    if f"/{file_query}" in path_value.lower():
-        return 220
-    return 180
-
-
-def pick_crowdin_file(
-    files: List[Dict[str, Any]],
-    *,
-    file_name: str,
-    crowdin_folder: str,
-    extra_path_keyword: str,
-    extra_keyword: str,
-) -> Dict[str, Any]:
-    folder_needles = [crowdin_folder.strip(), extra_path_keyword.strip()]
-    candidates: List[Tuple[int, Dict[str, Any]]] = []
-    for file_info in files:
-        path_value = get_resource_path(file_info).replace("\\", "/")
-        lowered_path = path_value.lower()
-        if any(needle and needle.lower() not in lowered_path for needle in folder_needles):
-            continue
-        score = score_file_match(file_info, file_name, extra_keyword)
-        if score is None:
-            continue
-        candidates.append((score, file_info))
-    if not candidates:
-        raise LookupError("未搜到对应文件")
-    candidates.sort(key=lambda item: (-item[0], get_resource_path(item[1]), get_resource_name(item[1])))
-    return candidates[0][1]
-
-
-def export_crowdin_translation(token: str, project_id: str, file_id: str) -> Dict[str, Any]:
-    url = f"{BASE_API_URL}/projects/{project_id}/translations/builds/files/{file_id}"
-    return http_json(
-        "POST",
-        url,
-        headers=crowdin_headers(token),
-        body={"targetLanguageId": CROWDIN_TARGET_LANGUAGE},
-    )
-
-
-def decode_translation_bytes(data: bytes) -> str:
-    for encoding in ("utf-8-sig", "utf-16", "utf-16-le", "utf-16-be", "latin-1"):
-        try:
-            text = data.decode(encoding)
-            if text:
-                return text
-        except Exception:
-            continue
-    return data.decode("utf-8", errors="replace")
-
-
-def _strip_inner_xml(fragment: str) -> str:
-    """Remove all XML tags from a fragment and return cleaned text."""
-    fragment = re.sub(r"</?(?:\w+:)?(?:t|r|si|a|span|div|body|txBody|sheetData|row|c|is)[^>]*>", " ", fragment)
-    fragment = re.sub(r"<[^>]+>", " ", fragment)
-    fragment = (
-        fragment.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
-        .replace("&quot;", '"')
-        .replace("&apos;", "'")
-    )
-    return " ".join(fragment.split()).strip()
-
-
-def strip_xml_text(text: str) -> str:
-    text = re.sub(r"<\?.*?\?>", " ", text, flags=re.S)
-
-    # 尝试按段落标签 <w:p>/<p> 拆分，保留空段落产生的空行
-    para_pattern = re.compile(r"<(?:\w+:)?p(?:\s[^>]*)?>.*?</(?:\w+:)?p\s*>|<(?:\w+:)?p(?:\s[^>]*)?/>", re.S)
-    para_matches = list(para_pattern.finditer(text))
-
-    if para_matches:
-        # 先提取段落标签之前的文本（不在任何 <p> 里的内容）
-        pre_text = _strip_inner_xml(text[:para_matches[0].start()])
-        lines: list[str] = []
-        if pre_text:
-            lines.append(pre_text)
-        for m in para_matches:
-            inner = _strip_inner_xml(m.group())
-            if inner:
-                lines.append(inner)
-            else:
-                # 空段落 → 保留为空行，但避免开头和连续多个空行
-                if lines and lines[-1] != "":
-                    lines.append("")
-        # 段落之后的尾部文本
-        tail = _strip_inner_xml(text[para_matches[-1].end():])
-        if tail:
-            lines.append(tail)
-        # 去掉末尾多余空行
-        while lines and lines[-1] == "":
-            lines.pop()
-        return "\n".join(lines)
-
-    # 非段落结构的 XML（如 xlsx sharedStrings 等），沿用原逻辑
-    text = re.sub(r"</?(?:\w+:)?(?:t|r|si|a|span|div|body|txBody|sheetData|row|c|is)[^>]*>", "\n", text)
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = (
-        text.replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&amp;", "&")
-        .replace("&quot;", '"')
-        .replace("&apos;", "'")
-    )
-    lines2: list[str] = []
-    for line in text.splitlines():
-        cleaned = " ".join(line.split()).strip()
-        if cleaned:
-            lines2.append(cleaned)
-    return "\n".join(lines2)
-
-
-def archive_candidate_names(file_path: str) -> List[str]:
-    lowered = file_path.lower()
-    if lowered.endswith(".docx"):
-        return ["word/document.xml"] + [f"word/{name}" for name in ("header1.xml", "footer1.xml", "footnotes.xml", "endnotes.xml")]
-    if lowered.endswith(".pptx"):
-        return [f"ppt/slides/slide{i}.xml" for i in range(1, 200)]
-    if lowered.endswith(".xlsx"):
-        names = ["xl/sharedStrings.xml"]
-        names.extend([f"xl/worksheets/sheet{i}.xml" for i in range(1, 200)])
-        return names
-    return []
-
-
-def extract_text_from_zip_bytes(data: bytes, file_path: str) -> str:
-    with zipfile.ZipFile(io.BytesIO(data)) as zf:
-        all_names = set(zf.namelist())
-        preferred = [name for name in archive_candidate_names(file_path) if name in all_names]
-        if not preferred:
-            preferred = [
-                name for name in zf.namelist()
-                if name.endswith((".txt", ".json", ".xml", ".html", ".htm"))
-                and not name.startswith(("_rels/", "docProps/"))
-                and not name.endswith((".rels",))
-                and "[Content_Types]" not in name
-            ]
-        chunks: List[str] = []
-        for name in preferred[:80]:
-            try:
-                raw = zf.read(name)
-            except Exception:
+    result_text = ""
+    try:
+        while True:
+            line = resp.readline()
+            if not line:
+                break
+            line = line.decode("utf-8", errors="ignore").strip()
+            if not line.startswith("data:"):
                 continue
-            text = decode_translation_bytes(raw)
-            if name.endswith(".xml") or "<" in text[:400]:
-                text = strip_xml_text(text)
-            else:
-                text = "\n".join(line.strip() for line in text.splitlines() if line.strip())
-            if text:
-                chunks.append(text)
-        merged = "\n".join(chunk for chunk in chunks if chunk).strip()
-        return merged
+            payload = line[5:].strip()
+            if not payload:
+                continue
+            try:
+                data = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            err = data.get("error_code")
+            if err == "4500002":
+                conn.close()
+                return None
+            if err not in (0, "0"):
+                raise RuntimeError(f"API 错误: {data.get('error_msg')}")
+            chunk = data.get("data", {})
+            if chunk.get("type") == "message":
+                result_text += chunk.get("text", "")
+            elif chunk.get("type") == "chat" and chunk.get("is_finished"):
+                break
+    finally:
+        conn.close()
+    return result_text
 
 
-def looks_like_binary_garbage(text: str) -> bool:
-    if not text:
-        return False
-    sample = text[:400]
-    weird = 0
-    for ch in sample:
-        if ch == "\ufffd":
-            weird += 3
-        elif ord(ch) < 32 and ch not in "\n\r\t":
-            weird += 2
-    return weird > max(12, len(sample) // 12)
+def _aichat_ask(prompt, model_key="gemini_31_flash_image", dialog_id=5870,
+                context_id="b8d94dfc-0dd9-4561-944b-3b31ce0dba09"):
+    for _ in range(2):
+        aichat_session, xsrf_token = _get_valid_session()
+        result = _do_ask(prompt, model_key, dialog_id, context_id, aichat_session, xsrf_token)
+        if result is not None:
+            return result
+        if os.path.exists(_AI_SESSION_FILE):
+            os.remove(_AI_SESSION_FILE)
+    raise RuntimeError("登录失败，请检查 aichat_creds.json 中的账密")
+# ─────────────────────────────────────────────────────────────────────────────
+
+GLOSSARY_FILE = "Mafia War's Glossary.csv"
+AI_CONFIG_FILE = "crowdin_checker_ai_config.json"
+REFERENCE_DIR = "reference"
+DEFAULT_AI_CONFIG = {
+    "model_key": "claude_opus_46",
+    "translate_prompt": (
+        "You are translating Mafia City localization content from Simplified Chinese to English.\n"
+        "Return English only.\n"
+        "Preserve every literal \\n exactly.\n"
+        "Preserve inline color tags like [E7594C]...[-] exactly.\n"
+        "Keep the original paragraph order.\n"
+        "Follow the glossary when applicable.\n\n"
+        "Glossary terms:\n{glossary_terms}\n\n"
+        "Chinese source:\n{zh_text}"
+    ),
+    "check_prompt": (
+        "You are reviewing an English localization draft against the Simplified Chinese source.\n"
+        "Return the corrected English only.\n"
+        "Preserve every literal \\n exactly as in the English draft.\n"
+        "Preserve inline color tags like [E7594C]...[-] exactly.\n"
+        "Keep the original paragraph order.\n"
+        "Improve accuracy, fluency, consistency, and terminology.\n"
+        "Follow the glossary when applicable.\n\n"
+        "Glossary terms:\n{glossary_terms}\n\n"
+        "Chinese source:\n{zh_text}\n\n"
+        "Current English draft:\n{en_text}"
+    ),
+    "align_prompt": (
+        "You are aligning an English localization draft to the Simplified Chinese source.\n"
+        "Return English only.\n"
+        "The English on the right must match the meaning of the Chinese on the left paragraph by paragraph.\n"
+        "It does not need to match sentence by sentence, but it must not drift semantically.\n"
+        "Preserve meaning, tone, literal \\n paragraph separators, and inline color tags exactly.\n"
+        "Re-segment the English so each Chinese paragraph maps to the corresponding English paragraph.\n"
+        "If a Chinese paragraph is a short title, label, or bracketed term, keep the English paragraph equally short instead of expanding it into a full explanation.\n"
+        "Do not add notes or explanations.\n\n"
+        "Glossary terms:\n{glossary_terms}\n\n"
+        "Chinese source:\n{zh_text}\n\n"
+        "Current English draft:\n{en_text}"
+    ),
+    "translate_templates": [
+        {
+            "id": "default",
+            "name": "Default",
+            "prompt": (
+                "You are translating Mafia City localization content from Simplified Chinese to English.\n"
+                "Return English only.\n"
+                "Preserve every literal \\n exactly.\n"
+                "Preserve inline color tags like [E7594C]...[-] exactly.\n"
+                "Keep the original paragraph order.\n"
+                "Follow the glossary when applicable.\n"
+                "If reference content is provided, imitate its formatting, tone, and stylistic conventions where appropriate.\n\n"
+                "Glossary terms:\n{glossary_terms}\n\n"
+                "Reference content:\n{reference_text}\n\n"
+                "Chinese source:\n{zh_text}"
+            ),
+            "reference_file": "",
+        }
+    ],
+    "selected_translate_template_id": "default",
+}
+ALIGN_HARD_RULES = (
+    "Alignment hard rules:\n"
+    "1. The meaning on the English side must match the meaning on the Chinese side paragraph by paragraph.\n"
+    "2. Do not force one-sentence-to-one-sentence matching. Semantic correspondence matters more than sentence count.\n"
+    "3. Keep each Chinese paragraph aligned with the corresponding English paragraph; do not shift meaning into neighboring paragraphs.\n"
+    "4. If a Chinese paragraph is a short title, label, bracketed term, or heading, the English output for that paragraph must also stay short and label-like. Do not expand it into an explanatory sentence.\n"
+    "5. Do not add background explanation, lore, or extra context that is not present in the Chinese source.\n"
+    "6. Preserve literal \\n separators and inline color tags exactly.\n"
+    "7. Never move a heading/title paragraph to a neighboring index.\n"
+    "8. Self-check before output: for each index i, ensure English paragraph i matches Chinese paragraph i semantically and is not shifted.\n"
+    "9. Return English only.\n"
+)
 
 
-def extract_translation_text(data: bytes, file_path: str) -> str:
-    if zipfile.is_zipfile(io.BytesIO(data)):
-        text = extract_text_from_zip_bytes(data, file_path)
-        if not text:
-            raise RuntimeError("该文件导出为压缩包，但未提取到可读翻译内容，可能当前还没有翻译")
-        return text
-    text = decode_translation_bytes(data).strip()
-    if not text:
-        raise RuntimeError("导出的翻译内容为空，可能当前还没有翻译")
-    if looks_like_binary_garbage(text):
-        raise RuntimeError("导出的内容不是可直接写入的文本，可能是二进制文件或当前没有可读翻译")
-    return text
-
-
-def parse_apitable_workbench(url: str) -> Tuple[str, str, str]:
-    parsed = urllib.parse.urlparse(url)
-    parts = [item for item in parsed.path.split("/") if item]
-    if len(parts) < 3 or parts[0] != "workbench":
-        raise RuntimeError("APITable workbench 地址格式不正确")
-    base_url = f"{parsed.scheme}://{parsed.netloc}/fusion/v1"
-    return base_url, parts[1], parts[2]
-
-
-def get_apitable_base_url() -> str:
-    return f"{APITABLE_BASE_ORIGIN}/fusion/v1"
-
-
-def build_multipart_body(fields: Dict[str, str], filename: str, file_bytes: bytes, content_type: str) -> Tuple[bytes, str]:
-    boundary = f"----CodexBoundary{uuid.uuid4().hex}"
-    buffer = io.BytesIO()
-    for key, value in fields.items():
-        buffer.write(f"--{boundary}\r\n".encode("utf-8"))
-        buffer.write(f'Content-Disposition: form-data; name="{key}"\r\n\r\n'.encode("utf-8"))
-        buffer.write(str(value).encode("utf-8"))
-        buffer.write(b"\r\n")
-    buffer.write(f"--{boundary}\r\n".encode("utf-8"))
-    buffer.write(
-        (
-            f'Content-Disposition: form-data; name="file"; filename="{filename}"\r\n'
-            f"Content-Type: {content_type}\r\n\r\n"
-        ).encode("utf-8")
-    )
-    buffer.write(file_bytes)
-    buffer.write(b"\r\n")
-    buffer.write(f"--{boundary}--\r\n".encode("utf-8"))
-    return buffer.getvalue(), boundary
-
-
-def call_aitable(method: str, url: str, api_key: str, body: Optional[Dict[str, Any]] = None) -> Tuple[int, str]:
-    headers = {"Authorization": f"Bearer {api_key}"}
-    payload = None
-    if body is not None:
-        headers["Content-Type"] = "application/json"
-        payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    req = urllib.request.Request(url, data=payload, method=method, headers=headers)
+def load_aichat_creds():
+    if not os.path.exists(AICHAT_CREDS_FILE):
+        return {"configured": False, "account": ""}
     try:
-        with urllib.request.urlopen(req, timeout=60, context=ssl_context()) as resp:
-            return resp.status, resp.read().decode("utf-8")
-    except urllib.error.HTTPError as exc:
-        return exc.code, exc.read().decode("utf-8", errors="replace")
-    except urllib.error.URLError as exc:
-        return 500, f"网络错误: {exc}"
+        with open(AICHAT_CREDS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return {"configured": True, "account": data.get("account", "")}
+    except Exception:
+        return {"configured": False, "account": ""}
 
 
-def upload_aitable_attachment(
-    api_key: str,
-    base_origin: str,
-    datasheet_id: str,
-    filename: str,
-    file_bytes: bytes,
-) -> List[Dict[str, Any]]:
-    content_type = mimetypes.guess_type(filename)[0] or "application/octet-stream"
-    body, boundary = build_multipart_body(
-        {},
-        filename,
-        file_bytes,
-        content_type,
-    )
-    url = f"{base_origin}/fusion/v1/datasheets/{datasheet_id}/attachments"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Content-Type": f"multipart/form-data; boundary={boundary}",
+def save_aichat_creds(account, password):
+    if not account or not password:
+        raise ValueError("账号和密码不能为空")
+    os.makedirs(SCRIPT_DIR, exist_ok=True)
+    with open(AICHAT_CREDS_FILE, "w", encoding="utf-8") as f:
+        json.dump({"account": account, "password": password}, f, ensure_ascii=False, indent=2)
+    os.chmod(AICHAT_CREDS_FILE, 0o600)
+
+
+def _glossary_candidates():
+    """
+    Return candidate glossary paths in priority order.
+    Supports running as:
+    - plain .py script
+    - PyInstaller onedir executable
+    - PyInstaller macOS .app (Finder launch)
+    """
+    candidates = []
+
+    # 1) Next to the running executable/script
+    candidates.append(os.path.join(SCRIPT_DIR, GLOSSARY_FILE))
+
+    # 2) Current working directory (useful for terminal launches)
+    candidates.append(os.path.join(os.getcwd(), GLOSSARY_FILE))
+
+    # 3) If inside a macOS .app, also try the .app's parent folder
+    #    .../MyApp.app/Contents/MacOS -> parent of .app bundle
+    if ".app/Contents/MacOS" in SCRIPT_DIR:
+        app_root = SCRIPT_DIR.split(".app/Contents/MacOS", 1)[0] + ".app"
+        app_parent = os.path.dirname(app_root)
+        candidates.append(os.path.join(app_parent, GLOSSARY_FILE))
+
+    # de-duplicate while preserving order
+    seen = set()
+    ordered = []
+    for p in candidates:
+        norm = os.path.normpath(p)
+        if norm not in seen:
+            seen.add(norm)
+            ordered.append(norm)
+    return ordered
+
+
+# Crowdin glossary export columns are fixed:
+#   A (0)  -> Term [zh-CN]    源术语（中文）
+#   M (12) -> Term [en-US]    目标术语（英文）
+ZH_COL = 0
+EN_COL = 12
+
+
+def load_glossary():
+    path = None
+    for candidate in _glossary_candidates():
+        if os.path.exists(candidate):
+            path = candidate
+            break
+    if not path:
+        return [], f"Glossary file not found: {GLOSSARY_FILE}"
+
+    with open(path, newline='', encoding='utf-8-sig') as f:
+        rows = list(csv.reader(f))
+
+    if len(rows) < 2:
+        return [], "Glossary is empty or contains only a header row"
+
+    terms = []
+    for row in rows[1:]:
+        zh = row[ZH_COL].strip() if len(row) > ZH_COL else ''
+        en = row[EN_COL].strip() if len(row) > EN_COL else ''
+        if zh and en:
+            terms.append({'zh': zh, 'en': en})
+
+    return terms, f"Loaded {len(terms)} glossary terms"
+
+
+def _ai_config_path():
+    return os.path.join(SCRIPT_DIR, AI_CONFIG_FILE)
+
+
+def _default_ai_config():
+    return json.loads(json.dumps(DEFAULT_AI_CONFIG))
+
+
+def _reference_dir_path():
+    return os.path.join(SCRIPT_DIR, REFERENCE_DIR)
+
+
+def _normalize_translate_templates(value):
+    defaults = _default_ai_config()["translate_templates"]
+    raw = value if isinstance(value, list) and value else defaults
+    out = []
+    for idx, item in enumerate(raw):
+        if not isinstance(item, dict):
+            continue
+        template_id = str(item.get("id") or f"template_{idx + 1}").strip()
+        name = str(item.get("name") or f"Template {idx + 1}").strip()
+        prompt = str(item.get("prompt") or defaults[0]["prompt"])
+        reference_file = str(item.get("reference_file") or "").strip()
+        out.append({
+            "id": template_id,
+            "name": name,
+            "prompt": prompt,
+            "reference_file": reference_file,
+        })
+    return out or defaults
+
+
+def _load_docx_text(path):
+    with zipfile.ZipFile(path) as zf:
+        xml_bytes = zf.read("word/document.xml")
+    root = ET.fromstring(xml_bytes)
+    ns = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+    paragraphs = []
+    for para in root.findall(".//w:p", ns):
+        chunks = []
+        for node in para.findall(".//w:t", ns):
+            if node.text:
+                chunks.append(node.text)
+        text = "".join(chunks).strip()
+        if text:
+            paragraphs.append(text)
+    return "\n".join(paragraphs)
+
+
+def list_reference_files():
+    ref_dir = _reference_dir_path()
+    if not os.path.isdir(ref_dir):
+        return []
+    names = []
+    for name in sorted(os.listdir(ref_dir)):
+        lower = name.lower()
+        if lower.endswith(".docx") and not name.startswith("~") and not name.startswith("."):
+            names.append(name)
+    return names
+
+
+def load_reference_text(filename):
+    if not filename:
+        return ""
+    safe_name = os.path.basename(filename)
+    path = os.path.join(_reference_dir_path(), safe_name)
+    if not os.path.exists(path):
+        raise ValueError(f"Reference file not found: {safe_name}")
+    if not safe_name.lower().endswith(".docx"):
+        raise ValueError("Only .docx reference files are supported")
+    text = _load_docx_text(path)
+    return text[:12000]
+
+
+def load_ai_config():
+    path = _ai_config_path()
+    if not os.path.exists(path):
+        return _default_ai_config()
+
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return _default_ai_config()
+
+    defaults = _default_ai_config()
+    templates = _normalize_translate_templates(data.get("translate_templates"))
+    selected_template_id = str(
+        data.get("selected_translate_template_id") or defaults["selected_translate_template_id"]
+    ).strip()
+    if not any(t["id"] == selected_template_id for t in templates):
+        selected_template_id = templates[0]["id"]
+
+    return {
+        "model_key": str(data.get("model_key") or defaults["model_key"]).strip(),
+        "translate_prompt": str(data.get("translate_prompt") or defaults["translate_prompt"]),
+        "check_prompt": str(data.get("check_prompt") or defaults["check_prompt"]),
+        "align_prompt": str(data.get("align_prompt") or defaults["align_prompt"]),
+        "translate_templates": templates,
+        "selected_translate_template_id": selected_template_id,
     }
-    req = urllib.request.Request(url, data=body, method="POST", headers=headers)
+
+
+def save_ai_config(data):
+    defaults = _default_ai_config()
+    templates = _normalize_translate_templates(data.get("translate_templates"))
+    selected_template_id = str(
+        data.get("selected_translate_template_id") or defaults["selected_translate_template_id"]
+    ).strip()
+    if not any(t["id"] == selected_template_id for t in templates):
+        selected_template_id = templates[0]["id"]
+
+    config = {
+        "model_key": str(data.get("model_key") or defaults["model_key"]).strip(),
+        "translate_prompt": str(data.get("translate_prompt") or defaults["translate_prompt"]),
+        "check_prompt": str(data.get("check_prompt") or defaults["check_prompt"]),
+        "align_prompt": str(data.get("align_prompt") or defaults["align_prompt"]),
+        "translate_templates": templates,
+        "selected_translate_template_id": selected_template_id,
+    }
+    with open(_ai_config_path(), "w", encoding="utf-8") as f:
+        json.dump(config, f, ensure_ascii=False, indent=2)
+    return config
+
+
+def normalize_ai_output(text: str) -> str:
+    value = str(text or "").strip()
+
+    # Drop leading explanation lines such as "Here is the corrected English:"
+    lines = value.splitlines()
+    while lines:
+        head = lines[0].strip().lower()
+        if (
+            head.startswith("here is the corrected english")
+            or head.startswith("corrected english")
+            or head.startswith("revised english")
+        ):
+            lines.pop(0)
+            continue
+        break
+    value = "\n".join(lines).strip()
+
+    # Normalize common HTML color spans into the tool's native color tags.
+    value = re.sub(
+        r"<span\s+style=['\"]color\s*:\s*red\s*;?['\"]\s*>(.*?)</span>",
+        r"[FF4D4F]\1[-]",
+        value,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    value = re.sub(
+        r"<span\s+style=['\"]color\s*:\s*green\s*;?['\"]\s*>(.*?)</span>",
+        r"[56D364]\1[-]",
+        value,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    value = re.sub(
+        r"<span\s+style=['\"]color\s*:\s*#?ff0000\s*;?['\"]\s*>(.*?)</span>",
+        r"[FF0000]\1[-]",
+        value,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    value = re.sub(
+        r"<span\s+style=['\"]color\s*:\s*#?00aa00\s*;?['\"]\s*>(.*?)</span>",
+        r"[00AA00]\1[-]",
+        value,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    value = re.sub(r"</?span[^>]*>", "", value, flags=re.IGNORECASE)
+
+    return value.strip()
+
+
+# Claude 模型需要专用的 claude 品牌对话（用 Gemini 对话会报错）
+# 同时 Claude 不通过 SSE 流式返回文本，需从对话历史取增量
+_CLAUDE_DIALOG_ID = 18462
+_CLAUDE_CONTEXT_ID = "98d7f72c-7350-4f2c-95c0-bc79a943b95e"
+
+
+def _get_dialog_last_msg_id(dialog_id, session, xsrf):
+    """返回对话中最后一条消息的 id（用于识别新增消息）。"""
+    cookie = f"aichat_session={session}; XSRF-TOKEN={xsrf}"
+    body = json.dumps({
+        "sys_lang": "zh-CN", "version_info": 1780282191327,
+        "app_key": "chatgpt", "dialog_id": dialog_id,
+        "start_index": 0, "msg_num": 2,
+    }).encode()
+    req = _urllib_request.Request(
+        f"https://{HOST}/web-api/openai/chat/get-dialog-messages",
+        data=body, method="POST",
+    )
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Cookie", cookie)
+    req.add_header("X-XSRF-TOKEN", xsrf)
+    with _urllib_request.urlopen(req, context=_ctx, timeout=15) as r:
+        data = json.loads(r.read())
+    msgs = data.get("data", {}).get("messages", [])
+    return max((m.get("id", 0) for m in msgs), default=0)
+
+
+def _get_new_assistant_text(dialog_id, after_id, session, xsrf):
+    """取 after_id 之后新增的 assistant 消息文本。"""
+    cookie = f"aichat_session={session}; XSRF-TOKEN={xsrf}"
+    body = json.dumps({
+        "sys_lang": "zh-CN", "version_info": 1780282191327,
+        "app_key": "chatgpt", "dialog_id": dialog_id,
+        "start_index": 0, "msg_num": 4,
+    }).encode()
+    req = _urllib_request.Request(
+        f"https://{HOST}/web-api/openai/chat/get-dialog-messages",
+        data=body, method="POST",
+    )
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Cookie", cookie)
+    req.add_header("X-XSRF-TOKEN", xsrf)
+    with _urllib_request.urlopen(req, context=_ctx, timeout=15) as r:
+        data = json.loads(r.read())
+    msgs = data.get("data", {}).get("messages", [])
+    for msg in reversed(msgs):
+        if msg.get("id", 0) > after_id and msg.get("role") == "assistant":
+            return "".join(
+                c.get("text", "") for c in msg.get("content", []) if isinstance(c, dict)
+            )
+    return ""
+
+
+def _create_tmp_claude_dialog(model_key, session, xsrf):
+    """新建一个临时 Claude 品牌对话，返回 (dialog_id, context_id)。"""
+    cookie = f"aichat_session={session}; XSRF-TOKEN={xsrf}"
+    body = json.dumps({
+        "app_key": "chatgpt", "brand": "claude",
+        "model_key": model_key, "title": "翻译检查临时",
+    }).encode()
+    req = _urllib_request.Request(
+        f"https://{HOST}/web-api/openai/chat/add-dialog",
+        data=body, method="POST",
+    )
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Cookie", cookie)
+    req.add_header("X-XSRF-TOKEN", xsrf)
+    with _urllib_request.urlopen(req, context=_ctx, timeout=15) as r:
+        data = json.loads(r.read())
+    d = data.get("data", {})
+    return d["id"], d["last_context_id"]
+
+
+def _delete_dialog(dialog_id, session, xsrf):
+    """删除指定对话（用于清理临时 dialog）。"""
+    cookie = f"aichat_session={session}; XSRF-TOKEN={xsrf}"
+    body = json.dumps({"app_key": "chatgpt", "id": dialog_id}).encode()
+    req = _urllib_request.Request(
+        f"https://{HOST}/web-api/openai/chat/delete-dialog",
+        data=body, method="POST",
+    )
+    req.add_header("Content-Type", "application/json")
+    req.add_header("Cookie", cookie)
+    req.add_header("X-XSRF-TOKEN", xsrf)
     try:
-        with urllib.request.urlopen(req, timeout=120, context=ssl_context()) as resp:
-            payload = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"上传 APITable 附件失败 HTTP {exc.code}: {detail[:400]}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"上传 APITable 附件失败: {exc}") from exc
-    data = payload.get("data")
-    if isinstance(data, list):
-        return [item for item in data if isinstance(item, dict)]
-    if isinstance(data, dict):
-        files = data.get("files") or data.get("attachments") or data.get("items")
-        if isinstance(files, list):
-            return [item for item in files if isinstance(item, dict)]
-        return [data]
-    raise RuntimeError(f"上传 APITable 附件成功，但返回结构无法识别: {json.dumps(payload, ensure_ascii=False)[:400]}")
+        with _urllib_request.urlopen(req, context=_ctx, timeout=10):
+            pass
+    except Exception:
+        pass  # 删除失败不阻断主流程
 
 
-def fetch_aitable_fields(api_key: str, base_url: str, datasheet_id: str, view_id: str) -> List[Dict[str, Any]]:
-    query = urllib.parse.urlencode({"viewId": view_id})
-    url = f"{base_url}/datasheets/{datasheet_id}/fields?{query}"
-    status, text = call_aitable("GET", url, api_key)
-    if status >= 400:
-        raise RuntimeError(f"读取 APITable 字段失败 HTTP {status}: {text[:300]}")
-    data = json.loads(text)
-    return (data.get("data") or {}).get("fields") or []
+def call_ai_chat(messages, config, temperature=0.2, max_tokens_override=None):
+    model_key = str(config.get("model_key") or "claude_opus_46").strip()
+    if not model_key:
+        raise ValueError("Please select a Model first")
+    prompt = "\n".join(
+        str(m.get("content") or "")
+        for m in messages
+        if m.get("role") == "user"
+    )
+
+    if model_key.startswith("claude"):
+        # 每次新建临时 dialog，确保无历史上下文干扰，用完即删
+        session, xsrf = _get_valid_session()
+        tmp_dialog_id, tmp_context_id = _create_tmp_claude_dialog(model_key, session, xsrf)
+        try:
+            prev_id = _get_dialog_last_msg_id(tmp_dialog_id, session, xsrf)
+            _aichat_ask(prompt, model_key=model_key,
+                        dialog_id=tmp_dialog_id, context_id=tmp_context_id)
+            session, xsrf = _get_valid_session()
+            raw_text = _get_new_assistant_text(tmp_dialog_id, prev_id, session, xsrf)
+        finally:
+            _delete_dialog(tmp_dialog_id, session, xsrf)
+    else:
+        # 每次传新 UUID 作为 context_id，强制开启全新会话
+        raw_text = _aichat_ask(prompt, model_key=model_key,
+                               context_id=str(uuid.uuid4()))
+
+    return {
+        "text": normalize_ai_output(raw_text),
+        "raw_text": raw_text,
+        "model": model_key,
+    }
 
 
-def fetch_aitable_records(api_key: str, base_url: str, datasheet_id: str, view_id: str) -> List[Dict[str, Any]]:
-    page = 1
-    records: List[Dict[str, Any]] = []
-    while True:
-        query = urllib.parse.urlencode({"viewId": view_id, "pageSize": 1000, "pageNum": page})
-        url = f"{base_url}/datasheets/{datasheet_id}/records?{query}"
-        status, text = call_aitable("GET", url, api_key)
-        if status >= 400:
-            raise RuntimeError(f"读取 APITable 记录失败 HTTP {status}: {text[:300]}")
-        data = json.loads(text)
-        page_items = ((data.get("data") or {}).get("records")) or []
-        if not isinstance(page_items, list):
-            break
-        records.extend(page_items)
-        if len(page_items) < 1000:
-            break
-        page += 1
-    return records
+def build_glossary_prompt(terms, source_text):
+    hits = []
+    seen = set()
+    for term in terms:
+        zh = term.get("zh", "")
+        en = term.get("en", "")
+        if zh and en and zh in source_text and zh not in seen:
+            hits.append(f"{zh} = {en}")
+            seen.add(zh)
+    return "\n".join(hits[:200])
 
 
-def field_by_name(fields: List[Dict[str, Any]], name: str) -> Optional[Dict[str, Any]]:
-    for field in fields:
-        if str(field.get("name") or "") == name:
-            return field
+def parse_raw_with_seps(raw_text):
+    tokens = str(raw_text or "").split("\\n")
+    paras = []
+    seps = []
+    pending_empty = 0
+    for tok in tokens:
+        trimmed = tok.strip()
+        if trimmed:
+            if paras:
+                seps.append("\\n" * (1 + pending_empty))
+            paras.append(trimmed)
+            pending_empty = 0
+        else:
+            pending_empty += 1
+    return {"paras": paras, "seps": seps}
+
+
+def build_align_json_prompt(zh_text, en_text, glossary_prompt, custom_prompt=""):
+    zh = parse_raw_with_seps(zh_text)
+    en = parse_raw_with_seps(en_text)
+    zh_lines = [
+        f"{idx + 1}. {para}"
+        for idx, para in enumerate(zh["paras"])
+    ]
+    en_lines = [
+        f"{idx + 1}. {para}"
+        for idx, para in enumerate(en["paras"])
+    ]
+    extra = ""
+    safe_custom = str(custom_prompt or "").strip()
+    if safe_custom:
+        extra = "\n\nAdditional alignment preference (must not override the hard rules above):\n" + safe_custom
+    return (
+        ALIGN_HARD_RULES
+        + "\nReturn valid JSON only. No markdown fences. No explanation.\n"
+        + "Your entire reply must start with { or [ and end with } or ].\n"
+        + "JSON schema:\n"
+        + '{\"paragraphs\": [\"english paragraph 1\", \"english paragraph 2\"]}\n'
+        + "The paragraphs array length must exactly equal the number of Chinese paragraphs.\n\n"
+        + "Glossary terms:\n"
+        + (glossary_prompt or "(no matched glossary terms)")
+        + "\n\nChinese paragraphs:\n"
+        + ("\n".join(zh_lines) if zh_lines else "(empty)")
+        + "\n\nCurrent English draft:\n"
+        + ("\n".join(en_lines) if en_lines else "(empty)")
+        + extra
+    )
+
+
+def build_align_repair_prompt(zh_text, en_text, glossary_prompt, broken_output, expected_count):
+    zh = parse_raw_with_seps(zh_text)
+    en = parse_raw_with_seps(en_text)
+    zh_lines = [f"{idx + 1}. {para}" for idx, para in enumerate(zh["paras"])]
+    en_lines = [f"{idx + 1}. {para}" for idx, para in enumerate(en["paras"])]
+    return (
+        ALIGN_HARD_RULES
+        + "\nYour previous output failed validation.\n"
+        + f"You MUST return exactly {expected_count} paragraphs in JSON array `paragraphs`.\n"
+        + "Do not merge or drop any paragraph index.\n"
+        + "Return valid JSON only. No markdown fences. No explanation.\n"
+        + "JSON schema:\n"
+        + '{\"paragraphs\": [\"english paragraph 1\", \"english paragraph 2\"]}\n\n'
+        + "Glossary terms:\n"
+        + (glossary_prompt or "(no matched glossary terms)")
+        + "\n\nChinese paragraphs:\n"
+        + ("\n".join(zh_lines) if zh_lines else "(empty)")
+        + "\n\nCurrent English draft:\n"
+        + ("\n".join(en_lines) if en_lines else "(empty)")
+        + "\n\nYour previous invalid output (for correction only):\n"
+        + str(broken_output or "")
+    )
+
+
+def _extract_json_blob(text):
+    value = str(text or "").strip()
+    fenced = re.search(r"```(?:json)?\s*([\s\S]*?)```", value, flags=re.IGNORECASE)
+    if fenced:
+        return fenced.group(1).strip()
+    obj_start = value.find("{")
+    obj_end = value.rfind("}")
+    if obj_start != -1 and obj_end != -1 and obj_end > obj_start:
+        return value[obj_start:obj_end + 1]
+    arr_start = value.find("[")
+    arr_end = value.rfind("]")
+    if arr_start != -1 and arr_end != -1 and arr_end > arr_start:
+        return value[arr_start:arr_end + 1]
+    raise ValueError("AI Align did not return JSON")
+
+
+def _try_parse_align_fallback(text, expected_count, fallback_seps):
+    raw = normalize_ai_output(text)
+    if not raw:
+        return None
+
+    # If the model already returned content with the correct paragraph count,
+    # accept it even when it ignored the JSON wrapper requirement.
+    parsed = parse_raw_with_seps(raw)
+    if len(parsed["paras"]) == expected_count:
+        return raw
+
+    # Common fallback: numbered lines like "1. ...", "2. ...".
+    lines = [line.strip() for line in raw.splitlines() if line.strip()]
+    numbered = []
+    for line in lines:
+        m = re.match(r"^\d+\.\s*(.*)$", line)
+        if m:
+            numbered.append(normalize_ai_output(m.group(1)))
+    if len(numbered) == expected_count:
+        result = ""
+        for idx, para in enumerate(numbered):
+            result += para
+            if idx < len(numbered) - 1:
+                result += fallback_seps[idx] if idx < len(fallback_seps) else "\\n"
+        return result
+
+    # Another common fallback: one paragraph per physical line.
+    if len(lines) == expected_count:
+        result = ""
+        for idx, para in enumerate(lines):
+            result += normalize_ai_output(para)
+            if idx < len(lines) - 1:
+                result += fallback_seps[idx] if idx < len(fallback_seps) else "\\n"
+        return result
+
     return None
 
 
-def serialize_option_value(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+def parse_align_json_response(text, expected_count, fallback_seps):
+    try:
+        blob = _extract_json_blob(text)
+    except ValueError:
+        fallback = _try_parse_align_fallback(text, expected_count, fallback_seps)
+        if fallback is not None:
+            return fallback
+        raise
+    try:
+        data = json.loads(blob)
+    except json.JSONDecodeError as e:
+        try:
+            data = ast.literal_eval(blob)
+        except (ValueError, SyntaxError):
+            fallback = _try_parse_align_fallback(text, expected_count, fallback_seps)
+            if fallback is not None:
+                return fallback
+            raise ValueError("AI Align returned invalid JSON") from e
+
+    if isinstance(data, list):
+        paras = data
+    else:
+        paras = data.get("paragraphs")
+    if not isinstance(paras, list):
+        fallback = _try_parse_align_fallback(text, expected_count, fallback_seps)
+        if fallback is not None:
+            return fallback
+        raise ValueError("AI Align JSON must contain a 'paragraphs' array")
+    cleaned = [normalize_ai_output(str(item or "").strip()) for item in paras]
+    if len(cleaned) != expected_count:
+        fallback = _try_parse_align_fallback(text, expected_count, fallback_seps)
+        if fallback is not None:
+            return fallback
+        raise ValueError(
+            f"AI Align returned {len(cleaned)} paragraphs, expected {expected_count}"
+        )
+
+    result = ""
+    for idx, para in enumerate(cleaned):
+        result += para
+        if idx < len(cleaned) - 1:
+            result += fallback_seps[idx] if idx < len(fallback_seps) else "\\n"
+    return result
 
 
-def parse_field_options(field: Optional[Dict[str, Any]], records: List[Dict[str, Any]], field_name: str) -> List[Dict[str, Any]]:
-    options: List[Dict[str, Any]] = []
-    seen = set()
-    has_schema_options = False
-    if field:
-        raw_options = ((field.get("property") or {}).get("options")) or ((field.get("properties") or {}).get("options")) or []
-        if isinstance(raw_options, list):
-            has_schema_options = bool(raw_options)
-            for item in raw_options:
-                if not isinstance(item, dict):
-                    continue
-                raw_value = item.get("id")
-                if raw_value in (None, ""):
-                    raw_value = item.get("name")
-                label = item.get("name")
-                if label in (None, ""):
-                    label = raw_value
-                if raw_value in (None, ""):
-                    continue
-                key = serialize_option_value(raw_value)
-                if key in seen:
-                    continue
-                seen.add(key)
-                options.append({"label": str(label), "value": raw_value})
-    for record in records:
-        raw_value = (record.get("fields") or {}).get(field_name)
-        if raw_value in (None, "", []):
-            continue
-        if has_schema_options and isinstance(raw_value, str) and raw_value.lower().startswith("opt"):
-            continue
-        key = serialize_option_value(raw_value)
-        if key in seen:
-            continue
-        seen.add(key)
-        options.append({"label": normalize_cell_text(raw_value), "value": raw_value})
-    return options
+def _is_zh_heading_like(text):
+    value = str(text or "").strip()
+    if not value:
+        return False
+    if re.match(r"^[\[\【].{1,40}[\]\】]$", value):
+        return True
+    if len(value) <= 24 and not re.search(r"[。！？；，,.!?;:]", value):
+        return True
+    return False
 
 
-def resolve_option_value(
-    fields: List[Dict[str, Any]],
-    records: List[Dict[str, Any]],
-    field_name: str,
-    template_value: Any,
-) -> Tuple[Any, Dict[str, Any]]:
-    debug: Dict[str, Any] = {
-        "field_name": field_name,
-        "template_value": template_value,
-        "matched_label": "",
-        "matched_source": "",
-        "matched_value": None,
-        "option_labels": [],
-    }
-    if template_value in (None, "", []):
-        return template_value, debug
-    text_value = normalize_cell_text(template_value).strip()
-    if not text_value:
-        return template_value, debug
-    options = parse_field_options(field_by_name(fields, field_name), records, field_name)
-    debug["option_labels"] = [str(item.get("label") or "") for item in options]
-    for item in options:
-        if str(item.get("label") or "").strip() == text_value:
-            debug["matched_label"] = text_value
-            debug["matched_source"] = "options"
-            debug["matched_value"] = item.get("value")
-            return item.get("value"), debug
-    for record in records:
-        raw_value = (record.get("fields") or {}).get(field_name)
-        if normalize_cell_text(raw_value).strip() == text_value:
-            debug["matched_label"] = text_value
-            debug["matched_source"] = "records"
-            debug["matched_value"] = raw_value
-            return raw_value, debug
-    debug["matched_label"] = text_value
-    debug["matched_source"] = "fallback"
-    debug["matched_value"] = template_value
-    return template_value, debug
+def _is_en_heading_like(text):
+    value = str(text or "").strip()
+    if not value:
+        return False
+    if re.match(r"^\[[^\]]{1,60}\]$", value):
+        return True
+    words = value.split()
+    if len(words) <= 8 and not re.search(r"[.!?]", value):
+        return True
+    return False
 
 
-def build_table_payload(
-    fields: List[Dict[str, Any]],
-    records: List[Dict[str, Any]],
-    reference_records: Optional[List[Dict[str, Any]]] = None,
-) -> Dict[str, Any]:
-    table_columns = [
-        SYNC_FIELD_SEARCH_KEY,
-        READ_FIELD_REQUESTER,
-        READ_FIELD_DEADLINE,
-        READ_FIELD_PRIORITY,
-        READ_FIELD_CROWDIN_FLAG,
-        READ_FIELD_TASK_LINK,
-        BATCH_FIELD_ASSIGN_LOCALIZER,
-        BATCH_FIELD_REQUESTER,
-        BATCH_FIELD_MESSAGE,
-        BATCH_FIELD_CHECK_LEAD,
-        BATCH_FIELD_SEND_FLAG,
+def _fix_adjacent_heading_shift(zh_paras, en_paras):
+    if len(zh_paras) != len(en_paras):
+        return en_paras
+    fixed = list(en_paras)
+    changed = False
+    for i in range(len(fixed) - 1):
+        zh_i_heading = _is_zh_heading_like(zh_paras[i])
+        zh_j_heading = _is_zh_heading_like(zh_paras[i + 1])
+        en_i_heading = _is_en_heading_like(fixed[i])
+        en_j_heading = _is_en_heading_like(fixed[i + 1])
+        # If heading/non-heading pattern is inverted across adjacent indexes,
+        # swap once to recover from the common +1 shift.
+        if zh_i_heading == en_j_heading and zh_j_heading == en_i_heading and (en_i_heading != en_j_heading):
+            fixed[i], fixed[i + 1] = fixed[i + 1], fixed[i]
+            changed = True
+    return fixed if changed else en_paras
+
+
+def _looks_like_truncated_align_json(text):
+    value = str(text or "").strip()
+    if not value:
+        return False
+
+    starts_json_like = value.startswith("{") or value.startswith("[") or "```json" in value.lower()
+    if not starts_json_like:
+        return False
+
+    # Common truncated-response signal: unbalanced structure.
+    # Simple counting is enough here and keeps Python 3.9 compatibility.
+    return value.count("{") != value.count("}") or value.count("[") != value.count("]")
+
+
+def fill_prompt_template(template, zh_text="", en_text="", glossary_prompt="", reference_text=""):
+    safe_template = str(template or "").strip()
+    if not safe_template:
+        raise ValueError("Prompt cannot be empty")
+    try:
+        return safe_template.format(
+            zh_text=zh_text,
+            en_text=en_text,
+            glossary_terms=glossary_prompt or "(no matched glossary terms)",
+            reference_text=reference_text or "(no reference content)",
+        )
+    except KeyError as e:
+        raise ValueError(f"Unsupported prompt placeholder: {e.args[0]}") from e
+
+
+def build_single_prompt_messages(prompt_text):
+    return [
+        {"role": "user", "content": prompt_text},
     ]
-    reference_map: Dict[str, Dict[str, Any]] = {}
-    for item in reference_records or []:
-        record_id = str(item.get("recordId") or "")
-        if record_id:
-            reference_map[record_id] = item
-    rows = []
-    for record in records:
-        field_values = record.get("fields") or {}
-        reference_values = (reference_map.get(str(record.get("recordId") or "")) or {}).get("fields") or {}
-        def pick_value(field_name: str) -> Any:
-            if field_name in field_values and field_values.get(field_name) not in (None, "", []):
-                return field_values.get(field_name)
-            return reference_values.get(field_name)
-        rows.append({
-            "recordId": record.get("recordId") or "",
-            "cells": {name: normalize_cell_text(pick_value(name)) for name in table_columns},
-            "rawFields": {name: pick_value(name) for name in table_columns},
-            "summary": {
-                "title": format_display_value(SYNC_FIELD_SEARCH_KEY, pick_value(SYNC_FIELD_SEARCH_KEY)),
-                "requester": format_display_value(READ_FIELD_REQUESTER, pick_value(READ_FIELD_REQUESTER)),
-                "deadline": format_display_value(READ_FIELD_DEADLINE, pick_value(READ_FIELD_DEADLINE)),
-                "priority": format_display_value(READ_FIELD_PRIORITY, pick_value(READ_FIELD_PRIORITY)),
-                "crowdin_flag": format_display_value(READ_FIELD_CROWDIN_FLAG, pick_value(READ_FIELD_CROWDIN_FLAG)),
-                "task_link": format_display_value(READ_FIELD_TASK_LINK, pick_value(READ_FIELD_TASK_LINK)),
-                "localizer": format_display_value(BATCH_FIELD_ASSIGN_LOCALIZER, pick_value(BATCH_FIELD_ASSIGN_LOCALIZER)),
-                "owner": format_display_value(BATCH_FIELD_REQUESTER, pick_value(BATCH_FIELD_REQUESTER)),
-                "message": format_display_value(BATCH_FIELD_MESSAGE, pick_value(BATCH_FIELD_MESSAGE)),
-                "check_lead": format_display_value(BATCH_FIELD_CHECK_LEAD, pick_value(BATCH_FIELD_CHECK_LEAD)),
-                "send_flag": format_display_value(BATCH_FIELD_SEND_FLAG, pick_value(BATCH_FIELD_SEND_FLAG)),
-            },
-        })
-    meta = {}
-    for field_name in table_columns:
-        field = field_by_name(fields, field_name)
-        meta[field_name] = {
-            "type": str((field or {}).get("type") or ""),
-            "options": parse_field_options(field, records, field_name),
-        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Embedded frontend
+# ─────────────────────────────────────────────────────────────────────────────
+HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Crowdin Translation Checker</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+     background:#0d1117;color:#c9d1d9;min-height:100vh}
+
+/* ── Header ── */
+.hdr{background:#161b22;border-bottom:1px solid #30363d;padding:12px 24px;
+     display:flex;align-items:center;gap:16px;position:sticky;top:0;z-index:100}
+.hdr h1{font-size:15px;font-weight:600;color:#f0f6fc;white-space:nowrap}
+.gloss-tag{margin-left:auto;font-size:12px;padding:4px 12px;border-radius:20px;
+           background:#122d20;color:#56d364;white-space:nowrap}
+.gloss-tag.warn{background:#32100b;color:#f85149}
+.gloss-tag.loading{background:#1c2a3a;color:#8b949e}
+
+/* ── Buttons ── */
+.btn{padding:7px 16px;border-radius:6px;border:none;cursor:pointer;
+     font-size:13px;font-weight:500;transition:background .15s;white-space:nowrap}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn-blue{background:#1f6feb;color:#fff}.btn-blue:hover:not(:disabled){background:#388bfd}
+.btn-green{background:#238636;color:#fff}.btn-green:hover:not(:disabled){background:#2ea043}
+.btn-sky{background:#0969da;color:#fff}.btn-sky:hover:not(:disabled){background:#1f6feb}
+.btn-gray{background:#21262d;color:#c9d1d9;border:1px solid #30363d}
+.btn-gray:hover:not(:disabled){background:#30363d}
+.btn-sm{padding:4px 10px;font-size:11px;border-radius:5px;border:none;cursor:pointer;
+        font-weight:500;transition:background .15s;white-space:nowrap;
+        background:#21262d;color:#8b949e;border:1px solid #30363d}
+.btn-sm:hover{background:#30363d;color:#c9d1d9}
+.btn-sm.active{background:#1c2a3a;color:#79c0ff;border-color:#1f4068}
+
+/* ── Input panel ── */
+.panel{padding:16px 24px;background:#161b22;border-bottom:1px solid #30363d}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-bottom:12px}
+.field label{display:block;font-size:11px;color:#8b949e;margin-bottom:6px;
+             font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+.field label span{text-transform:none;font-weight:400;color:#484f58}
+textarea{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;
+         padding:9px 11px;color:#c9d1d9;font-size:12.5px;
+         font-family:'SFMono-Regular',Consolas,monospace;resize:vertical;
+         min-height:130px;line-height:1.6;overflow-y:auto;overflow-x:hidden}
+select{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;
+       padding:9px 11px;color:#c9d1d9;font-size:12.5px;min-height:40px}
+textarea:focus,select:focus{outline:none;border-color:#388bfd}
+.mini-grid{display:grid;grid-template-columns:1fr auto;gap:10px;margin-bottom:12px}
+.creds-grid{display:grid;grid-template-columns:1fr 1fr auto;gap:10px;margin-bottom:12px}
+.creds-tag{font-size:11px;font-weight:400;padding:2px 8px;border-radius:10px;margin-left:6px;
+           background:#122d20;color:#56d364}
+.creds-tag.warn{background:#32100b;color:#f85149}
+.mini-field input{width:100%;background:#0d1117;border:1px solid #30363d;border-radius:6px;
+                  padding:9px 11px;color:#c9d1d9;font-size:12.5px}
+.mini-field input:focus{outline:none;border-color:#388bfd}
+.mini-field label{display:block;font-size:11px;color:#8b949e;margin-bottom:6px;
+                  font-weight:600;text-transform:uppercase;letter-spacing:.5px}
+.ai-actions{display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap}
+.prompt-grid{display:grid;grid-template-columns:1.1fr 0.9fr 1fr auto;gap:10px;margin-bottom:12px}
+.prompt-field textarea{min-height:120px;font-size:12px}
+.template-toolbar{display:flex;gap:8px;align-items:end;flex-wrap:wrap;margin-bottom:12px}
+.template-toolbar .mini-field{min-width:180px;flex:1}
+.template-actions{display:flex;gap:8px;align-items:end;flex-wrap:wrap}
+.usage-box{margin-top:10px;padding:10px 12px;border:1px solid #30363d;border-radius:6px;
+           background:#0d1117;font-size:12px;color:#8b949e;display:none;line-height:1.6}
+.usage-box.on{display:block}
+.debug-box{margin-top:10px;padding:12px;border:1px solid #30363d;border-radius:6px;background:#0d1117;display:none}
+.debug-box.on{display:block}
+.debug-hdr{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:8px}
+.debug-hdr strong{font-size:12px;color:#f0f6fc;letter-spacing:.04em}
+.debug-box textarea{min-height:130px;font-size:12px}
+.row-btns{display:flex;gap:10px;align-items:center}
+.status{font-size:13px;padding:5px 12px;border-radius:6px;display:none}
+.status.info{background:#1c3557;color:#79c0ff;display:inline-block}
+.status.ok  {background:#122d20;color:#56d364;display:inline-block}
+.status.err {background:#32100b;color:#f85149;display:inline-block}
+
+/* ── Blocks wrapper ── */
+.blocks-wrap{padding:16px 24px}
+.blocks-hdr{display:flex;align-items:center;justify-content:space-between;margin-bottom:14px}
+.blocks-hdr>span{font-size:13px;color:#8b949e}
+.blocks-actions{display:flex;gap:8px}
+
+/* ── Paragraph block ── */
+.para-block{background:#161b22;border:1px solid #30363d;border-radius:8px;
+            margin-bottom:12px;overflow:hidden}
+.block-hdr{display:flex;align-items:center;gap:10px;padding:8px 14px;
+           background:#1c2128;border-bottom:1px solid #30363d;flex-wrap:wrap}
+.block-label{font-size:12px;font-weight:600;color:#8b949e;
+             background:#21262d;padding:2px 9px;border-radius:10px;white-space:nowrap}
+.block-pills{flex:1;display:flex;flex-wrap:wrap;gap:4px}
+.pill{display:inline-block;background:#1c2a3a;color:#79c0ff;padding:2px 9px;
+      border-radius:12px;font-size:11px;white-space:nowrap;border:1px solid #1f4068}
+.pill .pill-zh{color:#c9d1d9}
+.pill .pill-eq{color:#484f58;margin:0 4px}
+.no-term{color:#484f58;font-size:11px}
+.term-hit{text-decoration:underline dashed #79c0ff;
+          text-underline-offset:3px;cursor:help}
+
+/* ── Help / tutorial panel ── */
+.help-panel{background:#0d2030;border-bottom:1px solid #1f4068;padding:14px 24px;
+            font-size:12.5px;line-height:1.7;color:#8b949e;display:none}
+.help-panel.on{display:block}
+.help-panel h3{font-size:12px;color:#79c0ff;text-transform:uppercase;
+               letter-spacing:.6px;font-weight:600;margin-bottom:8px}
+.help-panel ol{margin-left:20px;color:#b0b8c0}
+.help-panel ol li{margin-bottom:4px}
+.help-panel code{background:#161b22;padding:1px 6px;border-radius:4px;
+                 font-family:'SFMono-Regular',Consolas,monospace;font-size:11.5px;
+                 color:#79c0ff}
+.help-toggle{background:#21262d;color:#8b949e;border:1px solid #30363d;
+             border-radius:50%;width:26px;height:26px;cursor:pointer;
+             font-size:13px;font-weight:600;line-height:1;padding:0}
+.help-toggle:hover{background:#30363d;color:#c9d1d9}
+.help-toggle.active{background:#1c2a3a;color:#79c0ff;border-color:#1f4068}
+
+/* ── Merge / unmerge buttons ── */
+.btn-merge{padding:4px 10px;font-size:11px;border-radius:5px;border:1px solid #1f4068;
+           background:#0d2030;color:#79c0ff;cursor:pointer;font-weight:500;
+           white-space:nowrap;transition:background .15s}
+.btn-merge:hover:not(:disabled){background:#1c2a3a}
+.btn-merge:disabled{opacity:.3;cursor:not-allowed}
+
+/* ── Paragraph divider inside a merged group ── */
+.para-divider{padding:5px 14px;color:#79c0ff;font-size:10.5px;
+              background:#0d2030;border-top:1px solid #1f4068;
+              border-bottom:1px solid #1f4068;letter-spacing:.4px;
+              font-weight:500}
+.para-block.is-merged{border-color:#1f4068}
+.para-block.is-merged .block-hdr{background:#0d2030}
+
+/* ── Sentence rows inside a block ── */
+.block-body{width:100%}
+.sent-row{display:grid;grid-template-columns:38px 1fr 1fr;border-bottom:1px solid #21262d}
+.sent-row:last-child{border-bottom:none}
+.sent-row:hover{background:#1c2128}
+.sent-num{display:flex;align-items:flex-start;justify-content:center;
+          padding:10px 4px;color:#484f58;font-size:11px;font-weight:600;
+          border-right:1px solid #21262d;min-width:38px}
+.sent-zh{padding:10px 12px;font-size:13px;line-height:1.8;color:#c9d1d9;
+         border-right:1px solid #21262d;word-break:break-all}
+.sent-en{padding:8px 10px}
+.sent-en textarea{width:100%;background:transparent;border:1px solid transparent;
+                  border-radius:4px;padding:4px 8px;color:#c9d1d9;font-size:13px;
+                  font-family:'SFMono-Regular',Consolas,monospace;resize:none;
+                  line-height:1.8;overflow:hidden;min-height:32px;display:block}
+.sent-en textarea:hover{border-color:#30363d;background:#0d1117}
+.sent-en textarea:focus{border-color:#388bfd;background:#0d1117;outline:none}
+.en-preview{margin-top:6px;padding:6px 8px;border:1px dashed #30363d;border-radius:4px;
+            background:#11161d;color:#8b949e;font-size:12px;line-height:1.7;word-break:break-word}
+.en-preview-line{margin:0;cursor:pointer;border-radius:4px;padding:4px 6px}
+.en-preview-line:hover{background:#1a222d}
+.en-preview-line + .en-preview-line{margin-top:6px;padding-top:6px;border-top:1px dashed #30363d}
+.diff-new{color:#ff6b6b;font-weight:600}
+.diff-old{color:#56d364;font-weight:600}
+
+/* ── Combined view (per block) ── */
+.combined-view{display:none;padding:0}
+.combined-body{display:grid;grid-template-columns:1fr 1fr}
+.combined-zh{padding:12px 14px;font-size:13px;line-height:1.9;color:#c9d1d9;
+             border-right:1px solid #21262d;word-break:break-all}
+.sent-sep{display:block;color:#484f58;font-size:11px;margin:4px 0 2px}
+.combined-en{padding:10px 12px}
+.combined-en textarea{width:100%;background:#0d1117;border:1px solid #30363d;
+                      border-radius:6px;padding:10px 12px;color:#c9d1d9;
+                      font-size:13px;font-family:'SFMono-Regular',Consolas,monospace;
+                      resize:none;line-height:1.9;overflow:hidden;display:block}
+.combined-en textarea:focus{border-color:#388bfd;outline:none}
+.combined-en .en-preview{margin-top:10px}
+
+/* ── Preview modal ── */
+.overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.82);
+         z-index:200;overflow-y:auto;padding:24px 16px}
+.overlay.on{display:flex;justify-content:center;align-items:flex-start}
+.modal{background:#161b22;border:1px solid #30363d;border-radius:12px;
+       width:100%;max-width:980px;margin:auto}
+.modal-hdr{padding:14px 20px;border-bottom:1px solid #30363d;
+           display:flex;align-items:center;justify-content:space-between}
+.modal-hdr h2{font-size:15px;font-weight:600;color:#f0f6fc}
+.close-btn{background:none;border:none;color:#8b949e;font-size:22px;
+           cursor:pointer;line-height:1;padding:0 4px}
+.close-btn:hover{color:#c9d1d9}
+.modal-body{padding:20px}
+.preview-grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.preview-col h3{font-size:11px;color:#8b949e;text-transform:uppercase;
+                letter-spacing:.5px;margin-bottom:10px;font-weight:600}
+.preview-box{background:#0d1117;border:1px solid #30363d;border-radius:8px;
+             padding:14px 16px;font-size:13px;line-height:1.9;
+             max-height:62vh;overflow-y:auto;word-break:break-word}
+.pv-para{margin-bottom:12px;padding-bottom:12px;border-bottom:1px solid #21262d}
+.pv-para:last-child{border-bottom:none;margin-bottom:0}
+.modal-ftr{padding:14px 20px;border-top:1px solid #30363d;
+           display:flex;gap:10px;justify-content:flex-end}
+
+/* ── Toast ── */
+.toast{position:fixed;bottom:22px;right:22px;background:#238636;color:#fff;
+       padding:10px 20px;border-radius:8px;font-size:13px;z-index:999;
+       display:none;box-shadow:0 4px 14px rgba(0,0,0,.5)}
+.toast.on{display:block;animation:slideUp .2s ease}
+@keyframes slideUp{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+</style>
+</head>
+<body>
+
+<!-- ── Header ── -->
+<div class="hdr">
+  <h1>🎮 Crowdin Translation Checker</h1>
+  <button class="help-toggle" id="helpToggle" onclick="toggleHelp()" title="Show / hide instructions">?</button>
+  <div class="gloss-tag loading" id="glossTag">Loading glossary…</div>
+</div>
+
+<!-- ── Help / tutorial panel ── -->
+<div class="help-panel" id="helpPanel">
+  <h3>How to use</h3>
+  <ol>
+    <li>Paste the <strong>Chinese source</strong> on the left. The <strong>English draft</strong> on the right is <em>optional</em> &mdash; paste one to review/edit, or leave it empty to translate from scratch directly in the table below.</li>
+    <li>Use the literal token <code>\n</code> to separate paragraphs &mdash; in both inputs when present, ideally one-to-one. If the English side has fewer (or no) <code>\n</code>, the output will follow the Chinese source's <code>\n</code> structure.</li>
+    <li>Click <strong>Build Table</strong>. Each paragraph becomes a row that you can edit sentence by sentence, or toggle <strong>Merge view</strong> to edit a whole paragraph at once.</li>
+    <li>Glossary hits are shown as <code>中文 = English</code> pills above each block; matched substrings in the source get a <span class="term-hit">dashed underline</span> (hover for the English term).</li>
+    <li><strong>⬇ Merge next</strong> visually combines two adjacent blocks so you can review related paragraphs side by side. <em>This is view-only</em> &mdash; the copied output is unaffected. Press <strong>↑ Unmerge</strong> on a merged block to split it back apart.</li>
+    <li><strong>Preview</strong> renders edits live: color codes like <code>[E7594C]…[-]</code> become colored text, and any literal <code>\n</code> you type inside an edit area becomes a real line break. Both are preserved verbatim in the copied output.</li>
+    <li>Click <strong>Copy</strong> &mdash; the result always preserves the <em>exact</em> <code>\n</code> structure of your English draft (e.g. <code>\n\n</code> stays <code>\n\n</code>), no matter how you merge / unmerge. Nothing is auto-added.</li>
+  </ol>
+</div>
+
+<!-- ── Input panel ── -->
+<div class="panel">
+  <div class="mini-grid">
+    <div class="mini-field">
+      <label>Model</label>
+      <select id="aiModelKey" onchange="saveAiConfig({silent:true})">
+        <optgroup label="── 最高质量 ──">
+          <option value="claude_opus_46">Claude Opus</option>
+          <option value="claude_sonnet_46">Claude Sonnet</option>
+          <option value="gpt_5">GPT-5</option>
+        </optgroup>
+        <optgroup label="── 深度推理 ──">
+          <option value="deepseek_reasoner">DeepSeek 推理链</option>
+        </optgroup>
+        <optgroup label="── 均衡 ──">
+          <option value="gemini_31_flash_image">Gemini Flash（默认）</option>
+          <option value="gpt_4o">GPT-4o</option>
+          <option value="gpt_41">GPT-4.1</option>
+          <option value="deepseek_v3_1">DeepSeek V3</option>
+          <option value="gemini_15_pro">Gemini Pro</option>
+          <option value="grok_3">Grok 3</option>
+        </optgroup>
+        <optgroup label="── 快速 ──">
+          <option value="gpt_4o_mini">GPT-4o Mini</option>
+          <option value="gemini_20_flash_lite">Gemini Flash Lite</option>
+          <option value="deepseek_chat">DeepSeek 快速版</option>
+        </optgroup>
+      </select>
+    </div>
+    <div class="ai-actions">
+      <button class="btn btn-gray" onclick="saveAiConfig()">💾 Save</button>
+    </div>
+  </div>
+  <div class="creds-grid">
+    <div class="mini-field">
+      <label>OA 账号 <span id="credsTag" class="creds-tag warn">未配置</span></label>
+      <input id="credsAccount" type="text" placeholder="邮箱 @ 前的用户名，如 zhangsan">
+    </div>
+    <div class="mini-field">
+      <label>密码</label>
+      <input id="credsPassword" type="password" placeholder="OA 密码">
+    </div>
+    <div class="ai-actions">
+      <button class="btn btn-gray" onclick="saveCreds()">🔑 保存账密</button>
+    </div>
+  </div>
+  <div class="template-toolbar">
+    <div class="mini-field">
+      <label>Translate Template</label>
+      <select id="translateTemplateSelect" onchange="onTemplateChange()"></select>
+    </div>
+    <div class="mini-field">
+      <label>Reference</label>
+      <select id="referenceSelect" onchange="onReferenceChange()"></select>
+    </div>
+    <div class="mini-field">
+      <label>Template Name</label>
+      <input id="templateName" type="text" placeholder="Template name">
+    </div>
+    <div class="template-actions">
+      <button class="btn btn-gray" onclick="newTemplate()">New Template</button>
+      <button class="btn btn-gray" onclick="deleteTemplate()">Delete Template</button>
+    </div>
+  </div>
+  <div class="prompt-grid">
+    <div class="prompt-field">
+      <label>Translate Prompt</label>
+      <textarea id="translatePrompt"
+        placeholder="Use {zh_text} / {glossary_terms} / {reference_text} placeholders"></textarea>
+    </div>
+    <div class="prompt-field">
+      <label>Check Prompt</label>
+      <textarea id="checkPrompt"
+        placeholder="Use {zh_text} / {en_text} / {glossary_terms}"></textarea>
+    </div>
+    <div class="prompt-field">
+      <label>Align Prompt</label>
+      <textarea id="alignPrompt"
+        placeholder="Use {zh_text} / {en_text} / {glossary_terms}"></textarea>
+    </div>
+    <div class="ai-actions">
+      <button class="btn btn-gray" onclick="saveAiConfig()">💾 Save Prompts</button>
+    </div>
+  </div>
+  <div class="grid2">
+    <div class="field">
+      <label>Chinese Source <span>(use \n to separate paragraphs; supports [RRGGBB]…[-] color codes)</span></label>
+      <textarea id="zh"
+        placeholder="Paste Chinese source, e.g.&#10;各位市民即将可以选择离开本城市。但为了维护本城秩序，请遵守规定。\n[E7594C]请注意！[-]活动期间请保持冷静。"></textarea>
+    </div>
+    <div class="field">
+      <label>English Draft <span>(optional — leave empty to translate from scratch; use \n to separate paragraphs, should match the Chinese 1:1)</span></label>
+      <textarea id="en"
+        placeholder="Optional. Paste an existing English draft to review, or leave empty and fill it in below.&#10;e.g. Citizens will soon be able to leave the city.\n[E7594C]Please note![-] Stay calm during the event."></textarea>
+    </div>
+  </div>
+  <div class="row-btns">
+    <button class="btn btn-blue" onclick="buildBlocks()">📊 Build Table</button>
+    <button class="btn btn-sky" onclick="runAiAlign()">🧩 AI Align</button>
+    <button class="btn btn-sky" onclick="runAiTranslate()">🤖 AI Translate</button>
+    <button class="btn btn-gray" onclick="runAiCheck()">🩺 AI Check</button>
+    <div class="status" id="status"></div>
+  </div>
+  <div class="usage-box" id="usageBox"></div>
+  <div class="debug-box" id="debugBox">
+    <div class="debug-hdr">
+      <strong>AI RAW OUTPUT</strong>
+      <button class="btn btn-gray" onclick="copyRawOutput()">Copy Raw Output</button>
+    </div>
+    <textarea id="debugRawOutput" readonly placeholder="The model's raw response will appear here when available."></textarea>
+  </div>
+</div>
+
+<!-- ── Paragraph blocks ── -->
+<div class="blocks-wrap" id="blocksWrap" style="display:none">
+  <div class="blocks-hdr">
+    <span><strong id="cnt" style="color:#f0f6fc">0</strong> paragraph(s)</span>
+    <div class="blocks-actions">
+      <button class="btn btn-sky" onclick="showPreview()">👁 Preview</button>
+      <button class="btn btn-green" onclick="doCopy()">📋 Copy Final Result</button>
+    </div>
+  </div>
+  <div id="blocks"></div>
+</div>
+
+<!-- ── Preview modal ── -->
+<div class="overlay" id="overlay">
+  <div class="modal">
+    <div class="modal-hdr">
+      <h2>Preview &mdash; Colors &amp; Paragraph Layout</h2>
+      <button class="close-btn" onclick="closePreview()">×</button>
+    </div>
+    <div class="modal-body">
+      <div class="preview-grid">
+        <div class="preview-col">
+          <h3>Chinese Source</h3>
+          <div class="preview-box" id="pvZh"></div>
+        </div>
+        <div class="preview-col">
+          <h3>English (current edit)</h3>
+          <div class="preview-box" id="pvEn"></div>
+        </div>
+      </div>
+    </div>
+    <div class="modal-ftr">
+      <button class="btn btn-gray" onclick="closePreview()">Close</button>
+      <button class="btn btn-green" onclick="confirmAndCopy()">✓ Confirm &amp; Copy to Clipboard</button>
+    </div>
+  </div>
+</div>
+
+<!-- ── Toast ── -->
+<div class="toast" id="toast">✓ Copied! Paste back into Crowdin.</div>
+
+<script>
+// ── State ──────────────────────────────────────────────────────────────────
+let glossary = [];
+
+// IMMUTABLE after buildBlocks() — these define the original input structure and
+// the final output structure. Merge / unmerge NEVER touches them.
+//   paras[i]  = { zhFull, enFull, zhSentences, enSentences }
+//   zhSeps[i] / enSeps[i] = literal-\n separator string between paras[i] / paras[i+1]
+let paras = [], zhSeps = [], enSeps = [];
+
+// MUTABLE view-layer state. Each group is a visual block on screen.
+// Merging adjacent groups concatenates their paraIdxs; unmerging splits back.
+//   groups[gi] = { paraIdxs: number[], combined: boolean }
+// Initial state: groups.length === paras.length, each holds one paragraph.
+let groups = [];
+let aiBusy = false;
+let aiConfig = {};
+let referenceFiles = [];
+let enSuggestionRaw = null;
+let manualAlignUsed = false;
+let lastRawOutput = '';
+const clientId = 'client-' + Math.random().toString(36).slice(2) + '-' + Date.now();
+let heartbeatTimer = null;
+
+// ── Help toggle ─────────────────────────────────────────────────────────────
+function toggleHelp() {
+  document.getElementById('helpPanel').classList.toggle('on');
+  document.getElementById('helpToggle').classList.toggle('active');
+}
+
+// ── Load glossary ───────────────────────────────────────────────────────────
+window.addEventListener('load', async () => {
+  const tag = document.getElementById('glossTag');
+  try {
+    const res  = await fetch('/api/glossary');
+    const data = await res.json();
+    if (data.error) {
+      tag.textContent = '⚠ ' + data.error;
+      tag.className = 'gloss-tag warn';
+    } else {
+      glossary = data.terms;
+      tag.textContent = '✓ Glossary: ' + glossary.length + ' terms';
+      tag.className = 'gloss-tag';
+    }
+  } catch (e) {
+    tag.textContent = '⚠ Failed to load glossary';
+    tag.className = 'gloss-tag warn';
+  }
+
+  try {
+    const res = await fetch('/api/ai/config');
+    const data = await res.json();
+    if (!data.error) {
+      aiConfig = data;
+      document.getElementById('aiModelKey').value = data.model_key || 'claude_opus_46';
+      document.getElementById('checkPrompt').value = data.check_prompt || '';
+      document.getElementById('alignPrompt').value = data.align_prompt || '';
+      await loadReferences();
+      renderTemplateSelect();
+      syncTemplateEditor();
+    }
+  } catch (e) {
+    // Local-only config; ignore load failures and keep defaults in the UI.
+  }
+
+  try {
+    const res = await fetch('/api/ai/creds');
+    const data = await res.json();
+    updateCredsTag(data);
+  } catch (e) {}
+});
+
+function updateCredsTag(data) {
+  const tag = document.getElementById('credsTag');
+  if (data && data.configured) {
+    tag.textContent = '✓ ' + data.account;
+    tag.className = 'creds-tag';
+  } else {
+    tag.textContent = '未配置';
+    tag.className = 'creds-tag warn';
+  }
+}
+
+async function saveCreds() {
+  const account = document.getElementById('credsAccount').value.trim();
+  const password = document.getElementById('credsPassword').value.trim();
+  if (!account || !password) { alert('账号和密码不能为空'); return; }
+  try {
+    setAiBusy(true, '保存账密中…');
+    const res = await fetch('/api/ai/creds', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ account, password })
+    });
+    const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || '保存失败');
+    updateCredsTag({ configured: true, account: data.account });
+    document.getElementById('credsPassword').value = '';
+    setStatus('账密已保存 ✓', 'ok');
+  } catch (e) {
+    setStatus(String(e.message || e), 'err');
+  } finally {
+    setAiBusy(false);
+  }
+}
+
+async function postJson(url, payload, keepalive = false) {
+  const res = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+    keepalive
+  });
+  return res;
+}
+
+async function registerClient() {
+  try {
+    await postJson('/api/client/open', { client_id: clientId });
+  } catch (e) {
+    // Ignore lifecycle registration failures; the tool can still function.
+  }
+  heartbeatTimer = setInterval(async () => {
+    try {
+      await postJson('/api/client/ping', { client_id: clientId });
+    } catch (e) {
+      // Ignore transient ping failures.
+    }
+  }, 15000);
+}
+
+function closeClientSession() {
+  const body = JSON.stringify({ client_id: clientId });
+  try {
+    if (navigator.sendBeacon) {
+      navigator.sendBeacon('/api/client/close', new Blob([body], { type: 'application/json' }));
+      return;
+    }
+  } catch (e) {
+    // Fall through to fetch keepalive.
+  }
+  fetch('/api/client/close', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body,
+    keepalive: true
+  }).catch(() => {});
+}
+
+window.addEventListener('load', registerClient);
+window.addEventListener('pagehide', closeClientSession);
+window.addEventListener('beforeunload', closeClientSession);
+
+// ── Helpers ─────────────────────────────────────────────────────────────────
+function colorize(text) {
+  return text.replace(/\[([0-9A-Fa-f]{6})\]([\s\S]*?)\[-\]/g,
+    (_, hex, body) => '<span style="color:#' + hex + '">' + body + '</span>');
+}
+
+function esc(s) {
+  return String(s)
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+// Convert literal "\n" (backslash + n, two chars) typed by the user inside an
+// edit textarea into a real <br> for rendered HTML output. Safe to apply AFTER
+// esc()/highlightTerms() because neither emits nor escapes a backslash, so the
+// only "\n" sequences left in the html are the user's own.
+function nlToBr(html) {
+  return html.replace(/\\n/g, '<br>');
+}
+
+function autoH(ta) {
+  ta.style.height = 'auto';
+  ta.style.height = (ta.scrollHeight + 2) + 'px';
+}
+
+function setStatus(msg, type) {
+  const el = document.getElementById('status');
+  el.textContent = msg;
+  el.className = 'status ' + type;
+}
+
+function setUsageMeta(meta) {
+  const box = document.getElementById('usageBox');
+  if (!meta) {
+    box.className = 'usage-box';
+    box.textContent = '';
+    return;
+  }
+  const inputTokens = Number(meta.input_tokens || 0);
+  const outputTokens = Number(meta.output_tokens || 0);
+  const totalTokens = Number(meta.total_tokens || (inputTokens + outputTokens));
+  const cost = meta.estimated_cost_usd;
+  const costText = (typeof cost === 'number' && !Number.isNaN(cost))
+    ? `$${cost.toFixed(6)}`
+    : 'unavailable';
+  box.textContent =
+    `Model: ${meta.model || '-'} | Input: ${inputTokens} | Output: ${outputTokens} | Total: ${totalTokens} | Estimated cost: ${costText}`;
+  box.className = 'usage-box on';
+}
+
+function setRawOutput(rawText) {
+  lastRawOutput = String(rawText || '');
+  const box = document.getElementById('debugBox');
+  const ta = document.getElementById('debugRawOutput');
+  ta.value = lastRawOutput;
+  box.className = lastRawOutput ? 'debug-box on' : 'debug-box';
+}
+
+async function copyRawOutput() {
+  if (!lastRawOutput) return;
+  try {
+    await navigator.clipboard.writeText(lastRawOutput);
+  } catch (e) {
+    const ta = document.getElementById('debugRawOutput');
+    ta.focus();
+    ta.select();
+    document.execCommand('copy');
+  }
+}
+
+function mergeUsageMeta(firstMeta, secondMeta) {
+  if (!firstMeta && !secondMeta) return null;
+  if (!firstMeta) return secondMeta;
+  if (!secondMeta) return firstMeta;
+  const inputTokens = Number(firstMeta.input_tokens || 0) + Number(secondMeta.input_tokens || 0);
+  const outputTokens = Number(firstMeta.output_tokens || 0) + Number(secondMeta.output_tokens || 0);
+  const totalTokens = Number(firstMeta.total_tokens || 0) + Number(secondMeta.total_tokens || 0);
+  const firstCost = typeof firstMeta.estimated_cost_usd === 'number' ? firstMeta.estimated_cost_usd : null;
+  const secondCost = typeof secondMeta.estimated_cost_usd === 'number' ? secondMeta.estimated_cost_usd : null;
+  return {
+    model: secondMeta.model || firstMeta.model || '',
+    input_tokens: inputTokens,
+    output_tokens: outputTokens,
+    total_tokens: totalTokens,
+    estimated_cost_usd: firstCost !== null && secondCost !== null ? firstCost + secondCost : null
+  };
+}
+
+function currentTemplates() {
+  return Array.isArray(aiConfig.translate_templates) ? aiConfig.translate_templates : [];
+}
+
+function currentTemplateId() {
+  return aiConfig.selected_translate_template_id || (currentTemplates()[0] && currentTemplates()[0].id) || '';
+}
+
+function currentTemplate() {
+  return currentTemplates().find(t => t.id === currentTemplateId()) || currentTemplates()[0] || null;
+}
+
+function renderTemplateSelect() {
+  const select = document.getElementById('translateTemplateSelect');
+  const templateId = currentTemplateId();
+  select.innerHTML = currentTemplates().map(t =>
+    `<option value="${esc(t.id)}"${t.id === templateId ? ' selected' : ''}>${esc(t.name)}</option>`
+  ).join('');
+}
+
+function renderReferenceSelect(selectedValue) {
+  const select = document.getElementById('referenceSelect');
+  const options = ['<option value="">(No reference)</option>'];
+  referenceFiles.forEach(name => {
+    const selected = name === selectedValue ? ' selected' : '';
+    options.push(`<option value="${esc(name)}"${selected}>${esc(name)}</option>`);
+  });
+  select.innerHTML = options.join('');
+}
+
+function syncTemplateEditor() {
+  const tpl = currentTemplate();
+  if (!tpl) return;
+  document.getElementById('templateName').value = tpl.name || '';
+  document.getElementById('translatePrompt').value = tpl.prompt || '';
+  renderReferenceSelect(tpl.reference_file || '');
+}
+
+async function loadReferences() {
+  const res = await fetch('/api/references');
+  const data = await res.json();
+  referenceFiles = Array.isArray(data.files) ? data.files : [];
+}
+
+function getAiConfigPayload() {
+  const tpl = currentTemplate();
+  return {
+    model_key: document.getElementById('aiModelKey').value,
+    translate_prompt: tpl ? (document.getElementById('translatePrompt').value || tpl.prompt || '') : document.getElementById('translatePrompt').value,
+    check_prompt: document.getElementById('checkPrompt').value,
+    align_prompt: document.getElementById('alignPrompt').value,
+    translate_templates: serializeTemplates(),
+    selected_translate_template_id: currentTemplateId()
+  };
+}
+
+function serializeTemplates() {
+  const selectedId = currentTemplateId();
+  return currentTemplates().map(t => {
+    if (t.id !== selectedId) return t;
     return {
-        "columns": table_columns,
-        "rows": rows,
-        "meta": meta,
+      ...t,
+      name: document.getElementById('templateName').value.trim() || t.name,
+      prompt: document.getElementById('translatePrompt').value,
+      reference_file: document.getElementById('referenceSelect').value
+    };
+  });
+}
+
+function onTemplateChange() {
+  aiConfig.translate_templates = serializeTemplates();
+  aiConfig.selected_translate_template_id = document.getElementById('translateTemplateSelect').value;
+  syncTemplateEditor();
+  setUsageMeta(null);
+}
+
+function onReferenceChange() {
+  const tpl = currentTemplate();
+  if (tpl) tpl.reference_file = document.getElementById('referenceSelect').value;
+}
+
+function newTemplate() {
+  aiConfig.translate_templates = serializeTemplates();
+  const id = 'template_' + Date.now();
+  const template = {
+    id,
+    name: 'New Template',
+    prompt: document.getElementById('translatePrompt').value || '',
+    reference_file: document.getElementById('referenceSelect').value || ''
+  };
+  aiConfig.translate_templates = [...currentTemplates(), template];
+  aiConfig.selected_translate_template_id = id;
+  renderTemplateSelect();
+  syncTemplateEditor();
+}
+
+function deleteTemplate() {
+  aiConfig.translate_templates = serializeTemplates();
+  const templates = currentTemplates();
+  if (templates.length <= 1) {
+    alert('At least one translate template must remain.');
+    return;
+  }
+  const targetId = currentTemplateId();
+  aiConfig.translate_templates = templates.filter(t => t.id !== targetId);
+  aiConfig.selected_translate_template_id = aiConfig.translate_templates[0].id;
+  renderTemplateSelect();
+  syncTemplateEditor();
+}
+
+function setAiBusy(busy, message) {
+  aiBusy = busy;
+  document.querySelectorAll('button').forEach(btn => {
+    if (btn.onclick || btn.getAttribute('onclick')) btn.disabled = busy;
+  });
+  if (busy && message) setStatus(message, 'info');
+}
+
+function findTerms(zhText) {
+  return glossary.filter(({zh}) => zhText.includes(zh));
+}
+
+async function saveAiConfig({ silent = false } = {}) {
+  try {
+    if (!silent) setAiBusy(true, 'Saving AI settings...');
+    const res = await fetch('/api/ai/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(getAiConfigPayload())
+    });
+    const data = await res.json();
+    if (!res.ok || data.error) throw new Error(data.error || 'Failed to save AI settings');
+    aiConfig = data;
+    renderTemplateSelect();
+    syncTemplateEditor();
+    setUsageMeta(null);
+    if (!silent) setStatus('AI settings saved ✓', 'ok');
+  } catch (e) {
+    setStatus(String(e.message || e), 'err');
+  } finally {
+    if (!silent) setAiBusy(false);
+  }
+}
+
+async function fetchAiAlignSuggestion(zh, enText) {
+  const res = await fetch('/api/ai/align', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      ...getAiConfigPayload(),
+      zh_text: zh,
+      en_text: enText
+    })
+  });
+  const data = await res.json();
+  setRawOutput(data.raw_output || '');
+  if (!res.ok || data.error) throw new Error(data.error || 'AI align failed');
+  return data;
+}
+
+async function runAiAlign() {
+  const zh = document.getElementById('zh').value.trim();
+  const en = document.getElementById('en').value.trim();
+  if (!zh) { alert('Please paste the Chinese source first.'); return; }
+  if (!en) { alert('Please paste or generate the English draft first.'); return; }
+
+  try {
+    manualAlignUsed = true;
+    setAiBusy(true, 'AI aligning...');
+    const data = await fetchAiAlignSuggestion(zh, en);
+    enSuggestionRaw = data.result || '';
+    setUsageMeta(data.usage || null);
+    setRawOutput(data.raw_output || '');
+    buildBlocks(enSuggestionRaw);
+    setStatus('AI align completed ✓', 'ok');
+  } catch (e) {
+    setStatus(String(e.message || e), 'err');
+  } finally {
+    setAiBusy(false);
+  }
+}
+
+async function runAiTranslate() {
+  const zh = document.getElementById('zh').value.trim();
+  const en = document.getElementById('en').value.trim();
+  if (!zh) { alert('Please paste the Chinese source first.'); return; }
+
+  try {
+    setAiBusy(true, 'AI translating...');
+    const res = await fetch('/api/ai/translate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...getAiConfigPayload(),
+        zh_text: zh
+      })
+    });
+    const data = await res.json();
+    setRawOutput(data.raw_output || '');
+    if (!res.ok || data.error) throw new Error(data.error || 'AI translate failed');
+    let suggestion = data.result || '';
+    let usageMeta = data.usage || null;
+    if (!manualAlignUsed && suggestion) {
+      setStatus('AI translating... auto aligning suggestion...', 'info');
+      const aligned = await fetchAiAlignSuggestion(zh, suggestion);
+      suggestion = aligned.result || suggestion;
+      usageMeta = mergeUsageMeta(usageMeta, aligned.usage || null);
     }
+    enSuggestionRaw = suggestion;
+    setUsageMeta(usageMeta);
+    buildBlocks(enSuggestionRaw);
+    setStatus('AI translation completed ✓', 'ok');
+  } catch (e) {
+    setStatus(String(e.message || e), 'err');
+  } finally {
+    setAiBusy(false);
+  }
+}
 
+async function runAiCheck() {
+  const zh = document.getElementById('zh').value.trim();
+  const en = document.getElementById('en').value.trim();
+  if (!zh) { alert('Please paste the Chinese source first.'); return; }
+  if (!en) { alert('Please paste or generate the English draft first.'); return; }
 
-def normalize_record_fields_for_write(
-    fields: List[Dict[str, Any]],
-    records: List[Dict[str, Any]],
-    values: Dict[str, Any],
-) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-    type_map = {str(field.get("name") or ""): str(field.get("type") or "") for field in fields}
-    debug_info: Dict[str, Any] = {"field_debug": {}}
-    normalized: Dict[str, Any] = {}
-
-    for field_name, raw_value in values.items():
-        field_type = type_map.get(field_name, "")
-        debug_info["field_debug"].setdefault(field_name, {})
-        debug_info["field_debug"][field_name]["field_type"] = field_type
-        if field_type == "Checkbox":
-            normalized[field_name] = bool(raw_value)
-            continue
-        if field_type in ("Number", "Currency", "Percent", "Rating", "AutoNumber"):
-            try:
-                if raw_value in (None, ""):
-                    normalized[field_name] = None
-                else:
-                    normalized[field_name] = float(str(raw_value))
-            except Exception:
-                normalized[field_name] = raw_value
-            continue
-        if field_type == "SingleSelect":
-            resolved, field_debug = resolve_option_value(fields, records, field_name, raw_value)
-            debug_info["field_debug"][field_name] = field_debug
-            debug_info["field_debug"][field_name]["field_type"] = field_type
-            normalized[field_name] = str(field_debug.get("matched_label") or normalize_cell_text(raw_value) or normalize_cell_text(resolved))
-            continue
-        if field_type == "MultiSelect":
-            resolved, field_debug = resolve_option_value(fields, records, field_name, raw_value)
-            debug_info["field_debug"][field_name] = field_debug
-            debug_info["field_debug"][field_name]["field_type"] = field_type
-            labels: List[str] = []
-            if isinstance(raw_value, list):
-                labels = [normalize_cell_text(item).strip() for item in raw_value if normalize_cell_text(item).strip()]
-            else:
-                label = str(field_debug.get("matched_label") or normalize_cell_text(raw_value) or normalize_cell_text(resolved)).strip()
-                if label:
-                    labels = [label]
-            normalized[field_name] = labels
-            continue
-        if field_type in ("Member", "CreatedBy", "LastModifiedBy"):
-            resolved, field_debug = resolve_option_value(fields, records, field_name, raw_value)
-            debug_info["field_debug"][field_name] = field_debug
-            debug_info["field_debug"][field_name]["field_type"] = field_type
-            normalized[field_name] = resolved
-            continue
-        if isinstance(raw_value, (dict, list)):
-            normalized[field_name] = normalize_cell_text(raw_value)
-            continue
-        normalized[field_name] = raw_value
-
-    return normalized, debug_info
-
-
-def apply_batch_template_to_record(
-    api_key: str,
-    base_url: str,
-    datasheet_id: str,
-    view_id: str,
-    record_id: str,
-    fields: List[Dict[str, Any]],
-    records: List[Dict[str, Any]],
-    template: Dict[str, Any],
-) -> Dict[str, Any]:
-    type_map = {str(field.get("name") or ""): str(field.get("type") or "") for field in fields}
-    debug_info: Dict[str, Any] = {"field_debug": {}, "retry_payloads": []}
-
-    def candidate_values(field_name: str, display_value: Any, resolved_value: Any) -> List[Any]:
-        field_type = type_map.get(field_name, "")
-        candidates: List[Any] = []
-
-        def push(v: Any) -> None:
-            if v in (None, ""):
-                return
-            for existing in candidates:
-                if existing == v:
-                    return
-            candidates.append(v)
-
-        push(resolved_value)
-        push(display_value)
-        if field_type == "Member":
-            if isinstance(resolved_value, dict):
-                push([resolved_value])
-                if resolved_value.get("id"):
-                    push({"id": resolved_value.get("id"), "type": "Member"})
-                    push([{"id": resolved_value.get("id"), "type": "Member"}])
-                    push(str(resolved_value.get("id")))
-            elif isinstance(display_value, str):
-                push(display_value)
-        if field_type == "SingleSelect":
-            candidates = []
-            if isinstance(display_value, str):
-                candidates.append(display_value)
-            if isinstance(resolved_value, dict):
-                if resolved_value.get("name"):
-                    candidates.append(resolved_value.get("name"))
-                if resolved_value.get("id"):
-                    candidates.append(resolved_value.get("id"))
-            for item in candidates:
-                push(item)
-        return candidates
-
-    def record_field_matches(field_name: str, expected_display: Any) -> bool:
-        latest_records = fetch_aitable_records(api_key, base_url, datasheet_id, view_id)
-        latest = None
-        for item in latest_records:
-            if str(item.get("recordId") or "") == record_id:
-                latest = item
-                break
-        if not latest:
-            return False
-        actual = normalize_cell_text((latest.get("fields") or {}).get(field_name)).strip()
-        expected = normalize_cell_text(expected_display).strip()
-        return bool(expected) and actual == expected
-
-    immediate_fields, normalize_debug = normalize_record_fields_for_write(
-        fields,
-        records,
-        {
-            BATCH_FIELD_ASSIGN_LOCALIZER: template.get("assign_localizer"),
-            BATCH_FIELD_REQUESTER: template.get("requester"),
-            BATCH_FIELD_MESSAGE: template.get("message", ""),
-            BATCH_FIELD_CHECK_LEAD: template.get("check_lead", "30"),
-        },
-    )
-    debug_info["field_debug"].update(normalize_debug.get("field_debug") or {})
-    update_record_comment(
-        api_key,
-        base_url,
-        datasheet_id,
-        view_id,
-        record_id,
-        "__batch__",
-        immediate_fields,
-    )
-
-    for field_name in (BATCH_FIELD_ASSIGN_LOCALIZER, BATCH_FIELD_REQUESTER):
-        display_value = template.get("assign_localizer") if field_name == BATCH_FIELD_ASSIGN_LOCALIZER else template.get("requester")
-        if record_field_matches(field_name, display_value):
-            continue
-        resolved_value = immediate_fields.get(field_name)
-        for candidate in candidate_values(field_name, display_value, resolved_value):
-            debug_info["retry_payloads"].append({"field": field_name, "candidate": candidate})
-            update_record_comment(
-                api_key,
-                base_url,
-                datasheet_id,
-                view_id,
-                record_id,
-                "__batch__",
-                {field_name: candidate},
-            )
-            if record_field_matches(field_name, display_value):
-                break
-
-    time.sleep(3)
-    update_record_comment(
-        api_key,
-        base_url,
-        datasheet_id,
-        view_id,
-        record_id,
-        "__batch__",
-        normalize_record_fields_for_write(
-            fields,
-            records,
-            {BATCH_FIELD_SEND_FLAG: template.get("send_flag", False)},
-        )[0],
-    )
-    return debug_info
-
-
-def write_fields_with_retry(
-    api_key: str,
-    base_url: str,
-    datasheet_id: str,
-    view_id: str,
-    record_id: str,
-    fields: List[Dict[str, Any]],
-    records: List[Dict[str, Any]],
-    input_values: Dict[str, Any],
-) -> Dict[str, Any]:
-    type_map = {str(field.get("name") or ""): str(field.get("type") or "") for field in fields}
-    normalized_fields, normalize_debug = normalize_record_fields_for_write(fields, records, input_values)
-    debug_info: Dict[str, Any] = {
-        "field_debug": normalize_debug.get("field_debug") or {},
-        "retry_payloads": [],
-        "final_payload": dict(normalized_fields),
+  try {
+    setAiBusy(true, 'AI checking...');
+    const res = await fetch('/api/ai/check', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        ...getAiConfigPayload(),
+        zh_text: zh,
+        en_text: en
+      })
+    });
+    const data = await res.json();
+    setRawOutput(data.raw_output || '');
+    if (!res.ok || data.error) throw new Error(data.error || 'AI check failed');
+    let suggestion = data.result || '';
+    let usageMeta = data.usage || null;
+    if (!manualAlignUsed && suggestion) {
+      setStatus('AI checking... auto aligning suggestion...', 'info');
+      const aligned = await fetchAiAlignSuggestion(zh, suggestion);
+      suggestion = aligned.result || suggestion;
+      usageMeta = mergeUsageMeta(usageMeta, aligned.usage || null);
     }
+    enSuggestionRaw = suggestion;
+    setUsageMeta(usageMeta);
+    buildBlocks(enSuggestionRaw);
+    setStatus('AI check completed ✓', 'ok');
+  } catch (e) {
+    setStatus(String(e.message || e), 'err');
+  } finally {
+    setAiBusy(false);
+  }
+}
 
-    def field_matches(field_name: str, expected_display: Any) -> bool:
-        latest_records = fetch_aitable_records(api_key, base_url, datasheet_id, view_id)
-        latest = None
-        for item in latest_records:
-            if str(item.get("recordId") or "") == record_id:
-                latest = item
-                break
-        if not latest:
-            return False
-        actual = normalize_cell_text((latest.get("fields") or {}).get(field_name)).strip()
-        expected = normalize_cell_text(expected_display).strip()
-        if expected.lower() in ("true", "false"):
-            return actual.lower() == expected.lower()
-        return bool(expected) and actual == expected
+// Wrap matched glossary terms in <span class="term-hit"> while escaping HTML.
+// Operates on raw text so we can safely interleave escaped chunks with markup.
+// Longer terms win when overlapping (e.g. "首领部队" beats "首领").
+function highlightTerms(rawText, terms) {
+  if (!terms || !terms.length) return esc(rawText);
 
-    def candidate_values(field_name: str, display_value: Any, resolved_value: Any) -> List[Any]:
-        field_type = type_map.get(field_name, "")
-        candidates: List[Any] = []
-
-        def push(v: Any) -> None:
-            if v in (None, ""):
-                return
-            for existing in candidates:
-                if existing == v:
-                    return
-            candidates.append(v)
-
-        push(resolved_value)
-        push(display_value)
-        if field_type == "SingleSelect":
-            if isinstance(resolved_value, dict):
-                push(resolved_value.get("name"))
-                push(resolved_value.get("id"))
-        if field_type == "MultiSelect":
-            if isinstance(display_value, list):
-                push(display_value)
-            elif isinstance(display_value, str):
-                push([display_value])
-                push(display_value)
-            if isinstance(resolved_value, list):
-                push(resolved_value)
-            elif isinstance(resolved_value, str):
-                push([resolved_value])
-        if field_type in ("Member", "CreatedBy", "LastModifiedBy") and isinstance(resolved_value, dict):
-            push([resolved_value])
-            if resolved_value.get("id"):
-                push({"id": resolved_value.get("id"), "type": "Member"})
-                push([{"id": resolved_value.get("id"), "type": "Member"}])
-                push(str(resolved_value.get("id")))
-        return candidates
-
-    if normalized_fields:
-        update_record_comment(
-            api_key,
-            base_url,
-            datasheet_id,
-            view_id,
-            record_id,
-            "__batch__",
-            normalized_fields,
-        )
-
-    for field_name, display_value in input_values.items():
-        if not field_matches(field_name, display_value):
-            resolved_value = normalized_fields.get(field_name)
-            for candidate in candidate_values(field_name, display_value, resolved_value):
-                debug_info["retry_payloads"].append({"field": field_name, "candidate": candidate})
-                update_record_comment(
-                    api_key,
-                    base_url,
-                    datasheet_id,
-                    view_id,
-                    record_id,
-                    "__batch__",
-                    {field_name: candidate},
-                )
-                if field_matches(field_name, display_value):
-                    break
-
-    verification: Dict[str, bool] = {}
-    for field_name, display_value in input_values.items():
-        verification[field_name] = field_matches(field_name, display_value)
-    debug_info["verification"] = verification
-    return debug_info
-
-
-def normalize_cell_text(value: Any) -> str:
-    if value is None:
-        return ""
-    if isinstance(value, list):
-        parts = [normalize_cell_text(item) for item in value]
-        return " ".join([part for part in parts if part]).strip()
-    if isinstance(value, dict):
-        for key in ("name", "label", "title", "text"):
-            if value.get(key) not in (None, ""):
-                return normalize_cell_text(value.get(key))
-        if value.get("type") == "Member" and value.get("id") not in (None, ""):
-            return str(value.get("id"))
-        if "text" in value:
-            return normalize_cell_text(value.get("text"))
-        return json.dumps(value, ensure_ascii=False)
-    return str(value)
-
-
-def format_display_value(field_name: str, value: Any) -> str:
-    text = normalize_cell_text(value).strip()
-    if not text:
-        return ""
-    if field_name == READ_FIELD_DEADLINE and re.fullmatch(r"\d{12,14}", text):
-        try:
-            ts = int(text)
-            if ts > 10_000_000_000:
-                ts = ts / 1000
-            dt = time.localtime(ts)
-            return time.strftime("%Y/%m/%d %H:%M", dt)
-        except Exception:
-            return text
-    return text
-
-
-def find_target_record(records: List[Dict[str, Any]], search_column: str, keyword: str) -> Dict[str, Any]:
-    search = keyword.strip().lower()
-    if not search:
-        raise RuntimeError("APITable 搜索关键词不能为空")
-    matched: List[Dict[str, Any]] = []
-    exact: List[Dict[str, Any]] = []
-    for record in records:
-        fields = record.get("fields") or {}
-        value = normalize_cell_text(fields.get(search_column)).strip()
-        lowered = value.lower()
-        if not lowered:
-            continue
-        if search in lowered:
-            matched.append(record)
-        if lowered == search:
-            exact.append(record)
-    if len(exact) == 1:
-        return exact[0]
-    if len(matched) == 1:
-        return matched[0]
-    if not matched:
-        raise LookupError(f"APITable 中未找到包含关键词“{keyword}”的记录")
-    sample = []
-    for record in matched[:5]:
-        fields = record.get("fields") or {}
-        sample.append(normalize_cell_text(fields.get(search_column))[:60])
-    raise RuntimeError(
-        f"APITable 匹配到 {len(matched)} 行，请缩小关键词。示例: {' | '.join(sample)}"
-    )
-
-
-def update_record_comment(
-    api_key: str,
-    base_url: str,
-    datasheet_id: str,
-    view_id: str,
-    record_id: str,
-    comment_column: str,
-    comment_value: Any,
-) -> None:
-    query = urllib.parse.urlencode({"viewId": view_id})
-    url = f"{base_url}/datasheets/{datasheet_id}/records?{query}"
-    body = {
-        "records": [
-            {
-                "recordId": record_id,
-                "fields": comment_value if comment_column == "__batch__" else {comment_column: comment_value},
-            }
-        ],
-        "fieldKey": "name",
+  const sorted = [...terms].sort((a, b) => b.zh.length - a.zh.length);
+  const matches = [];
+  for (const t of sorted) {
+    let idx = 0;
+    while ((idx = rawText.indexOf(t.zh, idx)) !== -1) {
+      const start = idx, end = idx + t.zh.length;
+      const overlaps = matches.some(m => start < m.end && end > m.start);
+      if (!overlaps) matches.push({ start, end, term: t });
+      idx = end;
     }
-    status, text = call_aitable("PATCH", url, api_key, body)
-    if status >= 400:
-        raise RuntimeError(f"写入 APITable 失败 HTTP {status}: {text[:300]}")
+  }
+  matches.sort((a, b) => a.start - b.start);
 
+  let html = '', cursor = 0;
+  for (const m of matches) {
+    html += esc(rawText.slice(cursor, m.start));
+    html += '<span class="term-hit" title="' + esc(m.term.en) + '">'
+         +  esc(rawText.slice(m.start, m.end))
+         +  '</span>';
+    cursor = m.end;
+  }
+  html += esc(rawText.slice(cursor));
+  return html;
+}
 
-def new_job(payload: Dict[str, Any]) -> Dict[str, Any]:
-    job_id = uuid.uuid4().hex
-    job = {
-        "id": job_id,
-        "status": "pending",
-        "message": "任务已创建",
-        "logs": [],
-        "result": {},
-        "error_code": "",
-        "created_at": int(time.time() * 1000),
-        "payload": payload,
+// Render ZH text with term highlighting + literal \n -> <br> + color codes.
+// Pipeline order matters: highlightTerms wraps escaped chunks, nlToBr converts
+// any user-typed \n inside the body, and colorize finally wraps [RRGGBB]…[-].
+function renderZh(text) {
+  return colorize(nlToBr(highlightTerms(text, findTerms(text))));
+}
+
+function renderEn(text) {
+  return colorize(nlToBr(esc(text || '')));
+}
+
+function diffSegments(oldText, newText) {
+  const oldStr = String(oldText || '');
+  const newStr = String(newText || '');
+  if (oldStr === newStr) {
+    return {
+      changed: false,
+      oldPrefix: oldStr,
+      oldMid: '',
+      oldSuffix: '',
+      newPrefix: newStr,
+      newMid: '',
+      newSuffix: ''
+    };
+  }
+
+  let prefix = 0;
+  const maxPrefix = Math.min(oldStr.length, newStr.length);
+  while (prefix < maxPrefix && oldStr[prefix] === newStr[prefix]) prefix++;
+
+  let oldSuffixIdx = oldStr.length - 1;
+  let newSuffixIdx = newStr.length - 1;
+  while (
+    oldSuffixIdx >= prefix &&
+    newSuffixIdx >= prefix &&
+    oldStr[oldSuffixIdx] === newStr[newSuffixIdx]
+  ) {
+    oldSuffixIdx--;
+    newSuffixIdx--;
+  }
+
+  return {
+    changed: true,
+    oldPrefix: oldStr.slice(0, prefix),
+    oldMid: oldStr.slice(prefix, oldSuffixIdx + 1),
+    oldSuffix: oldStr.slice(oldSuffixIdx + 1),
+    newPrefix: newStr.slice(0, prefix),
+    newMid: newStr.slice(prefix, newSuffixIdx + 1),
+    newSuffix: newStr.slice(newSuffixIdx + 1)
+  };
+}
+
+function renderDiffPreview(originalText, suggestedText) {
+  const diff = diffSegments(originalText, suggestedText);
+  if (!diff.changed) return '';
+
+  const newLine = renderEn(diff.newPrefix)
+    + (diff.newMid ? `<span class="diff-new">${renderEn(diff.newMid)}</span>` : '')
+    + renderEn(diff.newSuffix);
+  const oldLine = renderEn(diff.oldPrefix)
+    + (diff.oldMid ? `<span class="diff-old">${renderEn(diff.oldMid)}</span>` : '')
+    + renderEn(diff.oldSuffix);
+
+  return `<div class="en-preview-line" data-apply="suggested">${newLine}</div><div class="en-preview-line" data-apply="original">${oldLine}</div>`;
+}
+
+// Mask [RRGGBB]...[‐] spans so their internal punctuation doesn't trigger splits.
+// Returns masked string (same length, placeholder chars).
+function maskColors(text) {
+  return text.replace(/\[[0-9A-Fa-f]{6}\][\s\S]*?\[-\]/g,
+    m => '\x01'.repeat(m.length));
+}
+
+// Split ZH paragraph into sentences, keeping [color]...[‐] spans atomic.
+// Terminators: 。！？
+function splitZhSentences(text) {
+  if (!text.trim()) return [text];
+  const masked = maskColors(text);
+  const parts = [];
+  // \x01 is NOT a terminator; runs of it stay with surrounding text
+  const re = /[^。！？]+[。！？]*/g;
+  let m;
+  while ((m = re.exec(masked)) !== null) {
+    const slice = text.slice(m.index, m.index + m[0].length).trim();
+    if (slice) parts.push(slice);
+  }
+  return parts.length ? parts : [text.trim()];
+}
+
+// Split EN paragraph into sentences.
+// Only split at .!? that is followed by whitespace + an uppercase letter.
+// This avoids false splits on decimals (0.1%), abbreviations, color codes, etc.
+//
+// Two-pass strategy:
+//   1) Split on the standard "<.!?> + whitespace + UPPERCASE" boundary.
+//   2) Re-glue tiny list-marker fragments (e.g. "1.", "2.", "i.", "I.") onto
+//      the next sentence so "1. During the event..." stays as one sentence
+//      instead of becoming ["1.", "During the event..."].
+function splitEnSentences(text) {
+  if (!text.trim()) return [text];
+  const masked = maskColors(text);
+  const pieces = masked.split(/(?<=[.!?])\s+(?=[A-Z])/);
+  const raw = [];
+  let cursor = 0;
+  for (const piece of pieces) {
+    const trimmedMasked = piece.trim();
+    if (!trimmedMasked) {
+      cursor += piece.length;
+      continue;
     }
-    STATE["jobs"][job_id] = job
-    return job
+    const start = masked.indexOf(trimmedMasked, cursor);
+    const original = text.slice(start, start + trimmedMasked.length).trim();
+    raw.push(original);
+    cursor = start + trimmedMasked.length;
+  }
+  const isListMarker = s => /^[0-9]{1,3}\.$/.test(s) || /^[ivxIVX]{1,4}\.$/.test(s);
+
+  const out = [];
+  let pending = '';
+  for (const p of raw) {
+    if (isListMarker(p)) {
+      pending = pending ? pending + ' ' + p : p;
+    } else {
+      out.push(pending ? pending + ' ' + p : p);
+      pending = '';
+    }
+  }
+  if (pending) out.push(pending);
+  return out;
+}
+
+// Parse raw Crowdin input into non-empty paragraphs PLUS the exact \n separator
+// between each adjacent pair. Splitting on literal \n yields tokens; runs of empty
+// tokens in between encode multi-\n separators (e.g. "A\n\nB" -> ["A","","B"] = sep "\n\n").
+// Returns { paras: string[], seps: string[] } where seps.length === paras.length - 1.
+function parseRawWithSeps(raw) {
+  const tokens = raw.split('\\n');
+  const out = [], seps = [];
+  let pendingEmpty = 0;
+  for (const tok of tokens) {
+    const trimmed = tok.trim();
+    if (trimmed) {
+      if (out.length > 0) {
+        // Separator = (1 boundary \n) + (one extra \n per empty token in between)
+        seps.push('\\n'.repeat(1 + pendingEmpty));
+      }
+      out.push(trimmed);
+      pendingEmpty = 0;
+    } else {
+      pendingEmpty++;
+    }
+  }
+  return { paras: out, seps };
+}
+
+// ── Build blocks ─────────────────────────────────────────────────────────────
+function buildBlocks(suggestionRaw = null) {
+  const zhRaw = document.getElementById('zh').value.trim();
+  const enRaw = document.getElementById('en').value.trim();
+  if (!zhRaw) { alert('Please paste the Chinese source.'); return; }
+  // English draft is OPTIONAL — leave it empty to translate from scratch using
+  // the table's per-sentence textareas.
+
+  const zh = parseRawWithSeps(zhRaw);
+  const en = parseRawWithSeps(enRaw);
+  const suggested = parseRawWithSeps(suggestionRaw !== null ? String(suggestionRaw) : '');
+  const n  = Math.max(zh.paras.length, en.paras.length);
+
+  paras = [];
+  for (let i = 0; i < n; i++) {
+    const zhFull = zh.paras[i] || '';
+    const enFull = en.paras[i] || '';
+    const enSuggested = suggested.paras[i] || '';
+    paras.push({
+      zhFull,
+      enFull,
+      enSuggested,
+      zhSentences: splitZhSentences(zhFull),
+      enSentences: splitEnSentences(enFull),
+      enSuggestedSentences: splitEnSentences(enSuggested)
+    });
+  }
+
+  // Fill separators for the n-1 gaps. EN can be partial / empty; when no EN
+  // separator is available, fall back to the ZH separator so the eventual
+  // copied output mirrors the source's \n structure rather than collapsing it.
+  zhSeps = [];
+  enSeps = [];
+  for (let i = 0; i < n - 1; i++) {
+    const zSep = zh.seps[i] !== undefined ? zh.seps[i] : '\\n';
+    const eSep = en.seps[i] !== undefined ? en.seps[i] : zSep;
+    zhSeps.push(zSep);
+    enSeps.push(eSep);
+  }
+
+  // Reset view-layer: every paragraph starts as its own group
+  groups = paras.map((_, i) => ({ paraIdxs: [i], combined: false }));
+
+  document.getElementById('cnt').textContent = n;
+
+  // Show wrapper BEFORE renderBlocks so textareas have non-zero scrollHeight
+  // when autoH measures them (otherwise heights collapse to min-height = 1 line
+  // and long EN content gets clipped by overflow:hidden).
+  const wrap = document.getElementById('blocksWrap');
+  wrap.style.display = 'block';
+  renderBlocks();
+  wrap.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  setStatus('Built ' + n + ' paragraph(s) ✓', 'ok');
+}
+
+// VIEW-LAYER ONLY. Merge group `gi` with group `gi+1` so they render as one
+// visual block. Original paras/seps are untouched -> Copy & Preview output the
+// EXACT \n structure of the user's draft regardless of how many merges happen.
+function mergeWithNext(gi) {
+  if (gi < 0 || gi >= groups.length - 1) return;
+  groups[gi].paraIdxs = [...groups[gi].paraIdxs, ...groups[gi + 1].paraIdxs];
+  groups[gi].combined = false; // combined-view doesn't make sense for merged groups
+  groups.splice(gi + 1, 1);
+  renderBlocks();
+  const labels = groups[gi].paraIdxs.map(i => i + 1).join(' + ');
+  setStatus('View-merged paragraphs ' + labels + ' ✓ (output unchanged)', 'ok');
+}
+
+// VIEW-LAYER ONLY. Split a multi-paragraph group back into individual groups.
+function unmergeGroup(gi) {
+  if (gi < 0 || gi >= groups.length) return;
+  const g = groups[gi];
+  if (g.paraIdxs.length < 2) return;
+  const expanded = g.paraIdxs.map(idx => ({ paraIdxs: [idx], combined: false }));
+  groups.splice(gi, 1, ...expanded);
+  renderBlocks();
+  setStatus('Unmerged ✓', 'ok');
+}
+
+function renderBlocks() {
+  const container = document.getElementById('blocks');
+  container.innerHTML = '';
+  groups.forEach((g, gi) => container.appendChild(makeBlock(g, gi)));
+  // rAF ensures layout has settled before reading scrollHeight
+  requestAnimationFrame(() => {
+    container.querySelectorAll('textarea').forEach(autoH);
+    container.querySelectorAll('textarea[data-sent]').forEach(syncSentencePreview);
+    container.querySelectorAll('textarea[data-combined]').forEach(syncCombinedPreview);
+  });
+}
+
+// Render one visual block per group. A group with N paragraphs renders all N
+// paragraphs' sentences sequentially with a divider between them.
+function makeBlock(g, gi) {
+  const isMulti = g.paraIdxs.length > 1;
+  const isLast  = (gi === groups.length - 1);
+
+  // ── Aggregate glossary hits across all paragraphs in this group (deduped)
+  const seen  = new Set();
+  const terms = [];
+  for (const pIdx of g.paraIdxs) {
+    for (const t of findTerms(paras[pIdx].zhFull)) {
+      const key = t.zh + '\x01' + t.en;
+      if (!seen.has(key)) { seen.add(key); terms.push(t); }
+    }
+  }
+  const termHtml = terms.length
+    ? terms.map(t =>
+        '<span class="pill">'
+      +   '<span class="pill-zh">' + esc(t.zh) + '</span>'
+      +   '<span class="pill-eq">=</span>'
+      +   esc(t.en)
+      + '</span>'
+      ).join('')
+    : '<span class="no-term">no glossary hits</span>';
+
+  // ── Sentence rows. Walk every paragraph in the group; insert a divider
+  //    before each paragraph after the first so users can still see the
+  //    original boundary. Each textarea is bound to its ORIGINAL paragraph
+  //    index via data-para so edits are attributed correctly even after merge.
+  let sentRows = '';
+  let rowNum   = 0;
+  g.paraIdxs.forEach((pIdx, idxInGroup) => {
+    const p = paras[pIdx];
+    if (idxInGroup > 0) {
+      sentRows += `<div class="para-divider">— Paragraph ${pIdx + 1} —</div>`;
+    }
+    const rowCount = Math.max(p.zhSentences.length, p.enSentences.length, 1);
+    for (let si = 0; si < rowCount; si++) {
+      rowNum++;
+      const zhVal = p.zhSentences[si] !== undefined ? p.zhSentences[si] : '';
+      const enVal = p.enSentences[si] !== undefined ? p.enSentences[si] : '';
+      const enSuggestedVal = p.enSuggestedSentences[si] !== undefined ? p.enSuggestedSentences[si] : '';
+      sentRows += `<div class="sent-row">
+        <div class="sent-num">${rowNum}</div>
+        <div class="sent-zh">${zhVal ? renderZh(zhVal) : ''}</div>
+        <div class="sent-en"><textarea
+          data-para="${pIdx}" data-sent="${si}"
+          data-original="${esc(enVal)}"
+          data-suggested="${esc(enSuggestedVal)}"
+          oninput="autoH(this);syncCombined(${gi});syncSentencePreview(this)">${esc(enVal)}</textarea>
+          <div class="en-preview"></div></div>
+      </div>`;
+    }
+  });
+
+  // ── Combined view (works for both single and merged groups). Sentence-level
+  //    textareas always exist in the DOM (just hidden behind combined view) and
+  //    keep their data-para attribution, so syncSentences distributes re-split
+  //    sentences back into the correct ORIGINAL paragraphs by DOM order.
+  const zhSentencesAll = g.paraIdxs.flatMap(pIdx => paras[pIdx].zhSentences);
+  const zhCombined = zhSentencesAll.length > 1
+    ? zhSentencesAll.map((s, si) =>
+        (si > 0 ? '<span class="sent-sep"> </span>' : '') + renderZh(s)
+      ).join('')
+    : renderZh(zhSentencesAll[0] || '');
+  const enJoined = g.paraIdxs.map(pIdx => paras[pIdx].enFull).filter(Boolean).join(' ');
+  const enSuggestedJoined = g.paraIdxs.map(pIdx => paras[pIdx].enSuggested).filter(Boolean).join(' ');
+  const combinedHtml = `
+    <div class="combined-view" id="body-comb-${gi}">
+      <div class="combined-body">
+        <div class="combined-zh">${zhCombined}</div>
+        <div class="combined-en">
+          <textarea data-combined="1"
+            data-original="${esc(enJoined)}"
+            data-suggested="${esc(enSuggestedJoined)}"
+            oninput="autoH(this);syncSentences(${gi});syncCombinedPreview(this)">${esc(enJoined)}</textarea>
+          <div class="en-preview"></div>
+        </div>
+      </div>
+    </div>`;
+
+  // ── Header: label + pills + buttons
+  const labelText = isMulti
+    ? 'Paragraphs ' + g.paraIdxs.map(i => i + 1).join(' + ')
+    : 'Paragraph ' + (g.paraIdxs[0] + 1);
+  const unmergeBtn = isMulti
+    ? `<button class="btn-merge" onclick="unmergeGroup(${gi})"
+         title="Split this merged group back into individual paragraphs">↑ Unmerge</button>`
+    : '';
+  const mergeBtn = `<button class="btn-merge" onclick="mergeWithNext(${gi})" ${isLast ? 'disabled' : ''}
+       title="Merge with next block (view-only — does not change the copied output)">⬇ Merge next</button>`;
+  const toggleBtn = `<button class="btn-sm" id="toggle-${gi}" onclick="toggleBlock(${gi})">Merge view ▾</button>`;
+
+  const div = document.createElement('div');
+  div.className = 'para-block' + (isMulti ? ' is-merged' : '');
+  div.id = 'block-' + gi;
+  div.innerHTML = `
+    <div class="block-hdr">
+      <span class="block-label">${labelText}</span>
+      <div class="block-pills">${termHtml}</div>
+      ${unmergeBtn}
+      ${mergeBtn}
+      ${toggleBtn}
+    </div>
+    <div class="block-body" id="body-sent-${gi}">${sentRows}</div>
+    ${combinedHtml}`;
+
+  return div;
+}
+
+// ── Toggle a group between sentence-level rows and a single combined textarea.
+//    Works for both single-paragraph and merged groups; in merged groups the
+//    combined textarea spans all paragraphs and on edit-commit the resulting
+//    sentences flow back into the correct ORIGINAL paragraphs by DOM order
+//    (each sent-row textarea preserves its data-para attribution).
+function toggleBlock(gi) {
+  const g = groups[gi];
+  if (!g) return;
+  g.combined = !g.combined;
+
+  const sentView = document.getElementById('body-sent-' + gi);
+  const combView = document.getElementById('body-comb-' + gi);
+  const btn      = document.getElementById('toggle-' + gi);
+
+  if (g.combined) {
+    const sentTas = sentView.querySelectorAll('textarea');
+    const joined  = Array.from(sentTas).map(ta => ta.value).filter(Boolean).join(' ');
+    const combTa  = combView.querySelector('textarea');
+    combTa.value  = joined;
+    syncCombinedPreview(combTa);
+    sentView.style.display = 'none';
+    combView.style.display = 'block';
+    btn.textContent = 'Split view ▴';
+    btn.classList.add('active');
+    autoH(combTa);
+  } else {
+    const combTa  = combView.querySelector('textarea');
+    const reSplit = splitEnSentences(combTa.value);
+    const sentTas = sentView.querySelectorAll('textarea');
+    sentTas.forEach((ta, si) => {
+      ta.value = reSplit[si] !== undefined ? reSplit[si] : '';
+      syncSentencePreview(ta);
+    });
+    sentView.style.display = 'block';
+    combView.style.display = 'none';
+    btn.textContent = 'Merge view ▾';
+    btn.classList.remove('active');
+    sentTas.forEach(autoH);
+  }
+}
+
+// Sync combined textarea when a sentence textarea changes (single-para groups).
+function syncCombined(gi) {
+  const combTa = document.querySelector('#body-comb-' + gi + ' textarea');
+  if (!combTa) return; // multi-para groups have no combined view
+  const sentTas = document.querySelectorAll('#body-sent-' + gi + ' textarea');
+  combTa.value = Array.from(sentTas).map(ta => ta.value).filter(Boolean).join(' ');
+  autoH(combTa);
+  syncCombinedPreview(combTa);
+}
+
+// Re-split combined EN into sentence rows when combined textarea changes.
+function syncSentences(gi) {
+  const combTa  = document.querySelector('#body-comb-' + gi + ' textarea');
+  if (!combTa) return;
+  const reSplit = splitEnSentences(combTa.value);
+  const sentTas = document.querySelectorAll('#body-sent-' + gi + ' textarea');
+  sentTas.forEach((ta, si) => {
+    ta.value = reSplit[si] !== undefined ? reSplit[si] : '';
+    autoH(ta);
+    syncSentencePreview(ta);
+  });
+}
+
+function syncSentencePreview(ta) {
+  const preview = ta.parentElement.querySelector('.en-preview');
+  if (!preview) return;
+  preview.innerHTML = renderDiffPreview(ta.dataset.original || '', ta.dataset.suggested || '');
+  preview.style.display = preview.innerHTML ? 'block' : 'none';
+  if (preview.innerHTML) {
+    preview.querySelectorAll('.en-preview-line').forEach(line => {
+      line.onclick = () => applyPreviewChoice(ta, line.dataset.apply);
+    });
+  }
+}
+
+function syncCombinedPreview(ta) {
+  const preview = ta.parentElement.querySelector('.en-preview');
+  if (!preview) return;
+  preview.innerHTML = renderDiffPreview(ta.dataset.original || '', ta.dataset.suggested || '');
+  preview.style.display = preview.innerHTML ? 'block' : 'none';
+  if (preview.innerHTML) {
+    preview.querySelectorAll('.en-preview-line').forEach(line => {
+      line.onclick = () => applyPreviewChoice(ta, line.dataset.apply);
+    });
+  }
+}
+
+function applyPreviewChoice(ta, applyType) {
+  if (applyType === 'suggested') {
+    ta.value = ta.dataset.suggested || '';
+  } else {
+    ta.value = ta.dataset.original || '';
+  }
+  autoH(ta);
+  if (ta.dataset.combined) {
+    const gi = Number((ta.closest('.combined-view') || {}).id?.replace('body-comb-', ''));
+    if (!Number.isNaN(gi)) syncSentences(gi);
+    syncCombinedPreview(ta);
+  } else {
+    const block = ta.closest('.para-block');
+    const gi = Number((block || {}).id?.replace('block-', ''));
+    if (!Number.isNaN(gi)) syncCombined(gi);
+    syncSentencePreview(ta);
+  }
+}
+
+// ── Collect final EN for ORIGINAL paragraph index `pIdx`, regardless of which
+//    group currently displays it. Sentence-level textareas are always present
+//    in the DOM (even when hidden behind combined view) and are kept in sync
+//    by syncSentences, so they are the single source of truth.
+function getParaEN(pIdx) {
+  const tas = document.querySelectorAll(
+    'textarea[data-para="' + pIdx + '"][data-sent]'
+  );
+  return Array.from(tas).map(ta => ta.value).filter(Boolean).join(' ');
+}
+
+// ── Preview modal ────────────────────────────────────────────────────────────
+// Always renders the ORIGINAL paragraph structure with the EXACT \n separators
+// from the user's draft. Merge / unmerge are pure view-layer operations and
+// have NO effect here.
+function showPreview() {
+  if (!paras.length) { alert('Please build the table first.'); return; }
+
+  const nlCount = sep => (sep.match(/\\n/g) || []).length;
+
+  let zhHtml = '';
+  let enHtml = '';
+  paras.forEach((p, i) => {
+    zhHtml += renderZh(p.zhFull);
+    // EN side may contain user-typed color codes [RRGGBB]…[-] AND literal \n.
+    // Pipeline: esc -> nlToBr -> colorize so all three get rendered live.
+    enHtml += renderEn(getParaEN(i));
+    if (i < paras.length - 1) {
+      zhHtml += '<br>'.repeat(nlCount(zhSeps[i]));
+      enHtml += '<br>'.repeat(nlCount(enSeps[i]));
+    }
+  });
+  document.getElementById('pvZh').innerHTML = zhHtml;
+  document.getElementById('pvEn').innerHTML = enHtml;
+
+  document.getElementById('overlay').classList.add('on');
+}
+
+function closePreview() {
+  document.getElementById('overlay').classList.remove('on');
+}
+
+document.getElementById('overlay').addEventListener('click', e => {
+  if (e.target === document.getElementById('overlay')) closePreview();
+});
+
+// ── Copy: rebuild the result using the ORIGINAL paragraph list and the EXACT
+//         \n separators captured from the user's draft. Merge / unmerge are
+//         purely visual and never touch this output. Nothing is auto-inserted.
+async function doCopy() {
+  let result = '';
+  paras.forEach((_, i) => {
+    result += getParaEN(i);
+    if (i < paras.length - 1) result += enSeps[i];
+  });
+
+  try {
+    await navigator.clipboard.writeText(result);
+  } catch {
+    const ta = document.createElement('textarea');
+    ta.value = result;
+    ta.style.cssText = 'position:fixed;opacity:0;top:0;left:0';
+    document.body.appendChild(ta);
+    ta.focus(); ta.select();
+    document.execCommand('copy');
+    document.body.removeChild(ta);
+  }
+  const toast = document.getElementById('toast');
+  toast.classList.add('on');
+  setTimeout(() => toast.classList.remove('on'), 3000);
+}
+
+function confirmAndCopy() { doCopy(); closePreview(); }
+</script>
+</body>
+</html>"""
 
 
-def append_job_log(job: Dict[str, Any], text: str) -> None:
-    job["logs"].append(text)
-    job["message"] = text
+# ─────────────────────────────────────────────────────────────────────────────
+# HTTP request handler
+# ─────────────────────────────────────────────────────────────────────────────
+class Handler(http.server.BaseHTTPRequestHandler):
 
+    def log_message(self, fmt, *args):
+        pass
 
-def run_sync_job(job: Dict[str, Any]) -> None:
-    payload = job["payload"]
-    job["status"] = "running"
-    try:
-        crowdin_token = payload["crowdin_token"].strip()
-        apitable_api_key = payload["apitable_api_key"].strip()
-        current_user = payload.get("current_user", "").strip()
-        sync_note = payload.get("sync_note", "")
-        file_name = payload["file_name"].strip()
-        crowdin_folder = payload["crowdin_folder"].strip()
-        extra_path_keyword = payload["extra_path_keyword"].strip()
-        extra_keyword = payload["extra_keyword"].strip()
-        search_keyword = file_name
-        search_column = (
-            payload["apitable_search_column"].strip()
-            or "翻译需求（当日日期+翻译需求名字+需求人）"
-        )
-        comment_column = (
-            payload["apitable_comment_column"].strip()
-            or "完成版附件"
-        )
-
-        append_job_log(job, "1/6 正在定位 Crowdin 项目…")
-        project = find_crowdin_project(crowdin_token)
-        project_id = get_resource_id(project)
-
-        append_job_log(job, "2/6 正在读取 Crowdin 文件清单…")
-        files = crowdin_api_get_all(crowdin_token, f"/projects/{project_id}/files", params={"recursion": "true"})
-
-        append_job_log(job, "3/6 正在匹配目标文件…")
-        try:
-            matched_file = pick_crowdin_file(
-                files,
-                file_name=file_name,
-                crowdin_folder=crowdin_folder,
-                extra_path_keyword=extra_path_keyword,
-                extra_keyword=extra_keyword,
-            )
-        except LookupError as exc:
-            job["error_code"] = "crowdin_not_found"
-            raise RuntimeError(str(exc)) from exc
-        matched_file_path = get_resource_path(matched_file) or get_resource_name(matched_file)
-        append_job_log(job, f"已匹配文件: {matched_file_path}")
-
-        append_job_log(job, "4/6 正在导出 en-US 翻译…")
-        export_result = export_crowdin_translation(crowdin_token, project_id, get_resource_id(matched_file))
-        data = export_result.get("data") or {}
-        download_url = str(data.get("url") or "").strip()
-        if not download_url:
-            raise RuntimeError(f"Crowdin 未返回下载链接: {json.dumps(export_result, ensure_ascii=False)[:500]}")
-        raw_translation = http_bytes(download_url)
-        attachment_name = os.path.basename(matched_file_path.replace("\\", "/")) or f"{file_name}.bin"
-        if zipfile.is_zipfile(io.BytesIO(raw_translation)):
-            append_job_log(job, "Crowdin 返回的是压缩包类型，正在提取可读文本…")
-        else:
-            append_job_log(job, "Crowdin 返回的是文本类型，正在整理内容…")
-        try:
-            translation_text = extract_translation_text(raw_translation, matched_file_path).strip()
-        except Exception as exc:
-            translation_text = ""
-            append_job_log(job, f"未提取到可读预览，将继续上传原文件: {exc}")
-
-        append_job_log(job, "5/6 正在读取 APITable 视图数据…")
-        base_url = get_apitable_base_url()
-        datasheet_id = APITABLE_DATASHEET_ID
-        view_id = APITABLE_WRITE_VIEW_ID
-        base_origin = base_url.rsplit("/fusion/v1", 1)[0]
-        fields = fetch_aitable_fields(apitable_api_key, base_url, datasheet_id, view_id)
-        field_names = {str(field.get("name") or "") for field in fields}
-        if search_column not in field_names:
-            raise RuntimeError(f"APITable 中未找到搜索列: {search_column}")
-        if comment_column not in field_names:
-            raise RuntimeError(f"APITable 中未找到写入列: {comment_column}")
-        records = fetch_aitable_records(apitable_api_key, base_url, datasheet_id, view_id)
-        record = find_target_record(records, search_column, search_keyword)
-        record_id = str(record.get("recordId") or "")
-        if not record_id:
-            raise RuntimeError("匹配记录缺少 recordId")
-
-        checker_field_payload = {}
-        if SYNC_FIELD_CHECKER in field_names and current_user:
-            checker_field_payload[SYNC_FIELD_CHECKER] = current_user
-        if checker_field_payload:
-            append_job_log(job, "6/6 先写入检查者…")
-            checker_write_debug = write_fields_with_retry(
-                apitable_api_key,
-                base_url,
-                datasheet_id,
-                view_id,
-                record_id,
-                fields,
-                records,
-                checker_field_payload,
-            )
-            append_job_log(job, f"已写入检查者: {json.dumps(checker_write_debug.get('final_payload') or {}, ensure_ascii=False)}")
-            if checker_write_debug.get("field_debug"):
-                append_job_log(job, f"检查者字段映射: {json.dumps(checker_write_debug['field_debug'], ensure_ascii=False)}")
-            if checker_write_debug.get("retry_payloads"):
-                append_job_log(job, f"检查者重试: {json.dumps(checker_write_debug['retry_payloads'], ensure_ascii=False)}")
-            if checker_write_debug.get("verification"):
-                append_job_log(job, f"检查者校验: {json.dumps(checker_write_debug['verification'], ensure_ascii=False)}")
-            time.sleep(1)
-
-        append_job_log(job, "正在上传附件并写入 APITable…")
-        existing_attachments = []
-        existing_value = (record.get("fields") or {}).get(comment_column)
-        if isinstance(existing_value, list):
-            existing_attachments = [item for item in existing_value if isinstance(item, dict)]
-        uploaded_attachments = upload_aitable_attachment(
-            apitable_api_key,
-            base_origin,
-            datasheet_id,
-            attachment_name,
-            raw_translation,
-        )
-        if not uploaded_attachments:
-            raise RuntimeError("APITable 附件上传后没有返回可写入的附件对象")
-        update_record_comment(
-            apitable_api_key,
-            base_url,
-            datasheet_id,
-            view_id,
-            record_id,
-            comment_column,
-            existing_attachments + uploaded_attachments,
-        )
-        extra_sync_fields = {}
-        if SYNC_FIELD_CHECKED in field_names:
-            extra_sync_fields[SYNC_FIELD_CHECKED] = True
-        if SYNC_FIELD_NOTE in field_names and sync_note:
-            extra_sync_fields[SYNC_FIELD_NOTE] = sync_note
-        if extra_sync_fields:
-            sync_field_types = {
-                name: str((field_by_name(fields, name) or {}).get("type") or "")
-                for name in extra_sync_fields
-            }
-            append_job_log(job, f"检查信息字段类型: {json.dumps(sync_field_types, ensure_ascii=False)}")
-            sync_write_debug = write_fields_with_retry(
-                apitable_api_key,
-                base_url,
-                datasheet_id,
-                view_id,
-                record_id,
-                fields,
-                records,
-                extra_sync_fields,
-            )
-            append_job_log(job, f"已补写检查信息: {json.dumps(sync_write_debug.get('final_payload') or {}, ensure_ascii=False)}")
-            if sync_write_debug.get("field_debug"):
-                append_job_log(job, f"检查信息字段映射: {json.dumps(sync_write_debug['field_debug'], ensure_ascii=False)}")
-            if sync_write_debug.get("retry_payloads"):
-                append_job_log(job, f"检查信息重试: {json.dumps(sync_write_debug['retry_payloads'], ensure_ascii=False)}")
-            if sync_write_debug.get("verification"):
-                append_job_log(job, f"检查信息校验: {json.dumps(sync_write_debug['verification'], ensure_ascii=False)}")
-
-        job["status"] = "success"
-        job["message"] = "同步完成，完成版附件已更新"
-        job["result"] = {
-            "matched_file_path": matched_file_path,
-            "record_id": record_id,
-            "search_column": search_column,
-            "comment_column": comment_column,
-            "translation_text": translation_text or f"[附件已上传] {attachment_name}",
-            "attachment_name": attachment_name,
-        }
-        append_job_log(job, "同步完成，完成版附件已更新。")
-    except Exception as exc:
-        job["status"] = "error"
-        job["message"] = str(exc)
-        append_job_log(job, f"[ERROR] {exc}")
-
-
-class Handler(BaseHTTPRequestHandler):
-    def log_message(self, fmt: str, *args: Any) -> None:
-        return
-
-    def send_html(self, text: str, status: int = 200) -> None:
-        body = text.encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def send_json(self, data: Any, status: int = 200) -> None:
+    def _send_json(self, code: int, data: dict):
         body = json.dumps(data, ensure_ascii=False).encode("utf-8")
-        self.send_response(status)
+        self.send_response(code)
         self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def read_json(self) -> Dict[str, Any]:
-        length = int(self.headers.get("Content-Length", "0") or 0)
-        raw = self.rfile.read(length).decode("utf-8", errors="replace")
-        return json.loads(raw) if raw else {}
+    def _read_json(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        raw = self.rfile.read(length) if length > 0 else b"{}"
+        if not raw:
+            return {}
+        return json.loads(raw.decode("utf-8"))
 
-    def do_GET(self) -> None:
-        if self.path in ("/", "/index.html"):
-            self.send_html(INDEX_HTML)
+    def _touch_client(self, client_id: str):
+        if client_id:
+            self.server.touch_client(client_id)
+
+    def _remove_client(self, client_id: str):
+        if client_id:
+            self.server.remove_client(client_id)
+
+    def do_GET(self):
+        if self.path == "/":
+            body = HTML.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/api/glossary":
+            terms, msg = load_glossary()
+            if terms:
+                self._send_json(200, {"terms": terms, "message": msg})
+            else:
+                self._send_json(200, {"terms": [], "error": msg})
+        elif self.path == "/api/ai/config":
+            self._send_json(200, load_ai_config())
+        elif self.path == "/api/ai/creds":
+            self._send_json(200, load_aichat_creds())
+        elif self.path == "/api/references":
+            self._send_json(200, {"files": list_reference_files()})
+        else:
+            self.send_error(404)
+
+    def do_POST(self):
+        try:
+            data = self._read_json()
+        except json.JSONDecodeError:
+            self._send_json(400, {"error": "Invalid JSON body"})
             return
-        if self.path == "/api/state":
-            self.send_json({"form": STATE["form"]})
-            return
-        if self.path.startswith("/api/job/"):
-            job_id = self.path.rsplit("/", 1)[-1]
-            job = STATE["jobs"].get(job_id)
-            if not job:
-                self.send_json({"status": "error", "message": "任务不存在"}, 404)
+
+        try:
+            if self.path == "/api/ai/config":
+                config = save_ai_config(data)
+                self._send_json(200, {"ok": True, **config})
                 return
-            self.send_json({
-                "id": job["id"],
-                "status": job["status"],
-                "message": job["message"],
-                "logs": job["logs"],
-                "result": job["result"],
-                "error_code": job.get("error_code", ""),
-            })
-            return
-        self.send_error(404)
 
-    def do_POST(self) -> None:
-        if self.path == "/api/ping":
-            mark_client_ping()
-            self.send_json({"ok": True})
-            return
-        if self.path == "/api/shutdown":
-            self.send_json({"ok": True})
-            request_shutdown()
-            return
-        if self.path == "/api/save-config":
-            try:
-                payload = self.read_json()
-                merged = dict(DEFAULT_FORM)
-                merged.update(payload)
-                persist_form(merged)
-                self.send_json({"ok": True})
-            except Exception as exc:
-                self.send_json({"ok": False, "error": str(exc)}, 400)
-            return
-        if self.path == "/api/batch-table/load":
-            try:
-                payload = self.read_json()
-                api_key = str(payload.get("api_key") or "").strip()
-                if not api_key:
-                    raise RuntimeError("APITable API Key 不能为空")
-                base_url = get_apitable_base_url()
-                datasheet_id = APITABLE_DATASHEET_ID
-                fields = fetch_aitable_fields(api_key, base_url, datasheet_id, APITABLE_WRITE_VIEW_ID)
-                records = fetch_aitable_records(api_key, base_url, datasheet_id, APITABLE_WRITE_VIEW_ID)
-                reference_records = fetch_aitable_records(api_key, base_url, datasheet_id, APITABLE_READ_VIEW_ID)
-                self.send_json({"ok": True, "table": build_table_payload(fields, records, reference_records)})
-            except Exception as exc:
-                self.send_json({"ok": False, "error": str(exc)}, 400)
-            return
-        if self.path == "/api/batch-apply":
-            try:
-                payload = self.read_json()
-                api_key = str(payload.get("api_key") or "").strip()
-                record_id = str(payload.get("record_id") or "").strip()
-                template = payload.get("template") or {}
-                if not api_key:
-                    raise RuntimeError("APITable API Key 不能为空")
-                if not record_id:
-                    raise RuntimeError("请先选中一行")
-                base_url = get_apitable_base_url()
-                datasheet_id = APITABLE_DATASHEET_ID
-                fields = fetch_aitable_fields(api_key, base_url, datasheet_id, APITABLE_WRITE_VIEW_ID)
-                records = fetch_aitable_records(api_key, base_url, datasheet_id, APITABLE_WRITE_VIEW_ID)
-                debug_info = apply_batch_template_to_record(api_key, base_url, datasheet_id, APITABLE_WRITE_VIEW_ID, record_id, fields, records, template)
-                self.send_json({
-                    "ok": True,
-                    "message": "前四项已写入，勾选字段已在 3 秒后完成更新",
-                    "debug": debug_info,
+            if self.path == "/api/ai/creds":
+                account = str(data.get("account") or "").strip()
+                password = str(data.get("password") or "").strip()
+                save_aichat_creds(account, password)
+                self._send_json(200, {"ok": True, "account": account})
+                return
+
+            if self.path == "/api/client/open":
+                client_id = str(data.get("client_id") or "").strip()
+                if client_id:
+                    self._touch_client(client_id)
+                self._send_json(200, {"ok": True})
+                return
+
+            if self.path == "/api/client/ping":
+                client_id = str(data.get("client_id") or "").strip()
+                if client_id:
+                    self._touch_client(client_id)
+                self._send_json(200, {"ok": True})
+                return
+
+            if self.path == "/api/client/close":
+                client_id = str(data.get("client_id") or "").strip()
+                if client_id:
+                    self._remove_client(client_id)
+                self._send_json(200, {"ok": True})
+                return
+
+            if self.path == "/api/ai/translate":
+                zh_text = str(data.get("zh_text") or "").strip()
+                if not zh_text:
+                    self._send_json(400, {"error": "Chinese source is required"})
+                    return
+
+                config = save_ai_config(data)
+                terms, _ = load_glossary()
+                glossary_prompt = build_glossary_prompt(terms, zh_text)
+                templates = config.get("translate_templates") or []
+                selected_id = config.get("selected_translate_template_id")
+                template = next((t for t in templates if t.get("id") == selected_id), None) or (templates[0] if templates else None)
+                if not template:
+                    raise ValueError("No translate template found")
+                reference_text = load_reference_text(template.get("reference_file"))
+                result = call_ai_chat(
+                    build_single_prompt_messages(
+                        fill_prompt_template(
+                            template.get("prompt"),
+                            zh_text=zh_text,
+                            glossary_prompt=glossary_prompt,
+                            reference_text=reference_text,
+                        )
+                    ),
+                    config,
+                )
+                self._send_json(200, {
+                    "result": result["text"],
+                    "raw_output": result.get("raw_text", ""),
+                    "template_name": template.get("name", ""),
+                    "reference_file": template.get("reference_file", ""),
                 })
-            except Exception as exc:
-                self.send_json({"ok": False, "error": str(exc)}, 400)
-            return
-        if self.path == "/api/start-sync":
-            try:
-                payload = self.read_json()
-                merged = dict(DEFAULT_FORM)
-                merged.update(payload)
-                merged["crowdin_folder"] = merged["crowdin_folder"].strip()
-                if not merged["crowdin_token"].strip():
-                    raise RuntimeError("Crowdin Token 不能为空")
-                if not merged["apitable_api_key"].strip():
-                    raise RuntimeError("APITable API Key 不能为空")
-                if not merged["file_name"].strip():
-                    raise RuntimeError("文件名或主关键词不能为空")
-                persist_form(merged)
-                job = new_job(merged)
-                thread = threading.Thread(target=run_sync_job, args=(job,), daemon=True)
-                thread.start()
-                self.send_json({"ok": True, "job_id": job["id"]})
-            except Exception as exc:
-                self.send_json({"ok": False, "error": str(exc)}, 400)
-            return
-        self.send_error(404)
+                return
+
+            if self.path == "/api/ai/check":
+                zh_text = str(data.get("zh_text") or "").strip()
+                en_text = str(data.get("en_text") or "").strip()
+                if not zh_text:
+                    self._send_json(400, {"error": "Chinese source is required"})
+                    return
+                if not en_text:
+                    self._send_json(400, {"error": "English draft is required"})
+                    return
+
+                config = save_ai_config(data)
+                terms, _ = load_glossary()
+                glossary_prompt = build_glossary_prompt(terms, zh_text)
+                result = call_ai_chat(
+                    build_single_prompt_messages(
+                        fill_prompt_template(
+                            config.get("check_prompt"),
+                            zh_text=zh_text,
+                            en_text=en_text,
+                            glossary_prompt=glossary_prompt,
+                        )
+                    ),
+                    config,
+                )
+                self._send_json(200, {
+                    "result": result["text"],
+                    "raw_output": result.get("raw_text", ""),
+                })
+                return
+
+            if self.path == "/api/ai/align":
+                zh_text = str(data.get("zh_text") or "").strip()
+                en_text = str(data.get("en_text") or "").strip()
+                if not zh_text:
+                    self._send_json(400, {"error": "Chinese source is required"})
+                    return
+                if not en_text:
+                    self._send_json(400, {"error": "English draft is required"})
+                    return
+
+                config = save_ai_config(data)
+                terms, _ = load_glossary()
+                glossary_prompt = build_glossary_prompt(terms, zh_text)
+                zh_parsed = parse_raw_with_seps(zh_text)
+                align_messages = build_single_prompt_messages(
+                    build_align_json_prompt(
+                        zh_text,
+                        en_text,
+                        glossary_prompt,
+                        fill_prompt_template(
+                            config.get("align_prompt"),
+                            zh_text=zh_text,
+                            en_text=en_text,
+                            glossary_prompt=glossary_prompt,
+                        ),
+                    )
+                )
+                result = call_ai_chat(align_messages, config)
+                expected_count = len(zh_parsed["paras"])
+                try:
+                    aligned_text = parse_align_json_response(
+                        result["raw_text"],
+                        expected_count,
+                        zh_parsed["seps"],
+                    )
+                except Exception as first_error:
+                    raw_first = result.get("raw_text", "")
+                    retried = False
+                    if _looks_like_truncated_align_json(raw_first):
+                        retried = True
+                        result_retry = call_ai_chat(align_messages, config, temperature=0.1)
+                        try:
+                            aligned_text = parse_align_json_response(
+                                result_retry["raw_text"],
+                                expected_count,
+                                zh_parsed["seps"],
+                            )
+                            result = result_retry
+                        except Exception as retry_error:
+                            setattr(retry_error, "raw_output", result_retry.get("raw_text", ""))
+                            raise ValueError(
+                                "AI Align response appears truncated or malformed. Please retry."
+                            ) from retry_error
+                    if not retried:
+                        repair_messages = build_single_prompt_messages(
+                            build_align_repair_prompt(
+                                zh_text,
+                                en_text,
+                                glossary_prompt,
+                                raw_first,
+                                expected_count,
+                            )
+                        )
+                        result_retry = call_ai_chat(repair_messages, config, temperature=0.1)
+                        try:
+                            aligned_text = parse_align_json_response(
+                                result_retry["raw_text"],
+                                expected_count,
+                                zh_parsed["seps"],
+                            )
+                            result = result_retry
+                        except Exception as retry_error:
+                            setattr(retry_error, "raw_output", result_retry.get("raw_text", ""))
+                            setattr(first_error, "raw_output", raw_first)
+                            raise ValueError(
+                                "AI Align could not produce the required paragraph count. Please retry."
+                            ) from retry_error
+                aligned_parsed = parse_raw_with_seps(aligned_text)
+                if len(aligned_parsed["paras"]) == expected_count:
+                    fixed_paras = _fix_adjacent_heading_shift(
+                        zh_parsed["paras"],
+                        aligned_parsed["paras"],
+                    )
+                    if fixed_paras != aligned_parsed["paras"]:
+                        rebuilt = ""
+                        for idx, para in enumerate(fixed_paras):
+                            rebuilt += para
+                            if idx < len(fixed_paras) - 1:
+                                rebuilt += zh_parsed["seps"][idx] if idx < len(zh_parsed["seps"]) else "\\n"
+                        aligned_text = rebuilt
+                self._send_json(200, {
+                    "result": aligned_text,
+                    "raw_output": result.get("raw_text", ""),
+                })
+                return
+
+            self._send_json(404, {"error": "Not found"})
+        except Exception as e:
+            raw_output = ""
+            if hasattr(e, "raw_output"):
+                raw_output = getattr(e, "raw_output") or ""
+            self._send_json(500, {"error": str(e), "raw_output": raw_output})
 
 
-def main() -> None:
-    global SERVER_REF
-    STATE["form"] = load_saved_form()
-    server, selected_port = create_server_with_fallback(HOST, PORT)
-    SERVER_REF = server
-    url = f"http://{HOST}:{selected_port}"
-    if not getattr(sys, "frozen", False):
-        print(f"Crowdin → APITable 留言同步工具已启动: {url}")
-        print(f"读取视图: {APITABLE_DATASHEET_ID}/{APITABLE_READ_VIEW_ID}")
-        print(f"写入视图: {APITABLE_DATASHEET_ID}/{APITABLE_WRITE_VIEW_ID}")
-        print(f"本地配置文件: {STATE_FILE}")
-    threading.Thread(target=watchdog_auto_exit, daemon=True).start()
-    threading.Timer(0.4, lambda: webbrowser.open(url)).start()
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        if not getattr(sys, "frozen", False):
-            print("\n已退出")
+# ─────────────────────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────────────────────
+class _Server(http.server.HTTPServer):
+    allow_reuse_address = True
+
+    def __init__(self, server_address, handler_class):
+        super().__init__(server_address, handler_class)
+        self._client_lock = threading.Lock()
+        self._clients = {}
+        self._shutdown_started = False
+
+    def touch_client(self, client_id: str):
+        with self._client_lock:
+            self._clients[client_id] = time.time()
+
+    def remove_client(self, client_id: str):
+        should_shutdown = False
+        with self._client_lock:
+            self._clients.pop(client_id, None)
+            self._drop_stale_clients_locked()
+            should_shutdown = not self._clients and not self._shutdown_started
+            if should_shutdown:
+                self._shutdown_started = True
+        if should_shutdown:
+            threading.Thread(target=self._delayed_shutdown, daemon=True).start()
+
+    def _drop_stale_clients_locked(self):
+        now = time.time()
+        stale_ids = [
+            client_id
+            for client_id, last_seen in self._clients.items()
+            if now - last_seen > CLIENT_STALE_SECONDS
+        ]
+        for client_id in stale_ids:
+            self._clients.pop(client_id, None)
+
+    def _delayed_shutdown(self):
+        time.sleep(SHUTDOWN_GRACE_SECONDS)
+        with self._client_lock:
+            self._drop_stale_clients_locked()
+            if self._clients:
+                self._shutdown_started = False
+                return
+        threading.Thread(target=self.shutdown, daemon=True).start()
+
+    def run_client_reaper(self):
+        while True:
+            time.sleep(10)
+            with self._client_lock:
+                self._drop_stale_clients_locked()
+                should_shutdown = not self._clients and not self._shutdown_started
+                if should_shutdown:
+                    self._shutdown_started = True
+            if should_shutdown:
+                self._delayed_shutdown()
+                return
 
 
 if __name__ == "__main__":
-    main()
+    # Kill any process still holding the port
+    subprocess.run(f"lsof -ti:{PORT} | xargs kill -9 2>/dev/null; true",
+                   shell=True, check=False)
+    time.sleep(0.3)
+
+    server = _Server(("127.0.0.1", PORT), Handler)
+    print(f"Crowdin Checker  →  http://localhost:{PORT}")
+    print(f"Glossary: {os.path.join(SCRIPT_DIR, GLOSSARY_FILE)}")
+    print("Press Ctrl+C to stop.\n")
+
+    def _open_browser():
+        time.sleep(0.7)
+        webbrowser.open(f"http://localhost:{PORT}")
+
+    threading.Thread(target=_open_browser, daemon=True).start()
+    threading.Thread(target=server.run_client_reaper, daemon=True).start()
+
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\nServer stopped.")
+    finally:
+        server.server_close()
