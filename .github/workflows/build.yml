@@ -30,6 +30,8 @@ jobs:
             --onefile `
             --windowed `
             --name="CrowdinChecker" `
+            --hidden-import Crypto `
+            --collect-all Crypto `
             main.py
 
       - name: 上传 EXE 文件
