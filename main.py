@@ -21,7 +21,6 @@ import threading
 import time
 import urllib.parse
 import urllib.request as _urllib_request
-import uuid
 import webbrowser
 import zipfile
 import xml.etree.ElementTree as ET
@@ -261,8 +260,7 @@ def _do_ask(prompt, model_key, dialog_id, context_id, aichat_session, xsrf_token
     return result_text
 
 
-def _aichat_ask(prompt, model_key="gemini_31_flash_image", dialog_id=5870,
-                context_id="b8d94dfc-0dd9-4561-944b-3b31ce0dba09"):
+def _aichat_ask(prompt, model_key, dialog_id, context_id):
     for _ in range(2):
         aichat_session, xsrf_token = _get_valid_session()
         result = _do_ask(prompt, model_key, dialog_id, context_id, aichat_session, xsrf_token)
@@ -606,50 +604,66 @@ def normalize_ai_output(text: str) -> str:
     return value.strip()
 
 
-# Claude 模型需要专用的 claude 品牌对话（用 Gemini 对话会报错）
-# 同时 Claude 不通过 SSE 流式返回文本，需从对话历史取增量
-_CLAUDE_DIALOG_ID = 18462
-_CLAUDE_CONTEXT_ID = "98d7f72c-7350-4f2c-95c0-bc79a943b95e"
+# 模型必须在对应品牌的对话下运行；dialog_id 是账号私有数据，不能写死，
+# 否则换一个账号登录就会报错。统一做法：每次在当前账号下新建临时对话，用完即删。
+_MODEL_BRANDS = (
+    ("claude", "claude"),
+    ("gemini", "gemini"),
+    ("gpt", "openai"),
+    ("deepseek", "deepseek"),
+    ("grok", "grok"),
+)
 
 
-def _get_dialog_last_msg_id(dialog_id, session, xsrf):
+def _brand_for_model(model_key):
+    for prefix, brand in _MODEL_BRANDS:
+        if model_key.startswith(prefix):
+            return brand
+    return "openai"
+
+
+def _dialog_api(path, body_dict):
+    """POST 对话管理接口；session 过期（4500002）时自动重新登录重试一次。"""
+    for attempt in range(2):
+        session, xsrf = _get_valid_session()
+        cookie = f"aichat_session={session}; XSRF-TOKEN={xsrf}"
+        body = json.dumps({
+            "sys_lang": "zh-CN", "version_info": 1780282191327,
+            "app_key": "chatgpt", **body_dict,
+        }).encode()
+        req = _urllib_request.Request(
+            f"https://{HOST}/web-api/{path}", data=body, method="POST",
+        )
+        req.add_header("Content-Type", "application/json")
+        req.add_header("Cookie", cookie)
+        req.add_header("X-XSRF-TOKEN", xsrf)
+        with _urllib_request.urlopen(req, context=_ctx, timeout=15) as r:
+            data = json.loads(r.read())
+        err = data.get("error_code")
+        if str(err) == "4500002" and attempt == 0:
+            if os.path.exists(_AI_SESSION_FILE):
+                os.remove(_AI_SESSION_FILE)
+            continue
+        if err not in (0, "0"):
+            raise RuntimeError(f"AIChat 接口错误: {data.get('error_msg')}")
+        return data
+    raise RuntimeError("登录失败，请检查 aichat_creds.json 中的账密")
+
+
+def _get_dialog_last_msg_id(dialog_id):
     """返回对话中最后一条消息的 id（用于识别新增消息）。"""
-    cookie = f"aichat_session={session}; XSRF-TOKEN={xsrf}"
-    body = json.dumps({
-        "sys_lang": "zh-CN", "version_info": 1780282191327,
-        "app_key": "chatgpt", "dialog_id": dialog_id,
-        "start_index": 0, "msg_num": 2,
-    }).encode()
-    req = _urllib_request.Request(
-        f"https://{HOST}/web-api/openai/chat/get-dialog-messages",
-        data=body, method="POST",
-    )
-    req.add_header("Content-Type", "application/json")
-    req.add_header("Cookie", cookie)
-    req.add_header("X-XSRF-TOKEN", xsrf)
-    with _urllib_request.urlopen(req, context=_ctx, timeout=15) as r:
-        data = json.loads(r.read())
+    data = _dialog_api("openai/chat/get-dialog-messages", {
+        "dialog_id": dialog_id, "start_index": 0, "msg_num": 2,
+    })
     msgs = data.get("data", {}).get("messages", [])
     return max((m.get("id", 0) for m in msgs), default=0)
 
 
-def _get_new_assistant_text(dialog_id, after_id, session, xsrf):
+def _get_new_assistant_text(dialog_id, after_id):
     """取 after_id 之后新增的 assistant 消息文本。"""
-    cookie = f"aichat_session={session}; XSRF-TOKEN={xsrf}"
-    body = json.dumps({
-        "sys_lang": "zh-CN", "version_info": 1780282191327,
-        "app_key": "chatgpt", "dialog_id": dialog_id,
-        "start_index": 0, "msg_num": 4,
-    }).encode()
-    req = _urllib_request.Request(
-        f"https://{HOST}/web-api/openai/chat/get-dialog-messages",
-        data=body, method="POST",
-    )
-    req.add_header("Content-Type", "application/json")
-    req.add_header("Cookie", cookie)
-    req.add_header("X-XSRF-TOKEN", xsrf)
-    with _urllib_request.urlopen(req, context=_ctx, timeout=15) as r:
-        data = json.loads(r.read())
+    data = _dialog_api("openai/chat/get-dialog-messages", {
+        "dialog_id": dialog_id, "start_index": 0, "msg_num": 4,
+    })
     msgs = data.get("data", {}).get("messages", [])
     for msg in reversed(msgs):
         if msg.get("id", 0) > after_id and msg.get("role") == "assistant":
@@ -659,40 +673,20 @@ def _get_new_assistant_text(dialog_id, after_id, session, xsrf):
     return ""
 
 
-def _create_tmp_claude_dialog(model_key, session, xsrf):
-    """新建一个临时 Claude 品牌对话，返回 (dialog_id, context_id)。"""
-    cookie = f"aichat_session={session}; XSRF-TOKEN={xsrf}"
-    body = json.dumps({
-        "app_key": "chatgpt", "brand": "claude",
+def _create_tmp_dialog(model_key):
+    """在当前账号下新建对应品牌的临时对话，返回 (dialog_id, context_id)。"""
+    data = _dialog_api("openai/chat/add-dialog", {
+        "brand": _brand_for_model(model_key),
         "model_key": model_key, "title": "翻译检查临时",
-    }).encode()
-    req = _urllib_request.Request(
-        f"https://{HOST}/web-api/openai/chat/add-dialog",
-        data=body, method="POST",
-    )
-    req.add_header("Content-Type", "application/json")
-    req.add_header("Cookie", cookie)
-    req.add_header("X-XSRF-TOKEN", xsrf)
-    with _urllib_request.urlopen(req, context=_ctx, timeout=15) as r:
-        data = json.loads(r.read())
+    })
     d = data.get("data", {})
     return d["id"], d["last_context_id"]
 
 
-def _delete_dialog(dialog_id, session, xsrf):
+def _delete_dialog(dialog_id):
     """删除指定对话（用于清理临时 dialog）。"""
-    cookie = f"aichat_session={session}; XSRF-TOKEN={xsrf}"
-    body = json.dumps({"app_key": "chatgpt", "id": dialog_id}).encode()
-    req = _urllib_request.Request(
-        f"https://{HOST}/web-api/openai/chat/delete-dialog",
-        data=body, method="POST",
-    )
-    req.add_header("Content-Type", "application/json")
-    req.add_header("Cookie", cookie)
-    req.add_header("X-XSRF-TOKEN", xsrf)
     try:
-        with _urllib_request.urlopen(req, context=_ctx, timeout=10):
-            pass
+        _dialog_api("openai/chat/delete-dialog", {"id": dialog_id})
     except Exception:
         pass  # 删除失败不阻断主流程
 
@@ -707,22 +701,21 @@ def call_ai_chat(messages, config, temperature=0.2, max_tokens_override=None):
         if m.get("role") == "user"
     )
 
-    if model_key.startswith("claude"):
-        # 每次新建临时 dialog，确保无历史上下文干扰，用完即删
-        session, xsrf = _get_valid_session()
-        tmp_dialog_id, tmp_context_id = _create_tmp_claude_dialog(model_key, session, xsrf)
-        try:
-            prev_id = _get_dialog_last_msg_id(tmp_dialog_id, session, xsrf)
+    # 所有模型统一：在当前账号下新建临时 dialog（无历史干扰、不依赖写死的
+    # dialog_id），用完即删。Claude 不走 SSE 返回文本，需从对话历史取增量。
+    tmp_dialog_id, tmp_context_id = _create_tmp_dialog(model_key)
+    try:
+        if model_key.startswith("claude"):
+            prev_id = _get_dialog_last_msg_id(tmp_dialog_id)
             _aichat_ask(prompt, model_key=model_key,
                         dialog_id=tmp_dialog_id, context_id=tmp_context_id)
-            session, xsrf = _get_valid_session()
-            raw_text = _get_new_assistant_text(tmp_dialog_id, prev_id, session, xsrf)
-        finally:
-            _delete_dialog(tmp_dialog_id, session, xsrf)
-    else:
-        # 每次传新 UUID 作为 context_id，强制开启全新会话
-        raw_text = _aichat_ask(prompt, model_key=model_key,
-                               context_id=str(uuid.uuid4()))
+            raw_text = _get_new_assistant_text(tmp_dialog_id, prev_id)
+        else:
+            raw_text = _aichat_ask(prompt, model_key=model_key,
+                                   dialog_id=tmp_dialog_id,
+                                   context_id=tmp_context_id)
+    finally:
+        _delete_dialog(tmp_dialog_id)
 
     return {
         "text": normalize_ai_output(raw_text),
@@ -1244,7 +1237,6 @@ textarea:focus,select:focus{outline:none;border-color:#388bfd}
         </optgroup>
         <optgroup label="── 快速 ──">
           <option value="gpt_4o_mini">GPT-4o Mini</option>
-          <option value="gemini_20_flash_lite">Gemini Flash Lite</option>
           <option value="deepseek_chat">DeepSeek 快速版</option>
         </optgroup>
       </select>
